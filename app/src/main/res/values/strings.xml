@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Steam Launcher</string>
+
+    <string-array name="resolution_options">
+        <item>Native (Device Resolution)</item>
+        <item>1920x1080 (Full HD)</item>
+        <item>1600x900</item>
+        <item>1280x720 (HD)</item>
+        <item>1024x768</item>
+        <item>800x600</item>
+    </string-array>
+
+    <string-array name="touch_mode_options">
+        <item>Mouse (Touch moves cursor)</item>
+        <item>Direct (Touch = Click)</item>
+        <item>Trackpad (Swipe to move)</item>
+    </string-array>
+</resources>

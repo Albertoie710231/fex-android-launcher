@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Game controller icon for Steam launcher -->
+    <group
+        android:translateX="24"
+        android:translateY="24">
+        <path
+            android:fillColor="#66c0f4"
+            android:pathData="M30,12C16.75,12 6,22.75 6,36c0,13.25 10.75,24 24,24s24,-10.75 24,-24C54,22.75 43.25,12 30,12zM30,54c-9.94,0 -18,-8.06 -18,-18s8.06,-18 18,-18s18,8.06 18,18S39.94,54 30,54z"/>
+        <path
+            android:fillColor="#66c0f4"
+            android:pathData="M24,30m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0"/>
+        <path
+            android:fillColor="#66c0f4"
+            android:pathData="M36,30m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0"/>
+        <path
+            android:fillColor="#66c0f4"
+            android:pathData="M30,24m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0"/>
+        <path
+            android:fillColor="#66c0f4"
+            android:pathData="M30,36m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0"/>
+    </group>
+</vector>
