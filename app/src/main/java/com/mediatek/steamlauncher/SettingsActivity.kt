@@ -80,6 +80,7 @@ class SettingsActivity : AppCompatActivity() {
             // Container management
             btnResetContainer.setOnClickListener { resetContainer() }
             btnInstallSteam.setOnClickListener { installSteam() }
+            btnTestBox64.setOnClickListener { testBox64() }
             btnTestVulkan.setOnClickListener { testVulkan() }
             btnClearCache.setOnClickListener { clearCache() }
 
@@ -179,6 +180,57 @@ class SettingsActivity : AppCompatActivity() {
             androidx.appcompat.app.AlertDialog.Builder(this@SettingsActivity)
                 .setTitle("Steam Installation")
                 .setMessage(result.take(2000))
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    private fun testBox64() {
+        if (!app.containerManager.isContainerReady()) {
+            Toast.makeText(this, "Container not ready. Run Setup first.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        lifecycleScope.launch {
+            binding.btnTestBox64.isEnabled = false
+            binding.btnTestBox64.text = "Testing..."
+
+            val result = withContext(Dispatchers.IO) {
+                val sb = StringBuilder()
+
+                // Test box64
+                sb.appendLine("=== Box64 Test ===")
+                val box64Result = app.prootExecutor.executeBlocking(
+                    "/usr/local/bin/box64 --version",
+                    timeoutMs = 10000
+                )
+                sb.appendLine(box64Result.output.ifEmpty { "Exit code: ${box64Result.exitCode}" })
+
+                // Test box32
+                sb.appendLine("\n=== Box32 Test ===")
+                val box32Result = app.prootExecutor.executeBlocking(
+                    "/usr/local/bin/box32 --version",
+                    timeoutMs = 10000
+                )
+                sb.appendLine(box32Result.output.ifEmpty { "Exit code: ${box32Result.exitCode}" })
+
+                // Check files exist
+                sb.appendLine("\n=== Binary Check ===")
+                val lsResult = app.prootExecutor.executeBlocking(
+                    "/bin/bash -c 'ls -la /usr/local/bin/box*'",
+                    timeoutMs = 10000
+                )
+                sb.appendLine(lsResult.output.ifEmpty { "Exit code: ${lsResult.exitCode}" })
+
+                sb.toString()
+            }
+
+            binding.btnTestBox64.isEnabled = true
+            binding.btnTestBox64.text = "Test Box64"
+
+            androidx.appcompat.app.AlertDialog.Builder(this@SettingsActivity)
+                .setTitle("Box64 Test Results")
+                .setMessage(result.take(3000))
                 .setPositiveButton("OK", null)
                 .show()
         }

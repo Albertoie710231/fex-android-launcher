@@ -308,6 +308,14 @@
                         style="@style/Widget.Material3.Button.TonalButton" />
 
                     <Button
+                        android:id="@+id/btnTestBox64"
+                        android:layout_width="match_parent"
+                        android:layout_height="48dp"
+                        android:layout_marginTop="8dp"
+                        android:text="Test Box64"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                    <Button
                         android:id="@+id/btnTestVulkan"
                         android:layout_width="match_parent"
                         android:layout_height="48dp"

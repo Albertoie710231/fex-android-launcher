@@ -275,12 +275,12 @@ class SteamService : Service() {
 
             echo "Starting Steam from ${'$'}STEAM_PATH..."
 
-            # Launch Steam with Box86 (bootstrapper is 32-bit)
+            # Launch Steam with Box32 (Box64 with BOX32 support for 32-bit x86)
             cd "${'$'}STEAM_PATH"
 
             # Use -no-browser to avoid CEF issues initially
             # Can remove this flag once rendering is confirmed working
-            exec box86 ./steam.sh -no-browser +open steam://open/minigameslist 2>&1
+            exec box32 ./steam.sh -no-browser +open steam://open/minigameslist 2>&1
         """.trimIndent()
     }
 

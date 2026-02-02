@@ -261,71 +261,59 @@ class ContainerManager(private val context: Context) {
             export BOX86_LD_LIBRARY_PATH=/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu
 
             alias ll='ls -la'
-            alias steam='box86 /opt/steam/steam.sh'
+            alias steam='box32 /opt/steam/steam.sh'
         """.trimIndent())
     }
 
     private fun installBox64() {
-        // Create Box64 installation script
-        val installScript = """
-            #!/bin/bash
-            set -e
+        // Extract pre-compiled Box64 from assets
+        val box64Dir = File(rootfsDir, "usr/local/bin")
+        box64Dir.mkdirs()
+        val box64File = File(box64Dir, "box64")
 
-            # Update package lists
-            apt-get update
+        try {
+            // Extract box64.xz from assets
+            context.assets.open("box64.xz").use { input ->
+                XZCompressorInputStream(input).use { xzInput ->
+                    FileOutputStream(box64File).use { output ->
+                        xzInput.copyTo(output)
+                    }
+                }
+            }
+            box64File.setExecutable(true)
 
-            # Install build dependencies
-            apt-get install -y cmake git build-essential python3
+            // Create box32 symlink (Box64 with BOX32 support handles 32-bit x86)
+            val box32File = File(box64Dir, "box32")
+            box32File.delete()
+            Runtime.getRuntime().exec(
+                arrayOf("ln", "-sf", "box64", box32File.absolutePath)
+            ).waitFor()
 
-            # Clone and build Box64
-            cd /opt
-            git clone https://github.com/ptitSeb/box64.git
-            cd box64
-            mkdir build && cd build
-            cmake .. -DARM_DYNAREC=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-            make -j$(nproc)
-            make install
-
-            # Verify installation
-            box64 --version || echo "Box64 installed"
-
-            # Create binfmt configuration
-            echo ':box64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/local/bin/box64:' > /usr/share/binfmts/box64
-        """.trimIndent()
-
-        writeScript("install_box64.sh", installScript)
+            Log.i(TAG, "Box64 installed: ${box64File.length()} bytes")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract Box64", e)
+            throw e
+        }
     }
 
     private fun installBox86() {
-        // Create Box86 installation script
-        val installScript = """
-            #!/bin/bash
-            set -e
+        // On 64-bit only devices, Box86 (ARM32) cannot run.
+        // We use Box64 compiled with BOX32=ON which handles 32-bit x86 directly.
+        // The box32 symlink was already created in installBox64().
 
-            # Add armhf architecture for 32-bit libraries
-            dpkg --add-architecture armhf || true
-            apt-get update
-
-            # Install 32-bit libraries
-            apt-get install -y libc6:armhf libstdc++6:armhf || true
-
-            # Clone and build Box86
-            cd /opt
-            git clone https://github.com/ptitSeb/box86.git
-            cd box86
-            mkdir build && cd build
-            cmake .. -DARM_DYNAREC=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
-            make -j$(nproc)
-            make install
-
-            # Verify installation
-            box86 --version || echo "Box86 installed"
-
-            # Create binfmt configuration
-            echo ':box86:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/local/bin/box86:' > /usr/share/binfmts/box86
-        """.trimIndent()
-
-        writeScript("install_box86.sh", installScript)
+        val box32File = File(rootfsDir, "usr/local/bin/box32")
+        if (box32File.exists()) {
+            Log.i(TAG, "Box32 (via Box64) already available - skipping Box86")
+        } else {
+            // Ensure box32 symlink exists
+            val box64File = File(rootfsDir, "usr/local/bin/box64")
+            if (box64File.exists()) {
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", "box64", box32File.absolutePath)
+                ).waitFor()
+                Log.i(TAG, "Created box32 symlink to box64")
+            }
+        }
     }
 
     private fun setupSteamDependencies() {
