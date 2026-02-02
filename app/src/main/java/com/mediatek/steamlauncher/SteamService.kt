@@ -260,27 +260,38 @@ class SteamService : Service() {
             echo "Checking Box64..."
             which box64 || echo "Warning: box64 not in PATH"
 
-            # Check Steam installation
-            STEAM_PATH="/opt/steam"
-            if [ ! -d "${'$'}STEAM_PATH" ]; then
-                echo "Steam not found at ${'$'}STEAM_PATH, checking ~/.steam..."
-                STEAM_PATH="${'$'}HOME/.steam/steam"
-            fi
+            # Check Steam installation - try multiple locations
+            STEAM_SCRIPT=""
+            for path in \
+                "/home/user/usr/lib/steam/bin_steam.sh" \
+                "/home/user/usr/bin/steam" \
+                "/opt/steam/steam.sh" \
+                "${'$'}HOME/.steam/steam/steam.sh" \
+                "${'$'}HOME/.local/share/Steam/steam.sh"; do
+                if [ -f "${'$'}path" ] || [ -L "${'$'}path" ]; then
+                    STEAM_SCRIPT="${'$'}path"
+                    break
+                fi
+            done
 
-            if [ ! -f "${'$'}STEAM_PATH/steam.sh" ]; then
-                echo "ERROR: steam.sh not found. Please install Steam first."
-                echo "Run: apt update && apt install steam-installer"
+            if [ -z "${'$'}STEAM_SCRIPT" ]; then
+                echo "ERROR: Steam not found. Please install Steam first."
+                echo "Searched locations:"
+                echo "  - /home/user/usr/lib/steam/bin_steam.sh"
+                echo "  - /opt/steam/steam.sh"
+                echo "  - ~/.steam/steam/steam.sh"
                 exit 1
             fi
 
-            echo "Starting Steam from ${'$'}STEAM_PATH..."
+            echo "Found Steam at: ${'$'}STEAM_SCRIPT"
+            echo "Starting Steam..."
 
             # Launch Steam with Box32 (Box64 with BOX32 support for 32-bit x86)
-            cd "${'$'}STEAM_PATH"
+            cd "$(dirname "${'$'}STEAM_SCRIPT")"
 
             # Use -no-browser to avoid CEF issues initially
             # Can remove this flag once rendering is confirmed working
-            exec box32 ./steam.sh -no-browser +open steam://open/minigameslist 2>&1
+            exec box32 "${'$'}STEAM_SCRIPT" -no-browser +open steam://open/minigameslist 2>&1
         """.trimIndent()
     }
 

@@ -317,83 +317,66 @@ class ContainerManager(private val context: Context) {
     }
 
     private fun setupSteamDependencies() {
-        // Create dependency installation script
-        val depsScript = """
-            #!/bin/bash
-            set -e
+        // Extract pre-bundled x86 libraries from assets
+        // These are needed for Box64's BOX32 to run 32-bit x86 Steam
 
-            # Enable multiarch
-            dpkg --add-architecture i386 || true
-            apt-get update
+        val libDir = File(rootfsDir, "lib")
+        val usrLibDir = File(rootfsDir, "usr/lib")
+        libDir.mkdirs()
+        usrLibDir.mkdirs()
 
-            # Install X11 and graphics dependencies
-            apt-get install -y --no-install-recommends \
-                xorg \
-                x11-xserver-utils \
-                libx11-6 \
-                libxext6 \
-                libxrandr2 \
-                libxrender1 \
-                libxcursor1 \
-                libxcomposite1 \
-                libxi6 \
-                libxtst6 \
-                libxkbfile1 \
-                libxinerama1 \
-                libxss1 \
-                libgl1 \
-                libglu1 \
-                libegl1 \
-                libgles2 \
-                libvulkan1 \
-                vulkan-tools \
-                mesa-vulkan-drivers
+        try {
+            // Extract x86-libs.tar.xz from assets
+            context.assets.open("x86-libs.tar.xz").use { input ->
+                XZCompressorInputStream(input).use { xzInput ->
+                    TarArchiveInputStream(xzInput).use { tar ->
+                        var entry = tar.nextTarEntry
+                        while (entry != null) {
+                            val destFile = File(libDir, entry.name)
 
-            # Install 32-bit libraries for Steam (Box86)
-            apt-get install -y --no-install-recommends \
-                libc6:i386 \
-                libstdc++6:i386 \
-                libgl1:i386 \
-                libx11-6:i386 \
-                libxext6:i386 \
-                libxrandr2:i386 \
-                libxrender1:i386 \
-                libxcursor1:i386 \
-                libxi6:i386 \
-                libglib2.0-0:i386 \
-                libnss3:i386 \
-                libnspr4:i386 \
-                libfontconfig1:i386 \
-                libpango-1.0-0:i386 \
-                libcairo2:i386 \
-                libatk1.0-0:i386 \
-                libgdk-pixbuf2.0-0:i386 \
-                libgtk-3-0:i386 \
-                libasound2:i386 \
-                libpulse0:i386 \
-                libcurl4:i386 \
-                libdbus-1-3:i386 || true
+                            when {
+                                entry.isDirectory -> destFile.mkdirs()
+                                entry.isSymbolicLink -> {
+                                    destFile.parentFile?.mkdirs()
+                                    try {
+                                        destFile.delete()
+                                        Runtime.getRuntime().exec(
+                                            arrayOf("ln", "-sf", entry.linkName, destFile.absolutePath)
+                                        ).waitFor()
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "Failed to create symlink: ${entry.name}")
+                                    }
+                                }
+                                else -> {
+                                    destFile.parentFile?.mkdirs()
+                                    FileOutputStream(destFile).use { output ->
+                                        tar.copyTo(output)
+                                    }
+                                    if (entry.mode and 0b001_000_000 != 0) {
+                                        destFile.setExecutable(true)
+                                    }
+                                }
+                            }
+                            entry = tar.nextTarEntry
+                        }
+                    }
+                }
+            }
 
-            # Install fonts
-            apt-get install -y --no-install-recommends \
-                fonts-liberation \
-                fonts-dejavu-core
+            // Create ld-linux.so.2 symlink in /lib if needed
+            val ldLinux = File(libDir, "ld-linux.so.2")
+            val ldLinuxSource = File(libDir, "i386-linux-gnu/ld-linux.so.2")
+            if (!ldLinux.exists() && ldLinuxSource.exists()) {
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", "i386-linux-gnu/ld-linux.so.2", ldLinux.absolutePath)
+                ).waitFor()
+            }
 
-            # Install utilities
-            apt-get install -y --no-install-recommends \
-                wget \
-                curl \
-                ca-certificates \
-                locales
-
-            # Generate locale
-            echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
-            locale-gen
-
-            echo "Dependencies installed successfully"
-        """.trimIndent()
-
-        writeScript("install_deps.sh", depsScript)
+            Log.i(TAG, "x86 libraries installed successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract x86 libraries", e)
+            // Don't throw - Steam may still partially work
+        }
     }
 
     private fun setupVulkan() {
