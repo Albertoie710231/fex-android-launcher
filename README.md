@@ -21,7 +21,7 @@ A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimens
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │ Ubuntu 22.04 RootFS                                     ││
 │  │  ├── Box64 (x86_64 → ARM64 translation)                ││
-│  │  ├── Box86 (x86 → ARM32 translation)                   ││
+│  │  ├── Box32 (x86 → ARM64 via Box64 with BOX32=ON)       ││
 │  │  ├── Steam Client                                       ││
 │  │  ├── Proton (Wine-based Windows compat)                 ││
 │  │  └── Mesa + Vulkan libraries                            ││
@@ -71,9 +71,9 @@ A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimens
 2. Click "Setup Container" to download and configure the Linux rootfs
 
 3. After setup, the app will automatically install:
-   - Box64 (x86_64 emulation)
-   - Box86 (x86 emulation)
-   - Required libraries
+   - Box64 with BOX32 support (x86_64 and x86 emulation on ARM64-only devices)
+   - Required x86 libraries
+   - Patched PRoot with futex/semaphore support
 
 4. Go to Settings > "Install Steam" to install Steam
 
@@ -132,7 +132,8 @@ Foreground service that keeps the proot container alive. Required for Android 12
 Manages the Linux rootfs lifecycle:
 - Downloads Ubuntu 22.04 arm64 base
 - Configures X11, Vulkan, and Steam dependencies
-- Installs Box64 and Box86
+- Installs Box64 with BOX32 support (handles both 32-bit and 64-bit x86)
+- Extracts Steam bootstrap from .deb (uses Java XZ library, no external xz binary needed)
 
 ### X11Server / LorieView
 Provides X11 display server functionality:
@@ -152,12 +153,70 @@ Wraps proot execution:
 - Binds X11 socket
 - Configures environment for Box64/Box86
 
+## Testing Steam via ADB
+
+To verify Steam runs correctly through the patched PRoot and Box32, use this command:
+
+```bash
+adb shell "run-as com.mediatek.steamlauncher sh -c '
+  export NATIVELIB=\$(dirname \$(pm path com.mediatek.steamlauncher | cut -d: -f2))/lib/arm64
+  export LD_LIBRARY_PATH=files/lib-override:\$NATIVELIB
+  export PROOT_LOADER=\$NATIVELIB/libproot-loader.so
+  export PROOT_TMP_DIR=cache/proot-tmp
+  export PROOT_NO_SECCOMP=1
+
+  timeout 15 \$NATIVELIB/libproot.so --rootfs=files/rootfs \
+    -b /dev -b /proc -b /sys \
+    -w /home/user \
+    /bin/sh -c \"
+      export HOME=/home/user
+      export DISPLAY=:0
+      export BOX64_LOG=1
+      export BOX64_LD_LIBRARY_PATH=/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu
+      export LD_LIBRARY_PATH=/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu
+      export STEAM_RUNTIME=0
+      /usr/local/bin/box32 /home/user/.local/share/Steam/ubuntu12_32/steam 2>&1
+    \"
+'"
+```
+
+Expected output (success):
+```
+[BOX32] Personality set to 32bits
+[BOX32] Using Box32 to load 32bits elf
+[BOX32] Rename process to "steam"
+[BOX32] Using native(wrapped) libdl.so.2
+[BOX32] Using native(wrapped) librt.so.1
+[BOX32] Using native(wrapped) libm.so.6
+[BOX32] Using native(wrapped) libpthread.so.0
+[BOX32] Using native(wrapped) libc.so.6
+[BOX32] Using native(wrapped) ld-linux.so.2
+```
+
+If you see the above output without "semaphore creation failed" errors, the patched PRoot is working correctly. Steam will wait for an X11 display server to continue.
+
+### Fix libtalloc symlink after reinstall
+
+After reinstalling the APK, the libtalloc symlink may break. Fix it with:
+
+```bash
+APP_PATH=$(adb shell "pm path com.mediatek.steamlauncher" | cut -d: -f2 | tr -d '\r\n')
+NATIVELIB=$(dirname "$APP_PATH")/lib/arm64
+
+adb shell "run-as com.mediatek.steamlauncher sh -c '
+  rm -f files/lib-override/libtalloc.so.2
+  mkdir -p files/lib-override
+  ln -sf $NATIVELIB/libtalloc.so files/lib-override/libtalloc.so.2
+'"
+```
+
 ## Troubleshooting
 
 ### Steam crashes on launch
-- Ensure Box86 is installed (Steam bootstrapper is 32-bit)
-- Check that all 32-bit libraries are installed
+- Ensure Box32 symlink exists (points to Box64 with BOX32 support)
+- Check that all 32-bit x86 libraries are installed in `/lib/i386-linux-gnu/`
 - Disable libmimalloc: `export LD_PRELOAD=""`
+- Check for "semaphore creation failed" - if present, the patched PRoot is not being used
 
 ### Black screen / no rendering
 - Verify X11 socket exists: `/tmp/.X11-unix/X0`
@@ -180,7 +239,14 @@ MIT License
 
 ## Credits
 
-- [Box64](https://github.com/ptitSeb/box64) - x86_64 emulation
-- [Box86](https://github.com/ptitSeb/box86) - x86 emulation
-- [PRoot](https://github.com/proot-me/proot) - User-space chroot
+- [Box64](https://github.com/ptitSeb/box64) - x86_64 emulation (with BOX32 support for 32-bit x86)
+- [PRoot](https://github.com/termux/proot) - User-space chroot (Termux fork, patched for futex/semaphore support)
 - [Termux:X11](https://github.com/termux/termux-x11) - X11 server inspiration
+
+## Technical Notes
+
+### PRoot Futex Patch
+The bundled `libproot.so` includes patches for `futex_time64` syscall handling, required for Steam's semaphore operations on Android. Without this patch, Steam fails with "semaphore creation failed Function not implemented".
+
+### Box64 with BOX32
+Since many Android devices are ARM64-only (no 32-bit ARM support), we use Box64 compiled with `BOX32=ON` flag. This allows Box64 to handle both 32-bit x86 (via `box32` symlink) and 64-bit x86_64 binaries on ARM64-only devices.

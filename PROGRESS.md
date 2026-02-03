@@ -1,5 +1,54 @@
 # Steam Launcher Progress Report
 
+## Session: 2026-02-03
+
+### What We Accomplished
+
+#### 1. Patched PRoot for Futex/Semaphore Support
+- **Problem**: Steam failed with `semaphore creation failed Function not implemented` when running through proot
+- **Root Cause**: PRoot didn't have explicit handling for `futex_time64` syscall (422 on ARM)
+- **Solution**: Patched Termux PRoot source:
+  - Added `futex_time64` to `sysnums.list`
+  - Added syscall 422 mapping in `sysnums-arm.h` and `sysnums-arm64.h`
+  - Added explicit passthrough handling in `syscall/enter.c` for `PR_futex` and `PR_futex_time64`
+  - Fixed ashmem headers for Android NDK compatibility
+- **Result**: Built patched `libproot.so` (222KB) for Android ARM64
+
+#### 2. Steam Bootstrap Extraction
+- **Problem**: Steam's `bin_steam.sh` needed `xz` to extract bootstrap, but rootfs lacked it
+- **Solution**: Extracted `bootstraplinux_ubuntu12_32.tar.xz` on host and pushed to device
+- **Location**: `/home/user/.local/share/Steam/`
+
+#### 3. Steam Binary Loading - SUCCESS!
+- Steam binary loads via Box32 without semaphore errors
+- Test output:
+```
+[BOX32] Personality set to 32bits
+[BOX32] Using Box32 to load 32bits elf
+[BOX32] Rename process to "steam"
+[BOX32] Using native(wrapped) libdl.so.2
+[BOX32] Using native(wrapped) libc.so.6
+CProcessEnvironmentManager is ready, 6 preallocated environment variables.
+```
+
+### Current Status
+- ✅ PRoot futex patch working
+- ✅ Box32 loading Steam binary
+- ✅ No more "semaphore creation failed" error
+- ⏳ Need display server (Termux:X11) for Steam GUI
+
+### Files Modified
+- `app/src/main/jniLibs/arm64-v8a/libproot.so` - Patched with futex support (222KB)
+- `app/src/main/jniLibs/arm64-v8a/libproot-loader.so` - Updated loader
+- `app/src/main/jniLibs/arm64-v8a/libproot-loader32.so` - Updated 32-bit loader
+
+### Next Steps
+1. Integrate Termux:X11 or similar display server
+2. Test Steam GUI rendering
+3. Handle Steam runtime library dependencies
+
+---
+
 ## Session: 2026-02-02
 
 ### What We Accomplished

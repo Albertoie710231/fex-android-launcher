@@ -655,9 +655,78 @@ class ContainerManager(private val context: Context) {
 
             if (steamBin.exists()) {
                 steamBin.setExecutable(true)
-                result.appendLine("")
-                result.appendLine("=== Steam installation complete! ===")
             }
+
+            // Extract Steam bootstrap (rootfs doesn't have xz, so we do it from Android)
+            val bootstrapFile = File(steamLib, "bootstraplinux_ubuntu12_32.tar.xz")
+            if (bootstrapFile.exists()) {
+                result.appendLine("")
+                result.appendLine("Extracting Steam bootstrap...")
+                val steamDataDir = File(steamDir, ".local/share/Steam")
+                steamDataDir.mkdirs()
+
+                try {
+                    FileInputStream(bootstrapFile).use { fis ->
+                        XZCompressorInputStream(fis).use { xzInput ->
+                            TarArchiveInputStream(xzInput).use { tar ->
+                                var tarEntry = tar.nextTarEntry
+                                var fileCount = 0
+                                while (tarEntry != null) {
+                                    val destFile = File(steamDataDir, tarEntry.name)
+
+                                    when {
+                                        tarEntry.isDirectory -> destFile.mkdirs()
+                                        tarEntry.isSymbolicLink -> {
+                                            destFile.parentFile?.mkdirs()
+                                            try {
+                                                destFile.delete()
+                                                Runtime.getRuntime().exec(
+                                                    arrayOf("ln", "-sf", tarEntry.linkName, destFile.absolutePath)
+                                                ).waitFor()
+                                            } catch (e: Exception) {
+                                                // Ignore symlink errors
+                                            }
+                                        }
+                                        else -> {
+                                            destFile.parentFile?.mkdirs()
+                                            FileOutputStream(destFile).use { out ->
+                                                tar.copyTo(out)
+                                            }
+                                            if (tarEntry.mode and 0b001_000_000 != 0) {
+                                                destFile.setExecutable(true)
+                                            }
+                                            fileCount++
+                                        }
+                                    }
+                                    tarEntry = tar.nextTarEntry
+                                }
+                                result.appendLine("Bootstrap extracted: $fileCount files")
+                            }
+                        }
+                    }
+
+                    // Create .steam symlink
+                    val dotSteam = File(steamDir, ".steam")
+                    dotSteam.mkdirs()
+                    val steamSymlink = File(dotSteam, "steam")
+                    if (!steamSymlink.exists()) {
+                        Runtime.getRuntime().exec(
+                            arrayOf("ln", "-sf", "../.local/share/Steam", steamSymlink.absolutePath)
+                        ).waitFor()
+                    }
+
+                    result.appendLine("Steam data dir: ${steamDataDir.absolutePath}")
+                } catch (e: Exception) {
+                    result.appendLine("Bootstrap extraction error: ${e.message}")
+                    Log.e(TAG, "Failed to extract Steam bootstrap", e)
+                }
+            }
+
+            result.appendLine("")
+            result.appendLine("=== Steam installation complete! ===")
+
+            // Mark Steam as installed
+            File(rootfsDir, MARKER_STEAM).createNewFile()
 
             result.toString()
         } catch (e: Exception) {

@@ -178,42 +178,36 @@ class SteamService : Service() {
     }
 
     private fun buildSteamEnvironment(): Map<String, String> {
-        val tmpDir = app.getTmpDir()
         return mapOf(
             "DISPLAY" to ":0",
             "PULSE_SERVER" to "tcp:127.0.0.1:4713",
 
-            // Box64/Box86 configuration
+            // Box64/Box32 configuration (Box64 compiled with BOX32=ON)
             "BOX64_LOG" to "1",
-            "BOX86_LOG" to "1",
-            "BOX64_LD_LIBRARY_PATH" to "/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu",
-            "BOX86_LD_LIBRARY_PATH" to "/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu",
+            "BOX64_LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
             "BOX64_DYNAREC" to "1",
-            "BOX86_DYNAREC" to "1",
+
+            // Steam configuration - use host libraries via Box32
+            "STEAM_RUNTIME" to "0",
+            "LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
 
             // Vulkan configuration
             "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/android_icd.json",
             "MESA_VK_WSI_PRESENT_MODE" to "fifo",
-            "MESA_LOADER_DRIVER_OVERRIDE" to "zink",
-
-            // Steam configuration
-            "STEAM_RUNTIME" to "1",
-            "STEAM_RUNTIME_PREFER_HOST_LIBRARIES" to "0",
-            "STEAM_DISABLE_BROWSER_SANDBOXING" to "1",
-            "STEAM_CHROMIUM_GPU_RENDERING" to "1",
 
             // Proton/Wine configuration
             "PROTON_USE_WINED3D" to "0",
             "DXVK_ASYNC" to "1",
-            "PROTON_ENABLE_NVAPI" to "0",
 
             // Fix common crashes
             "LD_PRELOAD" to "",
 
             // Paths
             "HOME" to "/home/user",
+            "USER" to "user",
             "XDG_RUNTIME_DIR" to "/tmp",
-            "TMPDIR" to "/tmp"
+            "TMPDIR" to "/tmp",
+            "PATH" to "/usr/local/bin:/usr/bin:/bin"
         )
     }
 
@@ -221,77 +215,74 @@ class SteamService : Service() {
         return mapOf(
             "DISPLAY" to ":0",
             "HOME" to "/home/user",
+            "USER" to "user",
             "TERM" to "xterm-256color",
             "LANG" to "en_US.UTF-8",
-            "PATH" to "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games",
+            "PATH" to "/usr/local/bin:/usr/bin:/bin",
 
-            // Box64/Box86
+            // Box64/Box32 configuration
             "BOX64_LOG" to "1",
-            "BOX86_LOG" to "1",
-            "BOX64_LD_LIBRARY_PATH" to "/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu",
-            "BOX86_LD_LIBRARY_PATH" to "/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu"
+            "BOX64_LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
+            "LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu"
         )
     }
 
     private fun buildSteamLaunchScript(): String {
         return """
             #!/bin/bash
-            set -e
 
             echo "=== Steam Launch Script ==="
             echo "Date: $(date)"
-            echo "User: $(whoami)"
+            echo "User: ${'$'}USER"
             echo "Display: ${'$'}DISPLAY"
 
             # Verify X11 is accessible
             if [ ! -S /tmp/.X11-unix/X0 ]; then
-                echo "ERROR: X11 socket not found at /tmp/.X11-unix/X0"
-                exit 1
+                echo "Warning: X11 socket not found at /tmp/.X11-unix/X0"
             fi
 
-            # Test X11 connection
-            echo "Testing X11 connection..."
-            xdpyinfo -display :0 >/dev/null 2>&1 || echo "Warning: xdpyinfo failed"
-
-            # Verify Box86/Box64 are available
-            echo "Checking Box86..."
-            which box86 || echo "Warning: box86 not in PATH"
-
+            # Verify Box64/Box32 are available
             echo "Checking Box64..."
-            which box64 || echo "Warning: box64 not in PATH"
+            box64 --version 2>&1 || echo "Warning: box64 not available"
 
             # Check Steam installation - try multiple locations
-            STEAM_SCRIPT=""
-            for path in \
-                "/home/user/usr/lib/steam/bin_steam.sh" \
-                "/home/user/usr/bin/steam" \
-                "/opt/steam/steam.sh" \
-                "${'$'}HOME/.steam/steam/steam.sh" \
-                "${'$'}HOME/.local/share/Steam/steam.sh"; do
-                if [ -f "${'$'}path" ] || [ -L "${'$'}path" ]; then
-                    STEAM_SCRIPT="${'$'}path"
-                    break
-                fi
-            done
+            STEAM_BIN=""
+            STEAM_DIR=""
 
-            if [ -z "${'$'}STEAM_SCRIPT" ]; then
+            # First try the extracted bootstrap location
+            if [ -f "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam" ]; then
+                STEAM_BIN="${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
+                STEAM_DIR="${'$'}HOME/.local/share/Steam"
+            elif [ -f "${'$'}HOME/.local/share/Steam/steam.sh" ]; then
+                STEAM_BIN="${'$'}HOME/.local/share/Steam/steam.sh"
+                STEAM_DIR="${'$'}HOME/.local/share/Steam"
+            elif [ -f "${'$'}HOME/usr/lib/steam/bin_steam.sh" ]; then
+                STEAM_BIN="${'$'}HOME/usr/lib/steam/bin_steam.sh"
+                STEAM_DIR="${'$'}HOME/usr/lib/steam"
+            fi
+
+            if [ -z "${'$'}STEAM_BIN" ]; then
                 echo "ERROR: Steam not found. Please install Steam first."
                 echo "Searched locations:"
-                echo "  - /home/user/usr/lib/steam/bin_steam.sh"
-                echo "  - /opt/steam/steam.sh"
-                echo "  - ~/.steam/steam/steam.sh"
+                echo "  - ~/.local/share/Steam/ubuntu12_32/steam"
+                echo "  - ~/.local/share/Steam/steam.sh"
+                echo "  - ~/usr/lib/steam/bin_steam.sh"
                 exit 1
             fi
 
-            echo "Found Steam at: ${'$'}STEAM_SCRIPT"
+            echo "Found Steam at: ${'$'}STEAM_BIN"
+            echo "Steam directory: ${'$'}STEAM_DIR"
+
+            # Clean any stale lock files
+            rm -f "${'$'}HOME/.steam/steam.pid" 2>/dev/null
+            rm -f "${'$'}STEAM_DIR/.crash" 2>/dev/null
+
             echo "Starting Steam..."
+            cd "${'$'}STEAM_DIR"
 
-            # Launch Steam with Box32 (Box64 with BOX32 support for 32-bit x86)
-            cd "$(dirname "${'$'}STEAM_SCRIPT")"
-
-            # Use -no-browser to avoid CEF issues initially
-            # Can remove this flag once rendering is confirmed working
-            exec box32 "${'$'}STEAM_SCRIPT" -no-browser +open steam://open/minigameslist 2>&1
+            # Launch Steam binary directly with Box32
+            # Box32 = Box64 compiled with BOX32 support for 32-bit x86
+            exec box32 "${'$'}STEAM_BIN" "${'$'}@" 2>&1
         """.trimIndent()
     }
 
