@@ -13,13 +13,7 @@ import kotlinx.coroutines.*
 import java.io.File
 
 /**
- * Foreground service that manages the proot container lifecycle.
- * This service is critical for Android 12+ to prevent phantom process killing.
- *
- * The service maintains:
- * - PRoot process for Linux container
- * - X11 server (Lorie) for display
- * - Steam client process
+ * Foreground service that manages the proot container and X11 server.
  */
 class SteamService : Service() {
 
@@ -38,7 +32,8 @@ class SteamService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var x11Server: X11Server? = null
     private var prootProcess: Process? = null
-    private var steamProcess: Process? = null
+    private var pendingAction: String? = null
+    private var surfaceReady = false
 
     private val app: SteamLauncherApp by lazy { application as SteamLauncherApp }
 
@@ -57,17 +52,35 @@ class SteamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, createNotification())
 
+        Log.i(TAG, "onStartCommand action: ${intent?.action}")
+
         when (intent?.action) {
             ACTION_START_STEAM -> {
+                // Store pending action - X11 server will start when surface is ready
+                pendingAction = ACTION_START_STEAM
                 serviceScope.launch {
-                    startX11Server()
-                    startSteam()
+                    stopExistingProcesses()
+                }
+                // If surface is already ready, start immediately
+                if (surfaceReady) {
+                    Log.i(TAG, "Surface already ready, starting Steam immediately")
+                    onSurfaceReady()
+                } else {
+                    Log.i(TAG, "Waiting for surface to be ready before starting Steam")
                 }
             }
             ACTION_START_TERMINAL -> {
+                // Store pending action - X11 server will start when surface is ready
+                pendingAction = ACTION_START_TERMINAL
                 serviceScope.launch {
-                    startX11Server()
-                    startTerminal()
+                    stopExistingProcesses()
+                }
+                // If surface is already ready, start immediately
+                if (surfaceReady) {
+                    Log.i(TAG, "Surface already ready, starting Terminal immediately")
+                    onSurfaceReady()
+                } else {
+                    Log.i(TAG, "Waiting for surface to be ready before starting Terminal")
                 }
             }
             ACTION_STOP -> {
@@ -78,17 +91,27 @@ class SteamService : Service() {
         return START_STICKY
     }
 
+    private suspend fun stopExistingProcesses() = withContext(Dispatchers.IO) {
+        Log.i(TAG, "Stopping existing processes...")
+        prootProcess?.let {
+            if (it.isAlive) {
+                it.destroyForcibly()
+                it.waitFor()
+            }
+        }
+        prootProcess = null
+        delay(200)
+    }
+
     private fun createNotification(): Notification {
         val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
+            this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
 
         val stopIntent = PendingIntent.getService(
-            this,
-            1,
+            this, 1,
             Intent(this, SteamService::class.java).apply { action = ACTION_STOP },
             PendingIntent.FLAG_IMMUTABLE
         )
@@ -101,217 +124,198 @@ class SteamService : Service() {
             .addAction(R.drawable.ic_stop, "Stop", stopIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
     private fun acquireWakeLock() {
-        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "SteamLauncher::ContainerWakeLock"
-        ).apply {
-            acquire(10 * 60 * 60 * 1000L) // 10 hours max
-        }
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SteamLauncher::WakeLock")
+            .apply { acquire(10 * 60 * 60 * 1000L) }
     }
 
-    private suspend fun startX11Server() = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Starting X11 server")
+    private suspend fun startX11Server() {
+        Log.i(TAG, "Starting X11 server...")
 
-        // Create X11 socket directory
-        val x11Dir = File(app.getX11SocketDir())
-        if (!x11Dir.exists()) {
-            x11Dir.mkdirs()
-        }
+        // Create socket directory
+        val socketDir = File(app.getX11SocketDir())
+        socketDir.mkdirs()
 
-        x11Server = X11Server(this@SteamService).apply {
-            start()
-        }
-
-        // Wait for X11 server to be ready
-        delay(500)
-        Log.i(TAG, "X11 server started")
-    }
-
-    private suspend fun startSteam() = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Starting Steam via proot")
-
-        val rootfsPath = app.getRootfsDir()
-        val env = buildSteamEnvironment()
-        val script = buildSteamLaunchScript()
-
-        // Write launch script
-        val scriptFile = File(rootfsPath, "tmp/launch_steam.sh")
-        scriptFile.parentFile?.mkdirs()
-        scriptFile.writeText(script)
-        scriptFile.setExecutable(true)
-
-        prootProcess = app.prootExecutor.execute(
-            command = "/bin/bash /tmp/launch_steam.sh",
-            environment = env,
-            workingDir = "/home/user"
-        )
-
-        // Monitor the process
-        serviceScope.launch {
-            prootProcess?.let { process ->
-                try {
-                    val exitCode = process.waitFor()
-                    Log.i(TAG, "Steam process exited with code: $exitCode")
-                } catch (e: InterruptedException) {
-                    Log.w(TAG, "Steam process interrupted")
+        // X11 server must be started on main thread (uses Choreographer)
+        withContext(Dispatchers.Main) {
+            x11Server = X11Server(this@SteamService).apply {
+                onServerStarted = {
+                    Log.i(TAG, "X11 server started callback")
                 }
+                onClientConnected = {
+                    Log.i(TAG, "X11 client connected callback")
+                }
+                onError = { msg ->
+                    Log.e(TAG, "X11 server error: $msg")
+                }
+                start()
             }
         }
+
+        // Wait for server to initialize
+        delay(500)
+        Log.i(TAG, "X11 server initialization complete")
     }
 
     private suspend fun startTerminal() = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Starting terminal via proot")
+        Log.i(TAG, "Starting terminal...")
 
-        val env = buildTerminalEnvironment()
+        // CRITICAL: TMPDIR must match host's TMPDIR for abstract X11 sockets to work
+        // libXlorie creates abstract socket @$TMPDIR/.X11-unix/X0
+        // X11 clients connect to @$TMPDIR/.X11-unix/X0
+        // If TMPDIR differs, abstract socket paths won't match
+        val hostTmpDir = app.getTmpDir()
 
-        prootProcess = app.prootExecutor.execute(
-            command = "/bin/bash",
-            environment = env,
-            workingDir = "/home/user"
-        )
-    }
-
-    private fun buildSteamEnvironment(): Map<String, String> {
-        return mapOf(
-            "DISPLAY" to ":0",
-            "PULSE_SERVER" to "tcp:127.0.0.1:4713",
-
-            // Box64/Box32 configuration (Box64 compiled with BOX32=ON)
-            "BOX64_LOG" to "1",
-            "BOX64_LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
-            "BOX64_DYNAREC" to "1",
-
-            // Steam configuration - use host libraries via Box32
-            "STEAM_RUNTIME" to "0",
-            "LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
-
-            // Vulkan configuration
-            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/android_icd.json",
-            "MESA_VK_WSI_PRESENT_MODE" to "fifo",
-
-            // Proton/Wine configuration
-            "PROTON_USE_WINED3D" to "0",
-            "DXVK_ASYNC" to "1",
-
-            // Fix common crashes
-            "LD_PRELOAD" to "",
-
-            // Paths
-            "HOME" to "/home/user",
-            "USER" to "user",
-            "XDG_RUNTIME_DIR" to "/tmp",
-            "TMPDIR" to "/tmp",
-            "PATH" to "/usr/local/bin:/usr/bin:/bin"
-        )
-    }
-
-    private fun buildTerminalEnvironment(): Map<String, String> {
-        return mapOf(
+        val env = mapOf(
             "DISPLAY" to ":0",
             "HOME" to "/home/user",
             "USER" to "user",
             "TERM" to "xterm-256color",
-            "LANG" to "en_US.UTF-8",
             "PATH" to "/usr/local/bin:/usr/bin:/bin",
-
-            // Box64/Box32 configuration
-            "BOX64_LOG" to "1",
-            "BOX64_LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu",
-            "LD_LIBRARY_PATH" to "/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu"
+            "XDG_RUNTIME_DIR" to hostTmpDir,
+            "TMPDIR" to hostTmpDir
         )
+
+        // Test X11 connection - check socket types
+        prootProcess = app.prootExecutor.execute(
+            command = """
+                echo "=== X11 Connection Test ==="
+                echo "DISPLAY=${'$'}DISPLAY"
+                echo ""
+                echo "Checking Unix sockets..."
+                ls -la /tmp/.X11-unix/ 2>/dev/null || echo "No /tmp/.X11-unix"
+                ls -la ${'$'}TMPDIR/.X11-unix/ 2>/dev/null || echo "No TMPDIR/.X11-unix"
+                echo ""
+                echo "Checking abstract sockets (via /proc/net/unix)..."
+                cat /proc/net/unix 2>/dev/null | grep X11 | head -5 || echo "Cannot read /proc/net/unix"
+                echo ""
+                echo "Trying TCP connection to localhost:6000..."
+                timeout 2 bash -c 'echo | nc -v localhost 6000' 2>&1 || echo "TCP connection failed"
+                echo ""
+                echo "Process staying alive..."
+                sleep 120
+            """.trimIndent(),
+            environment = env,
+            workingDir = "/home/user"
+        )
+
+        monitorProcess("TERMINAL")
     }
 
-    private fun buildSteamLaunchScript(): String {
-        return """
+    private suspend fun startSteam() = withContext(Dispatchers.IO) {
+        Log.i(TAG, "Starting Steam...")
+
+        val hostTmpDir = app.getTmpDir()
+
+        val env = mapOf(
+            "DISPLAY" to ":0",
+            "HOME" to "/home/user",
+            "USER" to "user",
+            "PATH" to "/usr/local/bin:/usr/bin:/bin",
+            "XDG_RUNTIME_DIR" to hostTmpDir,
+            "TMPDIR" to hostTmpDir,
+            "BOX64_LOG" to "1",
+            "BOX64_DYNAREC" to "1"
+        )
+
+        val script = """
             #!/bin/bash
-
-            echo "=== Steam Launch Script ==="
-            echo "Date: $(date)"
-            echo "User: ${'$'}USER"
-            echo "Display: ${'$'}DISPLAY"
-
-            # Verify X11 is accessible
-            if [ ! -S /tmp/.X11-unix/X0 ]; then
-                echo "Warning: X11 socket not found at /tmp/.X11-unix/X0"
-            fi
-
-            # Verify Box64/Box32 are available
-            echo "Checking Box64..."
-            box64 --version 2>&1 || echo "Warning: box64 not available"
-
-            # Check Steam installation - try multiple locations
-            STEAM_BIN=""
-            STEAM_DIR=""
-
-            # First try the extracted bootstrap location
+            echo "Starting Steam..."
             if [ -f "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam" ]; then
-                STEAM_BIN="${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
-                STEAM_DIR="${'$'}HOME/.local/share/Steam"
-            elif [ -f "${'$'}HOME/.local/share/Steam/steam.sh" ]; then
-                STEAM_BIN="${'$'}HOME/.local/share/Steam/steam.sh"
-                STEAM_DIR="${'$'}HOME/.local/share/Steam"
-            elif [ -f "${'$'}HOME/usr/lib/steam/bin_steam.sh" ]; then
-                STEAM_BIN="${'$'}HOME/usr/lib/steam/bin_steam.sh"
-                STEAM_DIR="${'$'}HOME/usr/lib/steam"
-            fi
-
-            if [ -z "${'$'}STEAM_BIN" ]; then
-                echo "ERROR: Steam not found. Please install Steam first."
-                echo "Searched locations:"
-                echo "  - ~/.local/share/Steam/ubuntu12_32/steam"
-                echo "  - ~/.local/share/Steam/steam.sh"
-                echo "  - ~/usr/lib/steam/bin_steam.sh"
+                exec /usr/local/bin/box32 "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
+            else
+                echo "Steam not found"
                 exit 1
             fi
-
-            echo "Found Steam at: ${'$'}STEAM_BIN"
-            echo "Steam directory: ${'$'}STEAM_DIR"
-
-            # Clean any stale lock files
-            rm -f "${'$'}HOME/.steam/steam.pid" 2>/dev/null
-            rm -f "${'$'}STEAM_DIR/.crash" 2>/dev/null
-
-            echo "Starting Steam..."
-            cd "${'$'}STEAM_DIR"
-
-            # Launch Steam binary directly with Box32
-            # Box32 = Box64 compiled with BOX32 support for 32-bit x86
-            exec box32 "${'$'}STEAM_BIN" "${'$'}@" 2>&1
         """.trimIndent()
+
+        val scriptFile = File(app.getTmpDir(), "launch.sh")
+        scriptFile.writeText(script)
+        scriptFile.setExecutable(true)
+
+        prootProcess = app.prootExecutor.execute(
+            command = "/bin/bash /tmp/launch.sh",
+            environment = env,
+            workingDir = "/home/user"
+        )
+
+        monitorProcess("STEAM")
+    }
+
+    private fun monitorProcess(tag: String) {
+        serviceScope.launch {
+            prootProcess?.let { process ->
+                launch {
+                    try {
+                        process.inputStream.bufferedReader().useLines { lines ->
+                            lines.forEach { Log.i(TAG, "$tag: $it") }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error reading $tag output", e)
+                    }
+                }
+                try {
+                    val exitCode = process.waitFor()
+                    Log.i(TAG, "$tag exited with code: $exitCode")
+                } catch (e: InterruptedException) {
+                    Log.w(TAG, "$tag interrupted")
+                }
+            }
+        }
     }
 
     fun getX11Server(): X11Server? = x11Server
 
     fun isRunning(): Boolean = prootProcess?.isAlive == true
 
-    fun sendCommand(command: String) {
-        prootProcess?.outputStream?.let { output ->
-            output.write("$command\n".toByteArray())
-            output.flush()
+    /**
+     * Called by GameActivity when the LorieView surface is ready.
+     * This is the signal to start the X11 server and pending action.
+     */
+    @Synchronized
+    fun onSurfaceReady() {
+        Log.i(TAG, "Surface ready callback received")
+
+        // Guard against multiple calls
+        if (surfaceReady) {
+            Log.d(TAG, "Surface already marked as ready, ignoring duplicate callback")
+            return
+        }
+        surfaceReady = true
+
+        val action = pendingAction
+        if (action == null) {
+            Log.w(TAG, "Surface ready but no pending action")
+            return
+        }
+
+        // Clear pending action BEFORE launching to prevent duplicate starts
+        pendingAction = null
+
+        Log.i(TAG, "Surface ready, starting X11 server for action: $action")
+        serviceScope.launch {
+            startX11Server()
+            when (action) {
+                ACTION_START_STEAM -> startSteam()
+                ACTION_START_TERMINAL -> startTerminal()
+            }
         }
     }
 
+    /**
+     * Check if surface is ready
+     */
+    fun isSurfaceReady(): Boolean = surfaceReady
+
     override fun onDestroy() {
         Log.i(TAG, "SteamService destroying")
-
-        // Clean up processes
-        steamProcess?.destroyForcibly()
         prootProcess?.destroyForcibly()
         x11Server?.stop()
-
-        // Release wake lock
-        wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
-            }
-        }
-
+        wakeLock?.let { if (it.isHeld) it.release() }
         serviceScope.cancel()
         super.onDestroy()
     }

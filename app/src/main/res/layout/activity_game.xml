@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -9,14 +8,14 @@
     tools:context=".GameActivity">
 
     <!-- X11 Rendering Surface -->
-    <com.mediatek.steamlauncher.LorieView
+    <com.termux.x11.LorieView
         android:id="@+id/lorieView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:focusable="true"
         android:focusableInTouchMode="true" />
 
-    <!-- Overlay Controls (shown on tap or edge swipe) -->
+    <!-- Overlay Controls -->
     <LinearLayout
         android:id="@+id/controlsOverlay"
         android:layout_width="wrap_content"
@@ -24,143 +23,37 @@
         android:layout_gravity="top|end"
         android:orientation="horizontal"
         android:padding="8dp"
-        android:background="@drawable/overlay_background"
         android:layout_marginTop="8dp"
         android:layout_marginEnd="8dp"
-        android:alpha="0.7">
+        android:alpha="0.8"
+        android:background="#44000000">
 
-        <ImageButton
-            android:id="@+id/btnMenu"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@drawable/ic_menu"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Menu"
-            app:tint="@color/white" />
-
-        <ImageButton
+        <Button
             android:id="@+id/btnKeyboard"
-            android:layout_width="40dp"
+            android:layout_width="wrap_content"
             android:layout_height="40dp"
-            android:src="@drawable/ic_keyboard"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Toggle keyboard"
-            app:tint="@color/white" />
+            android:text="KB"
+            android:textSize="12sp"
+            android:minWidth="48dp" />
 
         <Button
             android:id="@+id/btnMouseMode"
             android:layout_width="wrap_content"
             android:layout_height="40dp"
-            android:minWidth="60dp"
-            android:text="Mouse"
+            android:text="Touch"
             android:textSize="12sp"
-            android:textColor="@color/white"
-            android:background="@drawable/btn_overlay"
-            android:paddingHorizontal="8dp" />
+            android:minWidth="60dp"
+            android:layout_marginStart="4dp" />
 
-        <ImageButton
-            android:id="@+id/btnBack"
-            android:layout_width="40dp"
+        <Button
+            android:id="@+id/btnExit"
+            android:layout_width="wrap_content"
             android:layout_height="40dp"
-            android:src="@drawable/ic_close"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Exit"
-            app:tint="@color/white" />
+            android:text="Exit"
+            android:textSize="12sp"
+            android:minWidth="48dp"
+            android:layout_marginStart="4dp" />
 
     </LinearLayout>
-
-    <!-- On-screen D-Pad (optional, shown via settings) -->
-    <FrameLayout
-        android:id="@+id/dpadContainer"
-        android:layout_width="160dp"
-        android:layout_height="160dp"
-        android:layout_gravity="bottom|start"
-        android:layout_margin="24dp"
-        android:visibility="gone">
-
-        <ImageButton
-            android:id="@+id/btnDpadUp"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="top|center_horizontal"
-            android:src="@drawable/ic_arrow_up"
-            android:background="@drawable/btn_dpad"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnDpadDown"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="bottom|center_horizontal"
-            android:src="@drawable/ic_arrow_down"
-            android:background="@drawable/btn_dpad"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnDpadLeft"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="center_vertical|start"
-            android:src="@drawable/ic_arrow_left"
-            android:background="@drawable/btn_dpad"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnDpadRight"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="center_vertical|end"
-            android:src="@drawable/ic_arrow_right"
-            android:background="@drawable/btn_dpad"
-            android:alpha="0.6" />
-
-    </FrameLayout>
-
-    <!-- On-screen Action Buttons (optional) -->
-    <FrameLayout
-        android:id="@+id/actionButtonsContainer"
-        android:layout_width="160dp"
-        android:layout_height="160dp"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="24dp"
-        android:visibility="gone">
-
-        <ImageButton
-            android:id="@+id/btnA"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="bottom|center_horizontal"
-            android:text="A"
-            android:background="@drawable/btn_action"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnB"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="center_vertical|end"
-            android:text="B"
-            android:background="@drawable/btn_action"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnX"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="center_vertical|start"
-            android:text="X"
-            android:background="@drawable/btn_action"
-            android:alpha="0.6" />
-
-        <ImageButton
-            android:id="@+id/btnY"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_gravity="top|center_horizontal"
-            android:text="Y"
-            android:background="@drawable/btn_action"
-            android:alpha="0.6" />
-
-    </FrameLayout>
 
 </FrameLayout>

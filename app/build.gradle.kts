@@ -69,6 +69,8 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // Don't strip proot - the stripping process corrupts it
+            keepDebugSymbols += "**/libproot.so"
         }
     }
 }

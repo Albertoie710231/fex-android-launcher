@@ -52,48 +52,37 @@ class ProotExecutor(private val context: Context) {
      * Creates a symlink from libtalloc.so.2 to libtalloc.so in a writable directory.
      * libproot.so requires "libtalloc.so.2" but Android packages it as "libtalloc.so".
      * Since nativeLibraryDir is read-only, we create the symlink in app's files dir.
+     *
+     * Note: APK reinstalls change nativeLibraryDir path, so we always recreate the symlink
+     * to ensure it points to the current valid location.
      */
     private fun ensureTallocSymlink() {
         val nativeLibDir = File(context.applicationInfo.nativeLibraryDir)
         val tallocSource = File(nativeLibDir, "libtalloc.so")
-        val tallocSymlink = File(libOverrideDir, "libtalloc.so.2")
+        val tallocDest = File(libOverrideDir, "libtalloc.so.2")
 
-        if (tallocSymlink.exists()) {
-            Log.d(TAG, "libtalloc.so.2 symlink already exists at ${tallocSymlink.absolutePath}")
-            return
+        // Always delete and recreate
+        try {
+            tallocDest.delete()
+            Log.d(TAG, "Removed old libtalloc.so.2 (if existed)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not remove old file", e)
         }
 
         if (!tallocSource.exists()) {
-            Log.e(TAG, "libtalloc.so not found in native lib dir")
+            Log.e(TAG, "libtalloc.so not found in native lib dir: ${nativeLibDir.absolutePath}")
             return
         }
 
+        // Copy the file directly - symlinks don't work reliably with Android's library loading
         try {
-            // Use Runtime.exec to create symlink
-            val process = Runtime.getRuntime().exec(
-                arrayOf("ln", "-sf", tallocSource.absolutePath, tallocSymlink.absolutePath)
-            )
-            val exitCode = process.waitFor()
-            if (exitCode == 0) {
-                Log.i(TAG, "Created symlink: ${tallocSymlink.absolutePath} -> ${tallocSource.absolutePath}")
-            } else {
-                Log.e(TAG, "Failed to create symlink, exit code: $exitCode")
-                // Fallback: copy the file instead
-                tryCopyTalloc(tallocSource, tallocSymlink)
-            }
+            tallocSource.copyTo(tallocDest, overwrite = true)
+            // CRITICAL: Make the library executable - ld.so cannot preload non-executable .so files
+            tallocDest.setExecutable(true, false)
+            tallocDest.setReadable(true, false)
+            Log.i(TAG, "Copied libtalloc.so to ${tallocDest.absolutePath} with exec permissions")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to create libtalloc symlink", e)
-            // Fallback: copy the file
-            tryCopyTalloc(tallocSource, tallocSymlink)
-        }
-    }
-
-    private fun tryCopyTalloc(source: File, dest: File) {
-        try {
-            source.copyTo(dest, overwrite = true)
-            Log.i(TAG, "Copied libtalloc.so to ${dest.absolutePath} as fallback")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to copy libtalloc as fallback", e)
+            Log.e(TAG, "Failed to copy libtalloc", e)
         }
     }
 
@@ -121,20 +110,49 @@ class ProotExecutor(private val context: Context) {
         }
 
         val prootArgs = buildProotArgs(workingDir)
-        val fullCommand = listOf(prootBinary.absolutePath) + prootArgs + listOf("/bin/sh", "-c", command)
+
+        // Build the guest command with environment variables
+        // Proot doesn't forward host environment to guest, so we export them in the command
+        val guestEnvExports = environment.entries.joinToString("; ") { (key, value) ->
+            "export $key='$value'"
+        }
+        val guestCommand = if (guestEnvExports.isNotEmpty()) {
+            "$guestEnvExports; $command"
+        } else {
+            command
+        }
+
+        Log.d(TAG, "Guest command: $guestCommand")
+        val fullCommand = listOf(prootBinary.absolutePath) + prootArgs + listOf("/bin/sh", "-c", guestCommand)
 
         Log.d(TAG, "Executing: ${fullCommand.joinToString(" ")}")
 
         return try {
-            val processBuilder = ProcessBuilder(fullCommand).apply {
+            val baseEnv = buildBaseEnvironment()
+            val ldLibPath = baseEnv["LD_LIBRARY_PATH"] ?: ""
+            Log.d(TAG, "LD_LIBRARY_PATH: $ldLibPath")
+
+            // Android's linker namespace restrictions may prevent LD_LIBRARY_PATH from working
+            // when set via ProcessBuilder environment. Use a shell wrapper to ensure it works.
+            val shellCommand = buildString {
+                append("export LD_LIBRARY_PATH='$ldLibPath' && ")
+                append("export PROOT_LOADER='${baseEnv["PROOT_LOADER"]}' && ")
+                append("export PROOT_LOADER_32='${baseEnv["PROOT_LOADER_32"]}' && ")
+                append("export PROOT_TMP_DIR='${baseEnv["PROOT_TMP_DIR"]}' && ")
+                append("export PROOT_NO_SECCOMP=1 && ")
+                append("exec ${fullCommand.joinToString(" ") { "'$it'" }}")
+            }
+
+            Log.d(TAG, "Shell command: $shellCommand")
+
+            val processBuilder = ProcessBuilder("/system/bin/sh", "-c", shellCommand).apply {
                 // Set working directory to app's files dir
                 directory(File(context.filesDir.absolutePath))
 
-                // Merge environment variables
-                environment().apply {
-                    putAll(buildBaseEnvironment())
-                    putAll(environment)
-                }
+                // Set environment variables (these supplement the shell exports)
+                environment().clear()
+                environment().putAll(baseEnv)
+                environment().putAll(environment)
 
                 // Redirect stderr to stdout
                 redirectErrorStream(true)
@@ -195,6 +213,9 @@ class ProotExecutor(private val context: Context) {
     }
 
     private fun buildProotArgs(workingDir: String): List<String> {
+        Log.d(TAG, "Tmp dir: $tmpPath")
+        Log.d(TAG, "X11 socket dir: $x11SocketPath")
+
         return listOf(
             // Root filesystem
             "--rootfs=$rootfsPath",
@@ -210,10 +231,13 @@ class ProotExecutor(private val context: Context) {
             // GPU access (critical for Vulkan)
             "--bind=/dev/dri:/dev/dri",
 
+            // Temporary directory - MUST come before X11 socket bind
+            "--bind=$tmpPath:/tmp",
+
             // Shared memory
             "--bind=$tmpPath/shm:/dev/shm",
 
-            // X11 socket
+            // X11 socket - MUST come AFTER /tmp bind to override
             "--bind=$x11SocketPath:/tmp/.X11-unix",
 
             // Proc filesystem (limited in proot)
@@ -225,9 +249,6 @@ class ProotExecutor(private val context: Context) {
             // Android linker (for Vulkan passthrough)
             "--bind=/system:/system",
             "--bind=/vendor:/vendor",
-
-            // Temporary directory
-            "--bind=$tmpPath:/tmp",
 
             // Working directory inside container
             "-w", workingDir,
@@ -296,7 +317,7 @@ class ProotExecutor(private val context: Context) {
             return false
         }
 
-        // Try to run proot --version
+        // Try to run proot --version with proper LD_LIBRARY_PATH
         return try {
             val process = ProcessBuilder(prootBinary.absolutePath, "--version")
                 .redirectErrorStream(true)
