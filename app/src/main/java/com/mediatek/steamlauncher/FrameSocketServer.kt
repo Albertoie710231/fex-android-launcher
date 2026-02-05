@@ -191,6 +191,11 @@ class FrameSocketServer(private val port: Int = 19850) {
         Log.i(TAG, "Frame receiver ended")
     }
 
+    // Reusable bitmap to avoid allocations
+    private var frameBitmap: Bitmap? = null
+    private var bitmapWidth = 0
+    private var bitmapHeight = 0
+
     /**
      * Display a frame on the output surface.
      */
@@ -213,10 +218,55 @@ class FrameSocketServer(private val port: Int = 19850) {
             }
         }
 
-        // For now, just log that we received the frame
-        // TODO: Need separate SurfaceView for frame display (can't use LorieView's surface)
-        if (frameCount < 5) {
-            Log.i(TAG, "Received frame ${frameCount}: ${width}x${height}")
+        // Render to output surface
+        val surface = outputSurface
+        if (surface == null || !surface.isValid) {
+            if (frameCount < 5) {
+                Log.w(TAG, "No valid output surface for frame ${frameCount}")
+            }
+            return
+        }
+
+        try {
+            // Reuse or create bitmap
+            if (frameBitmap == null || bitmapWidth != width || bitmapHeight != height) {
+                frameBitmap?.recycle()
+                frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmapWidth = width
+                bitmapHeight = height
+                Log.i(TAG, "Created frame bitmap: ${width}x${height}")
+            }
+
+            // Copy pixels to bitmap
+            frameBitmap!!.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
+
+            // Draw to surface
+            val canvas = surface.lockCanvas(null)
+            if (canvas != null) {
+                // Scale to fit surface
+                val scaleX = canvas.width.toFloat() / width
+                val scaleY = canvas.height.toFloat() / height
+                val scale = minOf(scaleX, scaleY)
+
+                // Center the image
+                val offsetX = (canvas.width - width * scale) / 2
+                val offsetY = (canvas.height - height * scale) / 2
+
+                canvas.drawColor(android.graphics.Color.BLACK)
+                canvas.save()
+                canvas.translate(offsetX, offsetY)
+                canvas.scale(scale, scale)
+                canvas.drawBitmap(frameBitmap!!, 0f, 0f, paint)
+                canvas.restore()
+
+                surface.unlockCanvasAndPost(canvas)
+
+                if (frameCount < 5) {
+                    Log.i(TAG, "Rendered frame ${frameCount}: ${width}x${height} -> ${canvas.width}x${canvas.height}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to render frame: ${e.message}")
         }
     }
 

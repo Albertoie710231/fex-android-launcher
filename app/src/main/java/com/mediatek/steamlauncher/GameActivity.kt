@@ -12,6 +12,9 @@ import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
 import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
@@ -34,6 +37,7 @@ class GameActivity : AppCompatActivity() {
     }
 
     private lateinit var lorieView: LorieView
+    private lateinit var vulkanSurfaceView: SurfaceView
     private var steamService: SteamService? = null
     private var isBound = false
     private val handler = Handler(Looper.getMainLooper())
@@ -57,6 +61,11 @@ class GameActivity : AppCompatActivity() {
                 }
 
                 steamService?.onSurfaceReady()
+            }
+
+            // Set Vulkan frame surface if ready
+            if (vulkanSurfaceView.holder.surface.isValid) {
+                steamService?.setVulkanFrameSurface(vulkanSurfaceView.holder.surface)
             }
 
             waitForX11Server()
@@ -89,6 +98,29 @@ class GameActivity : AppCompatActivity() {
 
         lorieView = findViewById(R.id.lorieView)
         lorieView.touchMode = LorieView.TouchMode.MOUSE
+
+        // Set up Vulkan frame rendering surface
+        vulkanSurfaceView = findViewById(R.id.vulkanSurfaceView)
+        vulkanSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                Log.i(TAG, "Vulkan surface created")
+                steamService?.setVulkanFrameSurface(holder.surface)
+                // Make visible when we have a surface
+                vulkanSurfaceView.visibility = View.VISIBLE
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                Log.i(TAG, "Vulkan surface changed: ${width}x${height}")
+                steamService?.setVulkanFrameSurface(holder.surface)
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                Log.i(TAG, "Vulkan surface destroyed")
+                steamService?.setVulkanFrameSurface(null)
+            }
+        })
+        // Start visible to trigger surface creation
+        vulkanSurfaceView.visibility = View.VISIBLE
 
         // Set up the MainActivity stub with our LorieView
         // Native libXlorie code looks for MainActivity.getInstance().lorieView

@@ -15,6 +15,13 @@
         android:focusable="true"
         android:focusableInTouchMode="true" />
 
+    <!-- Vulkan Frame Rendering Surface (overlay) -->
+    <SurfaceView
+        android:id="@+id/vulkanSurfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
     <!-- Overlay Controls -->
     <LinearLayout
         android:id="@+id/controlsOverlay"

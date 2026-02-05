@@ -50,6 +50,10 @@ class SteamService : Service() {
     // Vortek socket path - must be accessible from both Android and container
     private val vortekSocketPath: String by lazy { "${app.getTmpDir()}/vortek.sock" }
 
+    // Frame socket for receiving Vulkan frames from proot (TCP on localhost:19850)
+    private var frameSocketServer: FrameSocketServer? = null
+    private var vulkanFrameSurface: Surface? = null  // Stored for when server starts later
+
     inner class LocalBinder : Binder() {
         fun getService(): SteamService = this@SteamService
     }
@@ -595,6 +599,40 @@ class SteamService : Service() {
         } else {
             Log.e(TAG, "Failed to start Vortek server")
         }
+
+        // Start frame socket server to receive Vulkan frames from proot
+        startFrameSocketServer()
+    }
+
+    /**
+     * Start the frame socket server for receiving Vulkan frames.
+     */
+    private fun startFrameSocketServer() {
+        if (frameSocketServer != null) {
+            Log.d(TAG, "Frame socket server already running")
+            return
+        }
+
+        Log.i(TAG, "Starting frame socket server on TCP port 19850")
+
+        frameSocketServer = FrameSocketServer().apply {
+            // Use the Vulkan frame surface if available, otherwise leave null
+            vulkanFrameSurface?.let { setOutputSurface(it) }
+            if (start()) {
+                Log.i(TAG, "Frame socket server started successfully")
+            } else {
+                Log.e(TAG, "Failed to start frame socket server")
+            }
+        }
+    }
+
+    /**
+     * Stop the frame socket server.
+     */
+    private fun stopFrameSocketServer() {
+        frameSocketServer?.stop()
+        frameSocketServer = null
+        Log.i(TAG, "Frame socket server stopped")
     }
 
     /**
@@ -691,6 +729,16 @@ class SteamService : Service() {
     }
 
     /**
+     * Set the surface for Vulkan frame rendering (from FrameSocketServer).
+     * This is separate from the X11 output surface.
+     */
+    fun setVulkanFrameSurface(surface: Surface?) {
+        Log.i(TAG, "setVulkanFrameSurface: surface=${surface != null}, serverRunning=${frameSocketServer != null}")
+        vulkanFrameSurface = surface
+        frameSocketServer?.setOutputSurface(surface)
+    }
+
+    /**
      * Create the FramebufferBridge and connect it to VortekRenderer.
      */
     @RequiresApi(Build.VERSION_CODES.O)
@@ -725,6 +773,7 @@ class SteamService : Service() {
         Log.i(TAG, "SteamService destroying")
         prootProcess?.destroyForcibly()
         x11Server?.stop()
+        stopFrameSocketServer()
         stopVortekServer()
         wakeLock?.let { if (it.isHeld) it.release() }
         serviceScope.cancel()
