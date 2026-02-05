@@ -409,27 +409,62 @@ class SteamService : Service() {
         monitorProcess("TERMINAL")
     }
 
+    // Set to true to use FEX-Emu instead of Box64
+    // FEX emulates x86 glibc → semaphores work on Android
+    // Box64 wraps to Bionic → semaphores fail on Android
+    private val useFexEmulator = true
+
     private suspend fun startSteam() = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Starting Steam...")
+        Log.i(TAG, "Starting Steam with ${if (useFexEmulator) "FEX-Emu" else "Box64"}...")
 
         val hostTmpDir = app.getTmpDir()
 
         val env = buildEnvironmentMap(hostTmpDir).toMutableMap().apply {
-            // Box64 specific settings
-            put("BOX64_LOG", "1")
-            put("BOX64_DYNAREC", "1")
+            if (useFexEmulator) {
+                // FEX-Emu settings
+                put("FEX_ROOTFS", "\$HOME/.fex-emu/RootFS/Ubuntu_22_04")
+            } else {
+                // Box64 specific settings
+                put("BOX64_LOG", "1")
+                put("BOX64_DYNAREC", "1")
+            }
         }
 
-        val script = """
+        val script = if (useFexEmulator) {
+            """
             #!/bin/bash
-            echo "Starting Steam..."
+            echo "Starting Steam via FEX-Emu..."
+            export FEX_ROOTFS="${'$'}HOME/.fex-emu/RootFS/Ubuntu_22_04"
+
+            # Check if FEX is installed
+            FEX_BIN=${'$'}(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
+            if [ -z "${'$'}FEX_BIN" ]; then
+                echo "ERROR: FEX not installed. Run setup_fex.sh first."
+                exit 1
+            fi
+
+            # Check if x86 rootfs exists
+            if [ ! -d "${'$'}FEX_ROOTFS" ]; then
+                echo "ERROR: x86-64 rootfs not found at ${'$'}FEX_ROOTFS"
+                echo "Run setup_fex.sh to download it."
+                exit 1
+            fi
+
+            # Run Steam through FEX
+            exec "${'$'}FEX_BIN" -- /usr/bin/steam "${'$'}@"
+            """.trimIndent()
+        } else {
+            """
+            #!/bin/bash
+            echo "Starting Steam via Box64..."
             if [ -f "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam" ]; then
                 exec /usr/local/bin/box32 "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
             else
                 echo "Steam not found"
                 exit 1
             fi
-        """.trimIndent()
+            """.trimIndent()
+        }
 
         val scriptFile = File(app.getTmpDir(), "launch.sh")
         scriptFile.writeText(script)

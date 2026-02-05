@@ -138,15 +138,33 @@ Vulkan passthrough to Mali GPU via Vortek IPC architecture.
 - [x] Choreographer-based vsync display (60 FPS)
 - [x] vkcube renders successfully
 
-### Phase 2: Replace Box64 with FEX ← CURRENT BLOCKER
+### Phase 2: Replace Box64 with FEX ← IN PROGRESS
 **Why:** Box64 wraps pthread to Android Bionic, which rejects semaphores. FEX emulates glibc.
 
-**Tasks:**
-- [ ] Get FEX binaries for ARM64 Linux (from Termux-FEX or build)
-- [ ] Install FEX in rootfs (replace Box64)
-- [ ] Modify `SteamService.kt`: change `box32` → `FEXInterpreter`
-- [ ] Configure FEX thunks for Vulkan (point to libvulkan_vortek.so)
-- [ ] Test semaphore-using app (confirm fix)
+**Key Difference:**
+- Box64: Uses native ARM64 libs, wraps pthread → semaphores FAIL
+- FEX: Uses x86 libs from x86 rootfs, emulates glibc → semaphores WORK
+
+**Implementation:**
+- [x] Created `setup_fex.sh` - installs FEX via Ubuntu PPA
+- [x] Downloads x86-64 rootfs (~2GB) for FEX to use
+- [x] Modified `SteamService.kt` - added `useFexEmulator` flag
+- [x] Created wrapper scripts: `fex-steam`, `fex-shell`, `fex-test-sem`
+- [ ] Test FEX installation in rootfs
+- [ ] Test semaphore test (`fex-test-sem`)
+- [ ] Test Steam launch via FEX
+
+**To test in rootfs:**
+```bash
+# Install FEX
+/assets/setup_fex.sh
+
+# Test semaphores work
+fex-test-sem
+
+# Launch Steam
+fex-steam
+```
 
 ### Phase 3: Vortek + Mali Integration ✓ COMPLETE
 **Note:** Using Vortek (IPC passthrough) instead of Zink (Mesa GL→VK translation).
