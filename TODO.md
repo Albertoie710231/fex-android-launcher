@@ -1,163 +1,306 @@
 # Development TODO
 
-## Current Status (2026-02-03)
+## Current Status (2026-02-05)
 
-### Completed
-- [x] PRoot executor with proper environment (PROOT_TMP_DIR, LD_LIBRARY_PATH)
-- [x] libtalloc.so.2 symlink fix
-- [x] Ubuntu 22.04 arm64 rootfs download and extraction
-- [x] Symlink handling in tar extraction (/bin -> /usr/bin)
-- [x] Steam .deb download and extraction from Android side (OkHttp + Commons-Compress)
-- [x] Container commands working (echo, uname, ls, bash via proot)
-- [x] Git repository initialized
-- [x] **Box64 compiled with BOX32 support** (v0.4.1 with ARM Dynarec, 75MB)
-- [x] **box32 symlink created** (for 32-bit x86 Steam client)
-- [x] 32-bit x86 libraries installed in `/lib/i386-linux-gnu/`
-- [x] **PRoot patched for futex/semaphore support** (fixes "semaphore creation failed")
-- [x] **Steam bootstrap extracted** (via Java XZ library, no external xz needed)
-- [x] **Steam loads successfully via Box32** (verified via ADB test)
+### What's Working ✓
+- [x] PRoot executor with proper environment
+- [x] Ubuntu 22.04 arm64 rootfs
+- [x] Box64 with BOX32 support installed
+- [x] Steam binary starts loading
+- [x] X11Server wrapper exists (libXlorie)
+- [x] **Vortek Vulkan passthrough** - Mali GPU rendering works!
+- [x] **vkcube runs** - Renders at 15-40 FPS on screen
+- [x] **Framebuffer bridge** - HardwareBuffer → Surface display
+- [x] **Headless Vulkan surface** - VK_EXT_headless_surface wrapper
+- [x] **Choreographer vsync** - 60 FPS display loop
 
-### What's Working
-```
-✅ PRoot with futex_time64 syscall handling
-✅ Box64 v0.4.1 with Dynarec
-✅ Box32 (symlink to Box64 with BOX32=ON)
-✅ Steam binary loads without semaphore errors
-✅ All wrapped libraries load (libdl, librt, libm, libpthread, libc, ld-linux)
-✅ App is self-contained (XZ decompression via Java, no external binaries needed)
-```
+### What's NOT Working
+- [ ] **Semaphores crash** - "semaphore creation failed Function not implemented"
+- [ ] **Steam full launch** - Blocked by semaphore issue (Box64 limitation)
 
-### Current Test Output (Success)
+### Root Cause Analysis: Semaphore Issue
+
+The semaphore error is NOT a PRoot issue - it's a **Box64 architecture limitation on Android**:
+
 ```
-[BOX32] Personality set to 32bits
-[BOX32] Using Box32 to load 32bits elf
-[BOX32] Rename process to "steam"
-[BOX32] Using native(wrapped) libdl.so.2
-[BOX32] Using native(wrapped) librt.so.1
-[BOX32] Using native(wrapped) libm.so.6
-[BOX32] Using native(wrapped) libpthread.so.0
-[BOX32] Using native(wrapped) libc.so.6
-[BOX32] Using native(wrapped) ld-linux.so.2
+Steam (x86)
+    → Box64 (wraps pthread to host)
+        → Android Bionic (not glibc!)
+            → semaphore syscall
+                → Android kernel REJECTS (ENOSYS)
 ```
 
-## Next Steps
+**Why Box64 fails on Android:**
+1. Box64 wraps pthread/semaphore calls to the HOST system
+2. On Android, the host is Bionic (not glibc)
+3. Android kernel blocks SYSV semaphores (semget/semop)
+4. Android 8+ Seccomp blocks additional syscalls
+5. Even `libandroid-sysv-semaphore` crashes with "bad system call"
 
-### 1. Integrate X11 Server (HIGH PRIORITY)
-Steam needs a display server to render its GUI. Options:
-- **Termux:X11** - Use as external dependency (user installs separately)
-- **Bundle Termux:X11 library** - Integrate into app for self-contained solution
-- **Implement minimal X11 server** - Based on Lorie (already have stubs in code)
+**Key insight:** This is unfixable by patching PRoot. The problem is Box64's pthread wrapping design.
 
-### 2. Test Steam GUI Rendering
-Once X11 is available:
+---
+
+## Solution: Migrate to FEX-Emu
+
+### Why FEX Solves the Semaphore Problem
+
+| Aspect | Box64 | FEX |
+|--------|-------|-----|
+| pthread handling | **Wraps to host Bionic** | **Emulates x86 glibc** |
+| sem_init() | Calls Bionic → fails | Emulates glibc → uses futex → works |
+| Thunked libs | pthread, GL, Vulkan | GL, Vulkan, X11 (NOT pthread!) |
+
+FEX only thunks performance-critical libraries:
+- Graphics: libGL, libEGL, libVulkan
+- Audio: libasound
+- Windowing: libX11, libwayland-client
+
+**pthread/semaphores are FULLY EMULATED** → glibc implementation → futex syscall → Android supports this!
+
+### Target Architecture (FEX + Vortek)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Android App (Kotlin)                                        │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  VortekRenderer (libvortekrenderer.so)                 │  │
+│  │  - Receives Vulkan commands via Unix socket            │  │
+│  │  - Executes on Mali GPU (/vendor/lib64/hw/vulkan.mali) │  │
+│  │  - Renders to HardwareBuffer                           │  │
+│  └────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  FramebufferBridge                                     │  │
+│  │  - Blits HardwareBuffer → Android Surface              │  │
+│  │  - Choreographer vsync (60 FPS)                        │  │
+│  └────────────────────────────────────────────────────────┘  │
+└─────────────────────┬────────────────────────────────────────┘
+                      │ Unix socket (Vulkan IPC)
+┌─────────────────────▼────────────────────────────────────────┐
+│  PRoot Container (ARM64 Ubuntu)                              │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  libvulkan_vortek.so (ICD)                              │ │
+│  │  - Serializes Vulkan API calls                          │ │
+│  │  - Sends to VortekRenderer via socket                   │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  FEX-Emu (NEEDED - replaces Box64)                      │ │
+│  │  - Emulates x86 glibc (semaphores work!)                │ │
+│  │  - Thunks Vulkan to libvulkan_vortek.so                 │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │  Steam (x86) + DXVK                                     │ │
+│  │  - Direct3D → Vulkan → Vortek → Mali GPU                │ │
+│  └─────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Mali GPU Support ✓ WORKING
+
+**Problem solved:** Most FEX/Android projects use Turnip driver (Adreno-only). We use **Vortek** instead.
+
+**Our Solution: Vortek IPC Passthrough**
+```
+Container (glibc)              Android (Bionic)
+┌─────────────────┐            ┌─────────────────┐
+│ libvulkan_vortek│───socket──→│ VortekRenderer  │
+│ (serializes API)│            │ (executes on GPU)│
+└─────────────────┘            └────────┬────────┘
+                                        ↓
+                               /vendor/lib64/hw/vulkan.mali.so
+                                        ↓
+                                   Mali G710/G720
+```
+
+**Why Vortek works on Mali:**
+1. Bypasses glibc/Bionic incompatibility via IPC
+2. VortekRenderer runs in Android process with Bionic
+3. Directly calls Mali's vulkan.mali.so driver
+4. No Mesa/Zink/Turnip needed
+
+**Verified working:**
+- vkcube renders at 15-40 FPS
+- Vulkan commands serialize correctly
+- HardwareBuffer GPU blitting works
+
+---
+
+## Migration Plan
+
+### Phase 1: Vulkan Rendering ✓ COMPLETE
+Vulkan passthrough to Mali GPU via Vortek IPC architecture.
+
+**Implemented:**
+- [x] Vortek ICD (`libvulkan_vortek.so`) - serializes Vulkan commands in container
+- [x] VortekRenderer (`libvortekrenderer.so`) - executes on Mali GPU in Android
+- [x] VK_EXT_headless_surface wrapper for windowless rendering
+- [x] FramebufferBridge - HardwareBuffer GPU blitting to Surface
+- [x] Choreographer-based vsync display (60 FPS)
+- [x] vkcube renders successfully
+
+### Phase 2: Replace Box64 with FEX ← CURRENT BLOCKER
+**Why:** Box64 wraps pthread to Android Bionic, which rejects semaphores. FEX emulates glibc.
+
+**Tasks:**
+- [ ] Get FEX binaries for ARM64 Linux (from Termux-FEX or build)
+- [ ] Install FEX in rootfs (replace Box64)
+- [ ] Modify `SteamService.kt`: change `box32` → `FEXInterpreter`
+- [ ] Configure FEX thunks for Vulkan (point to libvulkan_vortek.so)
+- [ ] Test semaphore-using app (confirm fix)
+
+### Phase 3: Vortek + Mali Integration ✓ COMPLETE
+**Note:** Using Vortek (IPC passthrough) instead of Zink (Mesa GL→VK translation).
+
+**Implemented:**
+- [x] Vortek IPC via Unix socket + ashmem ring buffers
+- [x] Mali driver access via `/vendor/lib64/hw/vulkan.mali.so`
+- [x] libhook_impl.so intercepts Mali driver calls
+- [x] Mali-specific optimizations (gl_ClipDistance, BCn textures)
+
+### Phase 4: Steam Testing
+**Tasks:**
+- [ ] Launch Steam with FEX + Vortek
+- [ ] Verify no semaphore errors
+- [ ] Test Steam GUI rendering (X11 or headless)
+- [ ] Test game downloads/launches
+- [ ] Test DXVK games (Direct3D → Vulkan → Vortek → Mali)
+
+---
+
+## Resources
+
+### Vortek (Our GPU Solution)
+- Source: Extracted from Winlator APK
+- `libvortekrenderer.so` - Android-side Vulkan executor
+- `libvulkan_vortek.so` - Container-side Vulkan ICD
+- Mali-specific optimizations included
+
+### FEX-Emu (Needed for Steam)
+- Main repo: https://github.com/FEX-Emu/FEX
+- Mali GPU discussion: https://github.com/FEX-Emu/FEX/discussions/4989
+- Termux-FEX: https://github.com/DesMS/Termux-FEX
+- FEXDroid: https://github.com/gamextra4u/FEXDroid
+
+### Box64 (Current - Semaphore Issues)
+- Main repo: https://github.com/ptitSeb/box64
+- Problem: Wraps pthread to Android Bionic → semaphores fail
+
+### Android Semaphore Limitations
+- SYSV semaphores: NOT supported by Android kernel
+- Named POSIX semaphores (sem_open): NOT supported
+- Unnamed POSIX semaphores (sem_init + futex): SHOULD work
+- Seccomp (Android 8+): Blocks additional syscalls
+- **FEX solves this** by emulating glibc semaphores via futex
+
+### Related Projects
+- Winlator: https://github.com/brunodev85/winlator (Vortek source)
+- androBox: https://github.com/Pipetto-crypto/androBox
+- termux-box: https://github.com/olegos2/termux-box
+
+---
+
+## File Changes Needed for FEX Migration
+
+### SteamService.kt
+```kotlin
+// OLD (Box64):
+exec /usr/local/bin/box32 "$STEAM_BIN" "$@"
+
+// NEW (FEX):
+exec FEXInterpreter "$STEAM_BIN" "$@"
+```
+
+### setup.sh
 ```bash
-# Steam should connect to DISPLAY=:0
+# Install FEX (replaces Box64)
+wget https://github.com/FEX-Emu/FEX/releases/... -O /opt/fex/FEXInterpreter
+chmod +x /opt/fex/FEXInterpreter
+
+# Vortek ICD already configured - no Zink needed
+```
+
+### Environment Variables
+```bash
+# FEX config
+export FEX_ROOTFS=/path/to/x86_rootfs
+
+# Vortek Vulkan (already set up)
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+```
+
+---
+
+## Architecture Comparison
+
+### Current (Box64 + Vortek - GPU Works, Semaphores Broken)
+```
+Android App → PRoot → Ubuntu ARM64 → Box64 → Steam x86
+     ↓                     ↓                    ↓
+VortekRenderer      libvulkan_vortek.so   Wraps pthread to Bionic
+     ↓                     ↓                    ↓
+Mali GPU ←───────── Vulkan IPC ──────────  Kernel rejects semaphores
+   ✓ WORKS                                      ✗ CRASH
+```
+
+### Proposed (FEX + Vortek - Should Fully Work)
+```
+Android App → PRoot → Ubuntu ARM64 → FEX → Steam x86
+     ↓                     ↓                ↓
+VortekRenderer      libvulkan_vortek.so  Emulates glibc
+     ↓                     ↓                ↓
+Mali GPU ←───────── Vulkan IPC ────── Semaphores via futex
+   ✓ WORKS              ✓ WORKS           ✓ SHOULD WORK
+```
+
+---
+
+## Quick Reference
+
+### Test Vortek + Mali GPU ✓
+```bash
+# Inside proot - runs vkcube with headless surface
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+export LD_PRELOAD=/lib/libvulkan_headless.so
+./vkcube --c 1000  # Renders 1000 frames to Android screen
+```
+
+### Test Vulkan Info
+```bash
+# Inside proot
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+vulkaninfo --summary  # Should show Mali GPU
+```
+
+### Test X11 Server
+```bash
+# Inside proot
 export DISPLAY=:0
-box32 /home/user/.local/share/Steam/ubuntu12_32/steam
+xterm  # or xclock, xeyes
 ```
 
-### 3. Audio Support
-- PulseAudio server on Android side
-- Or use `PULSE_SERVER=tcp:127.0.0.1:4713`
-
-### 4. Input Handling
-- Touch to mouse translation
-- Virtual keyboard for text input
-- Game controller support
-
-## Known Issues
-
-### lscpu not found (harmless warning)
-```
-sh: 1: lscpu: not found
-```
-Box64 tries to detect CPU but lscpu isn't in minimal rootfs. Doesn't affect functionality.
-
-### libtalloc symlink breaks after APK reinstall
-The symlink points to APK native lib path which changes on reinstall. Fix:
+### Test FEX (after migration)
 ```bash
-APP_PATH=$(adb shell "pm path com.mediatek.steamlauncher" | cut -d: -f2 | tr -d '\r\n')
-NATIVELIB=$(dirname "$APP_PATH")/lib/arm64
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  ln -sf $NATIVELIB/libtalloc.so files/lib-override/libtalloc.so.2
-'"
+# Inside proot
+FEXInterpreter /path/to/x86/binary
 ```
 
-## Build Commands Reference
-
-### Test Steam via ADB
+### Check Semaphores
 ```bash
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  export NATIVELIB=\$(dirname \$(pm path com.mediatek.steamlauncher | cut -d: -f2))/lib/arm64
-  export LD_LIBRARY_PATH=files/lib-override:\$NATIVELIB
-  export PROOT_LOADER=\$NATIVELIB/libproot-loader.so
-  export PROOT_TMP_DIR=cache/proot-tmp
-  export PROOT_NO_SECCOMP=1
-
-  timeout 15 \$NATIVELIB/libproot.so --rootfs=files/rootfs \
-    -b /dev -b /proc -b /sys -w /home/user \
-    /bin/sh -c \"
-      export HOME=/home/user DISPLAY=:0 BOX64_LOG=1 STEAM_RUNTIME=0
-      export LD_LIBRARY_PATH=/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu
-      /usr/local/bin/box32 /home/user/.local/share/Steam/ubuntu12_32/steam
-    \"
-'"
+# Simple test program
+cat > /tmp/sem_test.c << 'EOF'
+#include <semaphore.h>
+#include <stdio.h>
+int main() {
+    sem_t sem;
+    if (sem_init(&sem, 0, 1) == -1) {
+        perror("sem_init");
+        return 1;
+    }
+    printf("Semaphore created successfully!\n");
+    sem_destroy(&sem);
+    return 0;
+}
+EOF
+gcc /tmp/sem_test.c -o /tmp/sem_test -lpthread
+/tmp/sem_test
 ```
-
-### Compile Box64 with BOX32 (for 64-bit only devices)
-```bash
-docker run --rm --platform linux/arm64 \
-  -v /tmp/box64-build:/output \
-  ubuntu:22.04 bash -c "
-    apt-get update &&
-    apt-get install -y git cmake build-essential python3 &&
-    git clone --depth 1 https://github.com/ptitSeb/box64.git /box64 &&
-    mkdir /box64/build && cd /box64/build &&
-    cmake .. -DARM_DYNAREC=ON -DBOX32=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo &&
-    make -j\$(nproc) &&
-    cp box64 /output/
-  "
-```
-
-### Compile PRoot with futex patch
-See `/tmp/termux-proot/` for patched source. Key changes:
-- `src/syscall/sysnums.list` - Added `futex_time64`
-- `src/syscall/sysnums-arm.h` and `sysnums-arm64.h` - Added syscall 422 mapping
-- `src/syscall/enter.c` - Added explicit futex passthrough handling
-
-## Problem History
-
-### "semaphore creation failed Function not implemented" (SOLVED)
-- Steam uses futex syscalls for semaphores/mutexes
-- PRoot didn't have explicit handling for `futex_time64` (syscall 422)
-- **Solution:** Patched PRoot to pass through futex syscalls cleanly
-
-### Device is 64-bit only (no ARM32 support) (SOLVED)
-- `getprop ro.product.cpu.abilist32` returns empty
-- Box86 (ARM32 binary) cannot run
-- **Solution:** Use Box64 with `BOX32=ON` compile flag
-
-### glibc version mismatch (SOLVED)
-- Cross-compiling on host links against newer glibc
-- **Solution:** Compile inside Docker with `--platform linux/arm64 ubuntu:22.04`
-
-### xz command not found in rootfs (SOLVED)
-- Steam bootstrap is `.tar.xz` format
-- Minimal rootfs doesn't have xz utility
-- **Solution:** Use Java's `XZCompressorInputStream` from Apache Commons Compress
-
-## App Components
-
-### Bundled in APK
-- `libproot.so` - Patched PRoot with futex support (222KB)
-- `libproot-loader.so` - PRoot loader for ARM64
-- `libproot-loader32.so` - PRoot loader for ARM32
-- `libtalloc.so` - Talloc library for PRoot
-- `box64.xz` - Box64 v0.4.1 with BOX32 (11MB compressed)
-- `x86-libs.tar.xz` - 32-bit x86 libraries (3MB compressed)
-
-### Extracted at Runtime
-- Ubuntu 22.04 arm64 rootfs (downloaded on first run)
-- Steam client (downloaded and extracted via app)
-- Box64/Box32 binaries (extracted from assets)
-- x86 libraries (extracted from assets)

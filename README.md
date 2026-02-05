@@ -1,6 +1,6 @@
 # MediaTek Steam Gaming App
 
-A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimensity tablets using direct Vulkan passthrough, proot isolation, and Box64/Box86 for x86_64/x86 translation.
+A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimensity tablets using Vortek Vulkan IPC passthrough, proot isolation, and x86 emulation.
 
 ## Architecture
 
@@ -13,27 +13,55 @@ A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimens
 │  - Settings            │  - Session lifecycle               │
 │  - Container mgmt      │  - Phantom process workaround      │
 ├─────────────────────────────────────────────────────────────┤
-│                    X11 Server (Lorie)                        │
-│  - LorieView (SurfaceView) renders X11 to Android           │
-│  - Touch/keyboard input translation                          │
+│                 Vortek Renderer (Android)                    │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │ libvortekrenderer.so                                    ││
+│  │  - Receives Vulkan commands via Unix socket             ││
+│  │  - Executes on Mali GPU (/vendor/lib64/hw/vulkan.mali)  ││
+│  │  - Renders to HardwareBuffer                            ││
+│  └─────────────────────────────────────────────────────────┘│
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │ FramebufferBridge                                       ││
+│  │  - Blits HardwareBuffer → Android Surface               ││
+│  │  - Choreographer vsync (60 FPS)                         ││
+│  └─────────────────────────────────────────────────────────┘│
 ├─────────────────────────────────────────────────────────────┤
 │                    PRoot Container                           │
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │ Ubuntu 22.04 RootFS                                     ││
-│  │  ├── Box64 (x86_64 → ARM64 translation)                ││
-│  │  ├── Box32 (x86 → ARM64 via Box64 with BOX32=ON)       ││
+│  │  ├── libvulkan_vortek.so (Vulkan ICD)                  ││
+│  │  │   └── Serializes Vulkan calls → sends via socket    ││
+│  │  ├── Box64/FEX (x86 → ARM64 translation)               ││
 │  │  ├── Steam Client                                       ││
-│  │  ├── Proton (Wine-based Windows compat)                 ││
-│  │  └── Mesa + Vulkan libraries                            ││
+│  │  ├── DXVK (Direct3D → Vulkan)                          ││
+│  │  └── Proton (Wine-based Windows compat)                 ││
 │  └─────────────────────────────────────────────────────────┘│
-├─────────────────────────────────────────────────────────────┤
-│                 Vulkan Passthrough Layer                     │
-│  - Direct Android Vulkan → PRoot                            │
-│  - Mali GPU optimizations                                    │
 ├─────────────────────────────────────────────────────────────┤
 │              Android GPU (Mali G710/G720)                    │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Vortek: How Mali GPU Works
+
+The key innovation is **Vortek IPC passthrough** - bridging glibc (container) and Bionic (Android):
+
+```
+Container (glibc)              Android (Bionic)
+┌─────────────────┐            ┌─────────────────┐
+│ Game/Steam      │            │                 │
+│      ↓          │            │                 │
+│ DXVK (D3D→VK)   │            │                 │
+│      ↓          │            │                 │
+│ libvulkan_vortek│───socket──→│ VortekRenderer  │
+│ (serialize API) │  + ashmem  │ (execute on GPU)│
+└─────────────────┘            └────────┬────────┘
+                                        ↓
+                               vulkan.mali.so
+                                        ↓
+                                   Mali GPU
+```
+
+This bypasses the glibc/Bionic binary incompatibility that prevents loading Android's Vulkan driver directly from the container.
 
 ## Requirements
 
@@ -101,25 +129,34 @@ adb shell "/system/bin/dumpsys activity settings | grep max_phantom"
 app/
 ├── src/main/
 │   ├── java/com/mediatek/steamlauncher/
-│   │   ├── SteamLauncherApp.kt    # Application class
-│   │   ├── MainActivity.kt         # Main launcher UI
-│   │   ├── SteamService.kt         # Foreground service
-│   │   ├── ContainerManager.kt     # RootFS management
-│   │   ├── ProotExecutor.kt        # PRoot JNI wrapper
-│   │   ├── X11Server.kt            # X11 server lifecycle
-│   │   ├── LorieView.kt            # X11 rendering surface
-│   │   ├── VulkanBridge.kt         # Vulkan passthrough
-│   │   ├── InputHandler.kt         # Input handling
-│   │   ├── GameActivity.kt         # Game display activity
-│   │   └── SettingsActivity.kt     # Settings UI
+│   │   ├── SteamLauncherApp.kt     # Application class
+│   │   ├── MainActivity.kt          # Main launcher UI
+│   │   ├── SteamService.kt          # Foreground service
+│   │   ├── ContainerManager.kt      # RootFS management
+│   │   ├── ProotExecutor.kt         # PRoot JNI wrapper
+│   │   ├── VortekRenderer.kt        # Vortek Vulkan wrapper
+│   │   ├── FramebufferBridge.kt     # HardwareBuffer → Surface
+│   │   ├── FrameSocketServer.kt     # TCP frame receiver
+│   │   ├── X11Server.kt             # X11 server lifecycle
+│   │   ├── X11SocketHelper.kt       # Unix socket helper
+│   │   └── ...
 │   ├── cpp/
-│   │   ├── steamlauncher.cpp       # JNI bridge
-│   │   ├── lorie/                  # X11 server implementation
-│   │   └── vulkan_bridge/          # Vulkan configuration
+│   │   ├── steamlauncher.cpp        # JNI bridge
+│   │   ├── framebuffer_bridge.cpp   # HardwareBuffer JNI
+│   │   ├── x11_socket.cpp           # Unix socket JNI
+│   │   ├── vulkan_headless_wrapper.c # Headless surface wrapper
+│   │   └── lorie/                   # X11 server implementation
+│   ├── jniLibs/arm64-v8a/
+│   │   ├── libvortekrenderer.so     # Android Vulkan executor
+│   │   ├── libhook_impl.so          # Mali driver hook
+│   │   └── ...
 │   ├── assets/
-│   │   └── setup.sh                # Container setup script
+│   │   ├── libvulkan_vortek.so      # Container Vulkan ICD
+│   │   ├── libvulkan_headless.so    # Headless surface wrapper
+│   │   ├── setup.sh                 # Container setup script
+│   │   └── vkcube, vulkaninfo       # Test binaries
 │   └── res/
-│       └── layout/                 # UI layouts
+│       └── layout/                  # UI layouts
 └── build.gradle.kts
 ```
 
@@ -132,26 +169,38 @@ Foreground service that keeps the proot container alive. Required for Android 12
 Manages the Linux rootfs lifecycle:
 - Downloads Ubuntu 22.04 arm64 base
 - Configures X11, Vulkan, and Steam dependencies
-- Installs Box64 with BOX32 support (handles both 32-bit and 64-bit x86)
-- Extracts Steam bootstrap from .deb (uses Java XZ library, no external xz binary needed)
+- Installs x86 emulator (Box64/FEX)
+- Extracts Steam bootstrap from .deb
+
+### VortekRenderer
+Android-side Vulkan execution:
+- `libvortekrenderer.so` - receives serialized Vulkan commands
+- Executes on Mali GPU via `/vendor/lib64/hw/vulkan.mali.so`
+- Renders to HardwareBuffer (GPU memory)
+
+### FramebufferBridge
+GPU frame delivery to screen:
+- Wraps HardwareBuffer as Bitmap (GPU-backed, zero-copy)
+- Blits to Android Surface via Canvas
+- Choreographer-based vsync (60 FPS target)
+
+### libvulkan_vortek.so (Container ICD)
+Container-side Vulkan serialization:
+- Implements full Vulkan API for container apps
+- Serializes all Vulkan commands
+- Sends via Unix socket to VortekRenderer
 
 ### X11Server / LorieView
 Provides X11 display server functionality:
-- Renders X11 content to Android Surface via OpenGL ES
+- Renders X11 content to Android Surface
 - Translates Android touch events to X11 mouse events
 - Handles keyboard input
 
-### VulkanBridge
-Configures Vulkan passthrough:
-- Creates ICD configuration for Android Vulkan driver
-- Sets up Mali-specific workarounds
-- Configures DXVK environment for Proton
-
 ### ProotExecutor
 Wraps proot execution:
-- Binds /dev/dri for GPU access
-- Binds X11 socket
-- Configures environment for Box64/Box86
+- Binds /dev for device access
+- Binds X11 and Vortek sockets
+- Configures environment for x86 emulation
 
 ## Testing Steam via ADB
 
@@ -212,21 +261,30 @@ adb shell "run-as com.mediatek.steamlauncher sh -c '
 
 ## Troubleshooting
 
-### Steam crashes on launch
-- Ensure Box32 symlink exists (points to Box64 with BOX32 support)
-- Check that all 32-bit x86 libraries are installed in `/lib/i386-linux-gnu/`
-- Disable libmimalloc: `export LD_PRELOAD=""`
-- Check for "semaphore creation failed" - if present, the patched PRoot is not being used
+### Steam crashes with "semaphore creation failed"
+This is a **Box64 limitation on Android** - Box64 wraps pthread to Bionic, which rejects semaphores.
+- **Solution:** Migrate to FEX-Emu (see TODO.md Phase 2)
+- This is NOT fixable by patching PRoot
+
+### Vulkan/vkcube not rendering
+1. Check Vortek ICD is configured:
+   ```bash
+   cat /usr/share/vulkan/icd.d/vortek_icd.json
+   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+   ```
+2. Check VortekRenderer is running (Android logs)
+3. Run `vulkaninfo --summary` - should show Mali GPU
+4. For headless apps, ensure `LD_PRELOAD=/lib/libvulkan_headless.so`
 
 ### Black screen / no rendering
-- Verify X11 socket exists: `/tmp/.X11-unix/X0`
+- For Vulkan apps: Check FramebufferBridge is receiving frames
+- For X11 apps: Verify X11 socket exists `/tmp/.X11-unix/X0`
 - Check DISPLAY is set: `echo $DISPLAY` should show `:0`
-- Test with `xeyes` or `glxgears`
 
-### Vulkan not working
-- Run `vulkaninfo --summary` in the container
-- Check VK_ICD_FILENAMES is set correctly
-- Verify /dev/dri is bound in proot
+### Low FPS / stuttering
+- vkcube renders at 15-40 FPS (variable render time in PRoot)
+- Display runs at 60 FPS via Choreographer
+- Frame pacing optimization is WIP
 
 ### App killed by Android
 - Run the phantom process fix commands via ADB
@@ -239,14 +297,38 @@ MIT License
 
 ## Credits
 
-- [Box64](https://github.com/ptitSeb/box64) - x86_64 emulation (with BOX32 support for 32-bit x86)
-- [PRoot](https://github.com/termux/proot) - User-space chroot (Termux fork, patched for futex/semaphore support)
+- [Winlator](https://github.com/brunodev85/winlator) - Vortek Vulkan IPC passthrough
+- [Box64](https://github.com/ptitSeb/box64) - x86_64 emulation (with BOX32 support)
+- [FEX-Emu](https://github.com/FEX-Emu/FEX) - x86 emulation with glibc emulation (planned)
+- [PRoot](https://github.com/termux/proot) - User-space chroot (Termux fork)
 - [Termux:X11](https://github.com/termux/termux-x11) - X11 server inspiration
 
 ## Technical Notes
 
-### PRoot Futex Patch
-The bundled `libproot.so` includes patches for `futex_time64` syscall handling, required for Steam's semaphore operations on Android. Without this patch, Steam fails with "semaphore creation failed Function not implemented".
+### Vortek IPC Architecture
+Vortek solves the fundamental problem that Android's Vulkan driver (vulkan.mali.so) uses Bionic libc, but container apps use glibc. You cannot load a Bionic library from glibc code.
 
-### Box64 with BOX32
-Since many Android devices are ARM64-only (no 32-bit ARM support), we use Box64 compiled with `BOX32=ON` flag. This allows Box64 to handle both 32-bit x86 (via `box32` symlink) and 64-bit x86_64 binaries on ARM64-only devices.
+**Solution:** Serialize Vulkan API calls in the container, send via Unix socket + ashmem ring buffers (4MB commands, 256KB results), deserialize and execute in Android process.
+
+**Components:**
+- `libvulkan_vortek.so` (glibc, container) - Vulkan ICD that serializes API calls
+- `libvortekrenderer.so` (Bionic, Android) - Executes on real Mali GPU
+- `libhook_impl.so` - Intercepts vulkan.mali.so loading
+
+### VK_EXT_headless_surface
+The `vulkan_headless_wrapper.c` adds headless surface support for apps that don't need X11/XCB:
+- Wraps libvulkan_vortek.so
+- Adds VK_EXT_headless_surface extension
+- Used by vkcube for windowless rendering
+
+### FramebufferBridge
+Zero-copy GPU frame display:
+1. VortekRenderer renders to AHardwareBuffer (GPU memory)
+2. FramebufferBridge wraps as Bitmap (GPU-backed)
+3. Blits to Android Surface via Canvas
+4. Choreographer syncs to 60 FPS vsync
+
+### x86 Emulation (Current Blocker)
+**Box64** wraps pthread to Android Bionic → semaphores fail on Android kernel.
+
+**FEX-Emu** (planned) emulates x86 glibc → semaphores use futex → Android supports this.

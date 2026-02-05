@@ -28,6 +28,18 @@
 #include <fcntl.h>
 #include <time.h>
 
+// Debug logging control - set to 0 to disable most logs for performance
+#define XCB_BRIDGE_DEBUG 0
+
+#if XCB_BRIDGE_DEBUG
+#define DEBUG_LOG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while(0)
+#else
+#define DEBUG_LOG(...) do {} while(0)
+#endif
+
+// Always log errors and important state changes
+#define ERROR_LOG(...) do { fprintf(stderr, __VA_ARGS__); fflush(stderr); } while(0)
+
 // Minimal Vulkan types
 typedef uint32_t VkFlags;
 typedef uint32_t VkBool32;
@@ -358,13 +370,6 @@ static void send_frame_pitched(uint32_t width, uint32_t height, const void* pixe
             src += row_pitch;
         }
     }
-
-    static int frame_count = 0;
-    if (frame_count < 5 || frame_count % 60 == 0) {
-        fprintf(stderr, "[XCB-Bridge] Sent frame %d: %ux%u (pitch=%zu)\n",
-                frame_count, width, height, row_pitch);
-    }
-    frame_count++;
 }
 
 // Legacy wrapper for compatibility
@@ -1273,32 +1278,13 @@ void vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks*
 // Hook vkWaitForFences - vkcube may block here before AcquireNextImage
 VkResult vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences,
                           VkBool32 waitAll, uint64_t timeout) {
-    static int wait_count = 0;
-    if (wait_count < 20 || (wait_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] vkWaitForFences (count=%u, waitAll=%u, timeout=%lu, call #%d)\n",
-                fenceCount, waitAll, (unsigned long)timeout, wait_count);
-        fflush(stderr);
-    }
-    wait_count++;
-
+    (void)device; (void)fenceCount; (void)pFences; (void)waitAll; (void)timeout;
     // For our fake swapchain, immediately return success
-    // The fences are never signaled but we pretend they are
-    if (wait_count < 20) {
-        fprintf(stderr, "[XCB-Bridge] vkWaitForFences -> returning VK_SUCCESS immediately\n");
-        fflush(stderr);
-    }
-    return VK_SUCCESS;  // Pretend all fences are signaled
+    return VK_SUCCESS;
 }
 
 // Hook vkResetFences
 VkResult vkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences) {
-    static int reset_count = 0;
-    if (reset_count < 10) {
-        fprintf(stderr, "[XCB-Bridge] vkResetFences (count=%u)\n", fenceCount);
-        fflush(stderr);
-    }
-    reset_count++;
-
     // Forward to real implementation
     typedef VkResult (*PFN)(VkDevice, uint32_t, const VkFence*);
     PFN fn = NULL;
@@ -1318,15 +1304,6 @@ VkResult vkAcquireNextImageKHR(
     VkFence fence,
     uint32_t* pImageIndex)
 {
-    // Log at VERY start to catch any call
-    static int entry_count = 0;
-    if (entry_count < 5) {
-        fprintf(stderr, "[XCB-Bridge] *** vkAcquireNextImageKHR ENTERED *** (swapchain=0x%lx)\n",
-                (unsigned long)swapchain);
-        fflush(stderr);
-    }
-    entry_count++;
-
     (void)timeout;
 
     SwapchainEntry* entry = find_swapchain(swapchain);
@@ -1342,13 +1319,6 @@ VkResult vkAcquireNextImageKHR(
 
     *pImageIndex = entry->current_image;
     entry->current_image = (entry->current_image + 1) % entry->image_count;
-
-    static int acquire_count = 0;
-    if (acquire_count < 10 || acquire_count % 60 == 0) {
-        fprintf(stderr, "[XCB-Bridge] vkAcquireNextImageKHR: index=%u (call #%d)\n", *pImageIndex, acquire_count);
-        fflush(stderr);
-    }
-    acquire_count++;
 
     // Signal semaphore if provided - use vkQueueSubmit with no work to signal it
     // For now, apps should work without explicit signaling since we're not doing real presentation
@@ -1373,13 +1343,6 @@ VkResult vkQueuePresentKHR(
     const VkPresentInfoKHR* pPresentInfo)
 {
     (void)queue;
-
-    static int present_count = 0;
-    if (present_count < 10 || present_count % 60 == 0) {
-        fprintf(stderr, "[XCB-Bridge] vkQueuePresentKHR (call #%d)\n", present_count);
-        fflush(stderr);
-    }
-    present_count++;
 
     // Check if any of the swapchains are ours
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
@@ -1423,8 +1386,6 @@ VkResult vkQueuePresentKHR(
                         if (pitch == 0) pitch = entry->width * 4;
                         send_frame_pitched(entry->width, entry->height, mapped, pitch);
                         fn_unmap(entry->device, entry->memory[imageIndex]);
-                    } else if (present_count < 5) {
-                        fprintf(stderr, "[XCB-Bridge] vkMapMemory failed: %d\n", res);
                     }
                 }
             }
@@ -1616,13 +1577,6 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
         real_vkGetInstanceProcAddr = dlsym(RTLD_NEXT, "vkGetInstanceProcAddr");
     }
 
-    // Debug: log all function requests
-    if (strncmp(pName, "vkCreate", 8) == 0 || strncmp(pName, "vkGetPhysicalDevice", 19) == 0 ||
-        strncmp(pName, "vkGet", 5) == 0 || strncmp(pName, "vkAcquire", 9) == 0 ||
-        strncmp(pName, "vkQueue", 7) == 0 || strncmp(pName, "vkDestroy", 9) == 0) {
-        fprintf(stderr, "[XCB-Bridge] vkGetInstanceProcAddr('%s')\n", pName);
-    }
-
     // Our implementations
     if (strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0)
         return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
@@ -1630,10 +1584,8 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
         return (PFN_vkVoidFunction)vkCreateInstance;
     if (strcmp(pName, "vkCreateHeadlessSurfaceEXT") == 0)
         return (PFN_vkVoidFunction)my_vkCreateHeadlessSurfaceEXT;
-    if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning vkCreateXcbSurfaceKHR\n");
+    if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0)
         return (PFN_vkVoidFunction)vkCreateXcbSurfaceKHR;
-    }
     if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
         return (PFN_vkVoidFunction)my_vkGetPhysicalDeviceXcbPresentationSupportKHR;
     if (strcmp(pName, "vkDestroySurfaceKHR") == 0)
@@ -1650,16 +1602,12 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
         return (PFN_vkVoidFunction)my_vkGetPhysicalDeviceSurfacePresentModesKHR;
 
     // Return our vkGetDeviceProcAddr so we can intercept device-level functions
-    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkGetDeviceProcAddr\n");
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
-    }
 
     // Swapchain functions (device-level but can be queried via vkGetInstanceProcAddr)
-    if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning vkCreateSwapchainKHR\n");
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
         return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
-    }
     if (strcmp(pName, "vkDestroySwapchainKHR") == 0)
         return (PFN_vkVoidFunction)vkDestroySwapchainKHR;
     if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0)
@@ -1682,43 +1630,19 @@ PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice device, const char* pName)
         real_vkGetDeviceProcAddr = dlsym(RTLD_NEXT, "vkGetDeviceProcAddr");
     }
 
-    // Log all function requests
-    fprintf(stderr, "[XCB-Bridge] vkGetDeviceProcAddr('%s')\n", pName);
-    fflush(stderr);
-
     // Swapchain functions
-    if (strcmp(pName, "vkCreateSwapchainKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkCreateSwapchainKHR\n");
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
         return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
-    }
-    if (strcmp(pName, "vkDestroySwapchainKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkDestroySwapchainKHR\n");
+    if (strcmp(pName, "vkDestroySwapchainKHR") == 0)
         return (PFN_vkVoidFunction)vkDestroySwapchainKHR;
-    }
-    if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkGetSwapchainImagesKHR\n");
+    if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0)
         return (PFN_vkVoidFunction)vkGetSwapchainImagesKHR;
-    }
-    if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkAcquireNextImageKHR\n");
+    if (strcmp(pName, "vkAcquireNextImageKHR") == 0)
         return (PFN_vkVoidFunction)vkAcquireNextImageKHR;
-    }
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our vkQueuePresentKHR\n");
+    if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)vkQueuePresentKHR;
-    }
-    if (strcmp(pName, "vkCreateImageView") == 0) {
-        fprintf(stderr, "[XCB-Bridge] -> returning our hooked_vkCreateImageView\n");
+    if (strcmp(pName, "vkCreateImageView") == 0)
         return (PFN_vkVoidFunction)hooked_vkCreateImageView;
-    }
-
-    // Log other device proc lookups to see what vkcube is doing
-    static int other_lookup_count = 0;
-    if (other_lookup_count < 50) {
-        fprintf(stderr, "[XCB-Bridge] vkGetDeviceProcAddr('%s') -> forwarding\n", pName);
-        fflush(stderr);
-    }
-    other_lookup_count++;
 
     if (real_vkGetDeviceProcAddr)
         return real_vkGetDeviceProcAddr(device, pName);
@@ -1761,17 +1685,14 @@ static void signal_event_fd(void) {
 
 xcb_connection_t* xcb_connect(const char *name, int *screenp) {
     (void)name;
-    fprintf(stderr, "[XCB-Bridge] xcb_connect('%s') -> fake\n", name ? name : ":0");
+    DEBUG_LOG("[XCB-Bridge] xcb_connect('%s')\n", name ? name : ":0");
     if (screenp) *screenp = 0;
 
     // Create eventfd for waking up select/poll
     if (g_event_fd < 0) {
         g_event_fd = eventfd(0, EFD_NONBLOCK);
         if (g_event_fd < 0) {
-            fprintf(stderr, "[XCB-Bridge] WARNING: eventfd() failed, using dummy fd\n");
             g_event_fd = 3;
-        } else {
-            fprintf(stderr, "[XCB-Bridge] Created eventfd: %d\n", g_event_fd);
         }
     }
     fake_conn.fd = g_event_fd;
@@ -1780,17 +1701,9 @@ xcb_connection_t* xcb_connect(const char *name, int *screenp) {
 }
 void xcb_disconnect(xcb_connection_t *c) {
     (void)c;
-    fprintf(stderr, "[XCB-Bridge] xcb_disconnect()\n");
-    fflush(stderr);
 }
 int xcb_connection_has_error(xcb_connection_t *c) {
     (void)c;
-    static int check_count = 0;
-    if (check_count < 5) {
-        fprintf(stderr, "[XCB-Bridge] xcb_connection_has_error() -> 0 (no error)\n");
-        fflush(stderr);
-    }
-    check_count++;
     return 0;  // No error
 }
 const xcb_setup_t* xcb_get_setup(xcb_connection_t *c) { (void)c; return &fake_setup; }
@@ -1807,12 +1720,12 @@ xcb_void_cookie_t xcb_create_window(xcb_connection_t *c, uint8_t d, uint32_t w, 
     g_window_id = w;
     g_window_width = wi;
     g_window_height = h;
-    fprintf(stderr, "[XCB-Bridge] xcb_create_window: id=0x%x, size=%ux%u\n", w, wi, h);
+    DEBUG_LOG("[XCB-Bridge] xcb_create_window: id=0x%x, size=%ux%u\n", w, wi, h);
     return (xcb_void_cookie_t){1};
 }
 xcb_void_cookie_t xcb_map_window(xcb_connection_t *c, uint32_t w) {
     (void)c;
-    fprintf(stderr, "[XCB-Bridge] xcb_map_window(0x%x) - will send MapNotify\n", w);
+    DEBUG_LOG("[XCB-Bridge] xcb_map_window(0x%x)\n", w);
     g_window_mapped = 1;
     signal_event_fd();  // Wake up any waiting select/poll
     return (xcb_void_cookie_t){2};
@@ -1820,12 +1733,6 @@ xcb_void_cookie_t xcb_map_window(xcb_connection_t *c, uint32_t w) {
 xcb_void_cookie_t xcb_destroy_window(xcb_connection_t *c, uint32_t w) { (void)c;(void)w; return (xcb_void_cookie_t){3}; }
 int xcb_flush(xcb_connection_t *c) {
     (void)c;
-    static int flush_count = 0;
-    if (flush_count < 5) {
-        fprintf(stderr, "[XCB-Bridge] xcb_flush (call #%d)\n", flush_count);
-        fflush(stderr);
-    }
-    flush_count++;
     signal_event_fd();  // Wake up any waiting select/poll
     return 1;
 }
@@ -1885,11 +1792,10 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
     (void)c;
     static int poll_count = 0;
 
-    // Log more aggressively to debug the render loop issue
-    if (poll_count < 50 || (poll_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] xcb_poll_for_event (call #%d, state=%d, mapped=%d)\n",
+    // Only log occasionally to avoid performance impact
+    if (poll_count < 5) {
+        DEBUG_LOG("[XCB-Bridge] xcb_poll_for_event (call #%d, state=%d, mapped=%d)\n",
                 poll_count, g_event_state, g_window_mapped);
-        fflush(stderr);
     }
     poll_count++;
 
@@ -1914,8 +1820,7 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
             event->event = g_window_id ? g_window_id : 0x1000;
             event->window = g_window_id ? g_window_id : 0x1000;
             event->override_redirect = 0;
-            fprintf(stderr, "[XCB-Bridge] Sending MAP_NOTIFY event for window 0x%x\n", event->window);
-            fflush(stderr);
+            DEBUG_LOG("[XCB-Bridge] Sending MAP_NOTIFY event for window 0x%x\n", event->window);
             signal_event_fd();  // Signal more events coming
             return event;
         }
@@ -1935,9 +1840,8 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
             event->height = g_window_height;
             event->border_width = 0;
             event->override_redirect = 0;
-            fprintf(stderr, "[XCB-Bridge] Sending CONFIGURE_NOTIFY event: %ux%u\n",
+            DEBUG_LOG("[XCB-Bridge] Sending CONFIGURE_NOTIFY event: %ux%u\n",
                     event->width, event->height);
-            fflush(stderr);
             signal_event_fd();  // Signal more events coming
             return event;
         }
@@ -1955,9 +1859,8 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
             event->width = g_window_width;
             event->height = g_window_height;
             event->count = 0;
-            fprintf(stderr, "[XCB-Bridge] Sending EXPOSE event: %ux%u\n",
+            DEBUG_LOG("[XCB-Bridge] Sending EXPOSE event: %ux%u\n",
                     event->width, event->height);
-            fflush(stderr);
             signal_event_fd();  // Keep eventfd ready for render loop
             return event;
         }
@@ -1973,10 +1876,6 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
         if (phase == 0) {
             // Return NULL to let vkcube exit event loop and call draw()
             phase = 1;
-            if (cycle_count < 10 || (cycle_count % 60 == 0)) {
-                fprintf(stderr, "[XCB-Bridge] Returning NULL (cycle #%d) - vkcube should draw now\n", cycle_count);
-                fflush(stderr);
-            }
             cycle_count++;
             return NULL;
         } else {
@@ -2002,12 +1901,6 @@ void* xcb_poll_for_event(xcb_connection_t *c) {
 
 void* xcb_wait_for_event(xcb_connection_t *c) {
     (void)c;
-    static int wait_count = 0;
-
-    // ALWAYS log this to catch any call
-    fprintf(stderr, "[XCB-Bridge] *** xcb_wait_for_event CALLED *** (call #%d, state=%d)\n", wait_count, g_event_state);
-    fflush(stderr);
-    wait_count++;
 
     // First try poll_for_event in case we have queued events
     void* event = xcb_poll_for_event(c);
@@ -2023,14 +1916,10 @@ void* xcb_wait_for_event(xcb_connection_t *c) {
             expose->width = g_window_width;
             expose->height = g_window_height;
             expose->count = 0;
-            fprintf(stderr, "[XCB-Bridge] xcb_wait_for_event returning EXPOSE\n");
-            fflush(stderr);
             return expose;
         }
     }
 
-    // Don't block forever - return NULL after a short wait
-    usleep(16000); // ~16ms = 60fps
     return NULL;
 }
 
@@ -2191,26 +2080,17 @@ void xcb_discard_reply64(xcb_connection_t *c, uint64_t sequence) {
 // XCB-Xlib interop functions
 xcb_connection_t* XGetXCBConnection(void* dpy) {
     (void)dpy;
-    fprintf(stderr, "[XCB-Bridge] XGetXCBConnection() -> fake conn\n");
     return &fake_conn;
 }
 
 void XSetEventQueueOwner(void* dpy, int owner) {
     (void)dpy; (void)owner;
-    fprintf(stderr, "[XCB-Bridge] XSetEventQueueOwner(%d)\n", owner);
 }
 
-// Hook select() to see if vkcube is blocking on it
+// Hook select()
 #include <sys/select.h>
 static int (*real_select)(int, fd_set*, fd_set*, fd_set*, struct timeval*) = NULL;
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
-    static int select_count = 0;
-    if (select_count < 20 || (select_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] select() called (nfds=%d, call #%d)\n", nfds, select_count);
-        fflush(stderr);
-    }
-    select_count++;
-
     if (!real_select) {
         real_select = dlsym(RTLD_NEXT, "select");
     }
@@ -2230,14 +2110,6 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struc
 #include <poll.h>
 static int (*real_poll)(struct pollfd*, nfds_t, int) = NULL;
 int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-    static int poll_count = 0;
-    if (poll_count < 20 || (poll_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] poll() called (nfds=%lu, timeout=%d, call #%d)\n",
-                (unsigned long)nfds, timeout, poll_count);
-        fflush(stderr);
-    }
-    poll_count++;
-
     if (!real_poll) {
         real_poll = dlsym(RTLD_NEXT, "poll");
     }
@@ -2261,14 +2133,6 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
 // Hook ppoll as well
 static int (*real_ppoll)(struct pollfd*, nfds_t, const struct timespec*, const sigset_t*) = NULL;
 int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask) {
-    static int ppoll_count = 0;
-    if (ppoll_count < 20 || (ppoll_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] ppoll() called (nfds=%lu, call #%d)\n",
-                (unsigned long)nfds, ppoll_count);
-        fflush(stderr);
-    }
-    ppoll_count++;
-
     if (!real_ppoll) {
         real_ppoll = dlsym(RTLD_NEXT, "ppoll");
     }
@@ -2292,13 +2156,6 @@ int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const
 #include <sys/epoll.h>
 static int (*real_epoll_wait)(int, struct epoll_event*, int, int) = NULL;
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
-    static int epoll_count = 0;
-    if (epoll_count < 20 || (epoll_count % 60 == 0)) {
-        fprintf(stderr, "[XCB-Bridge] epoll_wait() called (epfd=%d, call #%d)\n", epfd, epoll_count);
-        fflush(stderr);
-    }
-    epoll_count++;
-
     if (!real_epoll_wait) {
         real_epoll_wait = dlsym(RTLD_NEXT, "epoll_wait");
     }
@@ -2308,26 +2165,10 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
     return 0;
 }
 
-// Exit handler to see when process exits
-static void on_exit_handler(void) {
-    fprintf(stderr, "[XCB-Bridge] *** PROCESS EXITING (atexit handler) ***\n");
-    fflush(stderr);
-}
-
-// Destructor
-__attribute__((destructor))
-static void fini(void) {
-    fprintf(stderr, "[XCB-Bridge] *** LIBRARY UNLOADING (destructor) ***\n");
-    fflush(stderr);
-}
-
 // Constructor
 __attribute__((constructor))
 static void init(void) {
-    fprintf(stderr, "[XCB-Bridge] Vulkan XCB-to-Xlib bridge loaded\n");
-    fprintf(stderr, "[XCB-Bridge]   VK_KHR_xcb_surface -> bridges to VK_KHR_xlib_surface\n");
-    fprintf(stderr, "[XCB-Bridge]   VK_EXT_headless_surface -> headless rendering\n");
+    DEBUG_LOG("[XCB-Bridge] Vulkan XCB-to-Xlib bridge loaded\n");
     real_vkGetInstanceProcAddr = dlsym(RTLD_NEXT, "vkGetInstanceProcAddr");
     real_vkEnumerateInstanceExtensionProperties = dlsym(RTLD_NEXT, "vkEnumerateInstanceExtensionProperties");
-    atexit(on_exit_handler);
 }
