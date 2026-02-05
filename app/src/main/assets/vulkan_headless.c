@@ -20,6 +20,12 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 
 // Minimal Vulkan types
 typedef uint32_t VkFlags;
@@ -243,6 +249,105 @@ static SurfaceEntry* g_surfaces = NULL;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_next_handle = 0xBEEF000000000001ULL;
 static VkInstance g_current_instance = NULL;
+static VkPhysicalDevice g_physical_device = NULL;
+
+// Frame output socket - use TCP localhost for proot compatibility
+#define FRAME_SOCKET_PORT 19850
+static int g_frame_socket = -1;
+static int g_frame_socket_connected = 0;
+
+// Connect to frame output socket (TCP on localhost)
+static int connect_frame_socket(void) {
+    if (g_frame_socket_connected) return 1;
+
+    g_frame_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_frame_socket < 0) {
+        fprintf(stderr, "[XCB-Bridge] Failed to create frame socket: %s\n", strerror(errno));
+        return 0;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(FRAME_SOCKET_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (connect(g_frame_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        static int error_count = 0;
+        if (error_count < 3) {
+            fprintf(stderr, "[XCB-Bridge] Failed to connect to frame socket port %d: %s\n",
+                    FRAME_SOCKET_PORT, strerror(errno));
+            error_count++;
+        }
+        close(g_frame_socket);
+        g_frame_socket = -1;
+        return 0;
+    }
+
+    g_frame_socket_connected = 1;
+    fprintf(stderr, "[XCB-Bridge] Connected to frame socket on port %d\n", FRAME_SOCKET_PORT);
+    return 1;
+}
+
+// Send a frame to the socket
+static void send_frame_pitched(uint32_t width, uint32_t height, const void* pixels, size_t row_pitch) {
+    if (!g_frame_socket_connected && !connect_frame_socket()) {
+        return;  // Can't connect, skip frame
+    }
+
+    // Frame header: width (4 bytes) + height (4 bytes)
+    uint32_t header[2] = { width, height };
+
+    ssize_t sent = write(g_frame_socket, header, sizeof(header));
+    if (sent != sizeof(header)) {
+        fprintf(stderr, "[XCB-Bridge] Failed to send frame header: %s\n", strerror(errno));
+        close(g_frame_socket);
+        g_frame_socket = -1;
+        g_frame_socket_connected = 0;
+        return;
+    }
+
+    // Frame data: RGBA pixels - handle row pitch
+    size_t expected_pitch = width * 4;
+    if (row_pitch == expected_pitch) {
+        // Tightly packed, send directly
+        size_t data_size = width * height * 4;
+        sent = write(g_frame_socket, pixels, data_size);
+        if (sent != (ssize_t)data_size) {
+            fprintf(stderr, "[XCB-Bridge] Failed to send frame data: %s\n", strerror(errno));
+            close(g_frame_socket);
+            g_frame_socket = -1;
+            g_frame_socket_connected = 0;
+            return;
+        }
+    } else {
+        // Row pitch differs - send row by row
+        const uint8_t* src = (const uint8_t*)pixels;
+        for (uint32_t y = 0; y < height; y++) {
+            sent = write(g_frame_socket, src, expected_pitch);
+            if (sent != (ssize_t)expected_pitch) {
+                fprintf(stderr, "[XCB-Bridge] Failed to send row %u: %s\n", y, strerror(errno));
+                close(g_frame_socket);
+                g_frame_socket = -1;
+                g_frame_socket_connected = 0;
+                return;
+            }
+            src += row_pitch;
+        }
+    }
+
+    static int frame_count = 0;
+    if (frame_count < 5 || frame_count % 60 == 0) {
+        fprintf(stderr, "[XCB-Bridge] Sent frame %d: %ux%u (pitch=%zu)\n",
+                frame_count, width, height, row_pitch);
+    }
+    frame_count++;
+}
+
+// Legacy wrapper for compatibility
+static void send_frame(uint32_t width, uint32_t height, const void* pixels) {
+    send_frame_pitched(width, height, pixels, width * 4);
+}
 
 // Load Xlib dynamically
 static int load_xlib(void) {
@@ -446,7 +551,13 @@ static VkResult my_vkGetPhysicalDeviceSurfaceSupportKHR(
     VkSurfaceKHR surface,
     VkBool32* pSupported)
 {
-    (void)physicalDevice; (void)queueFamilyIndex;
+    (void)queueFamilyIndex;
+
+    // Store physical device for later memory property queries
+    if (physicalDevice && !g_physical_device) {
+        g_physical_device = physicalDevice;
+        fprintf(stderr, "[XCB-Bridge] Captured physical device: %p\n", physicalDevice);
+    }
 
     SurfaceEntry* entry = find_surface(surface);
     if (entry) {
@@ -578,6 +689,7 @@ typedef struct SwapchainEntry {
     uint32_t image_count;
     VkImage images[MAX_SWAPCHAIN_IMAGES];  // Real image handles
     VkDeviceMemory memory[MAX_SWAPCHAIN_IMAGES];  // Memory for each image
+    VkDeviceSize row_pitch[MAX_SWAPCHAIN_IMAGES];  // Row pitch for LINEAR images
     uint32_t width;
     uint32_t height;
     int format;
@@ -616,7 +728,10 @@ static int is_our_swapchain(VkSwapchainKHR swapchain) {
 #define VK_IMAGE_TYPE_2D 1
 #define VK_SAMPLE_COUNT_1_BIT 1
 #define VK_IMAGE_TILING_OPTIMAL 0
+#define VK_IMAGE_TILING_LINEAR 1
 #define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 0x01
+#define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 0x02
+#define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 0x04
 
 typedef struct VkImageCreateInfo {
     int sType;
@@ -650,6 +765,27 @@ typedef struct VkMemoryAllocateInfo {
 } VkMemoryAllocateInfo;
 
 typedef uint64_t VkDeviceMemory;
+
+// For querying memory properties
+typedef struct VkMemoryType {
+    uint32_t propertyFlags;
+    uint32_t heapIndex;
+} VkMemoryType;
+
+typedef struct VkMemoryHeap {
+    VkDeviceSize size;
+    uint32_t flags;
+} VkMemoryHeap;
+
+typedef struct VkPhysicalDeviceMemoryProperties {
+    uint32_t memoryTypeCount;
+    VkMemoryType memoryTypes[32];
+    uint32_t memoryHeapCount;
+    VkMemoryHeap memoryHeaps[16];
+} VkPhysicalDeviceMemoryProperties;
+
+static VkPhysicalDeviceMemoryProperties g_mem_properties = {0};
+static int g_mem_properties_queried = 0;
 
 // Create swapchain for fake surface
 VkResult vkCreateSwapchainKHR(
@@ -728,7 +864,7 @@ VkResult vkCreateSwapchainKHR(
             imageInfo.mipLevels = 1;
             imageInfo.arrayLayers = pCreateInfo->imageArrayLayers;
             imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.tiling = VK_IMAGE_TILING_LINEAR;  // LINEAR for CPU readback
             imageInfo.usage = pCreateInfo->imageUsage;
             imageInfo.sharingMode = pCreateInfo->imageSharingMode;
             imageInfo.initialLayout = 0; // VK_IMAGE_LAYOUT_UNDEFINED
@@ -744,15 +880,51 @@ VkResult vkCreateSwapchainKHR(
             VkMemoryRequirements memReq = {0};
             fn_getMemReq(device, entry->images[i], &memReq);
 
-            // Allocate memory (use memory type 0 which is usually device local)
+            // Query memory properties if not done yet
+            if (!g_mem_properties_queried && g_physical_device && real_vkGetInstanceProcAddr && g_current_instance) {
+                typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
+                PFN_vkGetPhysicalDeviceMemoryProperties fn_getMemProps = (PFN_vkGetPhysicalDeviceMemoryProperties)
+                    real_vkGetInstanceProcAddr(g_current_instance, "vkGetPhysicalDeviceMemoryProperties");
+                if (fn_getMemProps) {
+                    fn_getMemProps(g_physical_device, &g_mem_properties);
+                    g_mem_properties_queried = 1;
+                    fprintf(stderr, "[XCB-Bridge] Queried memory properties: %u types\n", g_mem_properties.memoryTypeCount);
+                    for (uint32_t k = 0; k < g_mem_properties.memoryTypeCount; k++) {
+                        fprintf(stderr, "[XCB-Bridge]   Type %u: flags=0x%x\n", k, g_mem_properties.memoryTypes[k].propertyFlags);
+                    }
+                }
+            }
+
+            // Allocate memory - find HOST_VISIBLE | HOST_COHERENT type
             VkMemoryAllocateInfo allocInfo = {0};
             allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
             allocInfo.allocationSize = memReq.size;
-            // Find a suitable memory type - try the first bit set in memoryTypeBits
-            for (uint32_t j = 0; j < 32; j++) {
-                if (memReq.memoryTypeBits & (1 << j)) {
-                    allocInfo.memoryTypeIndex = j;
-                    break;
+
+            // Find a HOST_VISIBLE memory type
+            uint32_t hostVisibleType = UINT32_MAX;
+            uint32_t requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+            if (g_mem_properties_queried) {
+                for (uint32_t j = 0; j < g_mem_properties.memoryTypeCount; j++) {
+                    if ((memReq.memoryTypeBits & (1 << j)) &&
+                        (g_mem_properties.memoryTypes[j].propertyFlags & requiredFlags) == requiredFlags) {
+                        hostVisibleType = j;
+                        fprintf(stderr, "[XCB-Bridge] Found HOST_VISIBLE memory type: %u\n", j);
+                        break;
+                    }
+                }
+            }
+
+            if (hostVisibleType != UINT32_MAX) {
+                allocInfo.memoryTypeIndex = hostVisibleType;
+            } else {
+                // Fallback: try the first bit set in memoryTypeBits
+                fprintf(stderr, "[XCB-Bridge] WARNING: No HOST_VISIBLE memory type found, using fallback\n");
+                for (uint32_t j = 0; j < 32; j++) {
+                    if (memReq.memoryTypeBits & (1 << j)) {
+                        allocInfo.memoryTypeIndex = j;
+                        break;
+                    }
                 }
             }
 
@@ -767,6 +939,39 @@ VkResult vkCreateSwapchainKHR(
             if (res != VK_SUCCESS) {
                 fprintf(stderr, "[XCB-Bridge] vkBindImageMemory[%u] failed: %d\n", i, res);
                 continue;
+            }
+
+            // Query image layout for row pitch (LINEAR tiling)
+            typedef struct VkImageSubresource {
+                uint32_t aspectMask;
+                uint32_t mipLevel;
+                uint32_t arrayLayer;
+            } VkImageSubresource;
+            typedef struct VkSubresourceLayout {
+                VkDeviceSize offset;
+                VkDeviceSize size;
+                VkDeviceSize rowPitch;
+                VkDeviceSize arrayPitch;
+                VkDeviceSize depthPitch;
+            } VkSubresourceLayout;
+            typedef void (*PFN_vkGetImageSubresourceLayout)(VkDevice, VkImage, const VkImageSubresource*, VkSubresourceLayout*);
+
+            PFN_vkGetImageSubresourceLayout fn_getLayout = NULL;
+            if (real_vkGetInstanceProcAddr && g_current_instance) {
+                fn_getLayout = (PFN_vkGetImageSubresourceLayout)real_vkGetInstanceProcAddr(g_current_instance, "vkGetImageSubresourceLayout");
+            }
+            if (fn_getLayout) {
+                VkImageSubresource subres = {0};
+                subres.aspectMask = 1;  // VK_IMAGE_ASPECT_COLOR_BIT
+                subres.mipLevel = 0;
+                subres.arrayLayer = 0;
+                VkSubresourceLayout layout = {0};
+                fn_getLayout(device, entry->images[i], &subres, &layout);
+                entry->row_pitch[i] = layout.rowPitch;
+                fprintf(stderr, "[XCB-Bridge] Image[%u] rowPitch: %lu (expected: %u)\n",
+                        i, (unsigned long)layout.rowPitch, entry->width * 4);
+            } else {
+                entry->row_pitch[i] = entry->width * 4;  // Fallback
             }
 
             fprintf(stderr, "[XCB-Bridge] Created real image[%u]: 0x%lx (mem: 0x%lx, size: %lu)\n",
@@ -1139,7 +1344,7 @@ VkResult vkAcquireNextImageKHR(
     return VK_SUCCESS;
 }
 
-// Queue present - no-op for fake swapchain
+// Queue present - send frame to socket for display
 VkResult vkQueuePresentKHR(
     VkQueue queue,
     const VkPresentInfoKHR* pPresentInfo)
@@ -1155,8 +1360,52 @@ VkResult vkQueuePresentKHR(
 
     // Check if any of the swapchains are ours
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-        if (is_our_swapchain(pPresentInfo->pSwapchains[i])) {
-            // Our fake swapchain - just return success
+        SwapchainEntry* entry = find_swapchain(pPresentInfo->pSwapchains[i]);
+        if (entry) {
+            // Our fake swapchain - map image and send to display
+            uint32_t imageIndex = pPresentInfo->pImageIndices[i];
+            if (imageIndex < entry->image_count && entry->memory[imageIndex]) {
+                // Wait for GPU to finish rendering before reading the image
+                typedef VkResult (*PFN_vkQueueWaitIdle)(VkQueue);
+                PFN_vkQueueWaitIdle fn_wait = NULL;
+                if (real_vkGetDeviceProcAddr && entry->device) {
+                    fn_wait = (PFN_vkQueueWaitIdle)real_vkGetDeviceProcAddr(entry->device, "vkQueueWaitIdle");
+                }
+                if (fn_wait && queue) {
+                    fn_wait(queue);
+                }
+
+                // Get vkMapMemory and vkUnmapMemory
+                typedef VkResult (*PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
+                typedef void (*PFN_vkUnmapMemory)(VkDevice, VkDeviceMemory);
+
+                PFN_vkMapMemory fn_map = NULL;
+                PFN_vkUnmapMemory fn_unmap = NULL;
+
+                if (real_vkGetDeviceProcAddr && entry->device) {
+                    fn_map = (PFN_vkMapMemory)real_vkGetDeviceProcAddr(entry->device, "vkMapMemory");
+                    fn_unmap = (PFN_vkUnmapMemory)real_vkGetDeviceProcAddr(entry->device, "vkUnmapMemory");
+                }
+
+                if (fn_map && fn_unmap) {
+                    void* mapped = NULL;
+                    // Map entire image memory (use row_pitch * height for size)
+                    size_t map_size = entry->row_pitch[imageIndex] * entry->height;
+                    if (map_size == 0) map_size = entry->width * entry->height * 4;
+                    VkResult res = fn_map(entry->device, entry->memory[imageIndex], 0,
+                                          map_size, 0, &mapped);
+                    if (res == VK_SUCCESS && mapped) {
+                        // Send frame to display socket with row pitch
+                        size_t pitch = entry->row_pitch[imageIndex];
+                        if (pitch == 0) pitch = entry->width * 4;
+                        send_frame_pitched(entry->width, entry->height, mapped, pitch);
+                        fn_unmap(entry->device, entry->memory[imageIndex]);
+                    } else if (present_count < 5) {
+                        fprintf(stderr, "[XCB-Bridge] vkMapMemory failed: %d\n", res);
+                    }
+                }
+            }
+
             if (pPresentInfo->pResults) {
                 pPresentInfo->pResults[i] = VK_SUCCESS;
             }
