@@ -11,10 +11,12 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.Toast
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -46,6 +48,14 @@ class GameActivity : AppCompatActivity() {
             // If surface is already ready, notify service immediately
             if (lorieView.isSurfaceReady) {
                 Log.i(TAG, "Surface already ready when service connected, notifying")
+
+                // Pass the surface for Vortek rendering
+                val holder = lorieView.holder
+                val rect = holder.surfaceFrame
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    steamService?.setOutputSurface(holder.surface, rect.width(), rect.height())
+                }
+
                 steamService?.onSurfaceReady()
             }
 
@@ -90,6 +100,13 @@ class GameActivity : AppCompatActivity() {
         // Set up surface ready callback to notify service when we're ready to render
         lorieView.setSurfaceReadyCallback { width, height ->
             Log.i(TAG, "Surface ready: ${width}x${height}, notifying service")
+
+            // Get the Surface from LorieView's holder for Vortek rendering
+            val surface = lorieView.holder.surface
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                steamService?.setOutputSurface(surface, width, height)
+            }
+
             steamService?.onSurfaceReady()
         }
 
@@ -183,6 +200,12 @@ class GameActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+
+        // Clear the surface reference in the service
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            steamService?.setOutputSurface(null, 0, 0)
+        }
+
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false

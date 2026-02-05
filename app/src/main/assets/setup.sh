@@ -68,8 +68,8 @@ dpkg --add-architecture armhf 2>/dev/null || true
 dpkg --add-architecture i386 2>/dev/null || true
 apt-get update || true
 
-# Install X11 libraries
-log_info "Installing X11 libraries..."
+# Install X11 libraries, terminal emulator, and Xvfb
+log_info "Installing X11 libraries and Xvfb..."
 apt-get install -y --no-install-recommends \
     libx11-6 \
     libx11-xcb1 \
@@ -86,7 +86,12 @@ apt-get install -y --no-install-recommends \
     libxss1 \
     libxkbfile1 \
     libxinerama1 \
+    libxkbcommon0 \
+    xkb-data \
     x11-utils \
+    xterm \
+    x11-apps \
+    xvfb \
     || log_warn "Some X11 packages failed"
 
 # Install graphics libraries
@@ -98,6 +103,7 @@ apt-get install -y --no-install-recommends \
     libgles2 \
     libvulkan1 \
     mesa-vulkan-drivers \
+    libbsd0 \
     || log_warn "Some graphics packages failed"
 
 # Install audio libraries
@@ -146,7 +152,9 @@ cat > /home/user/.bashrc << 'EOF'
 
 export HOME=/home/user
 export USER=user
-export DISPLAY=:0
+# Use TCP display for X11 connection to Android's Xlorie server
+# :0 uses Unix socket (not available), 127.0.0.1:0 uses TCP port 6000
+export DISPLAY=127.0.0.1:0
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 export PATH=/usr/local/bin:/usr/bin:/bin:/opt/box64:/opt/box86:$PATH
@@ -178,18 +186,47 @@ echo "Welcome to Steam Launcher Container"
 echo "Run 'steam' to launch Steam"
 EOF
 
-# Set up Vulkan ICD
-log_info "Configuring Vulkan..."
+# Set up Vulkan ICD - Vortek passthrough
+log_info "Configuring Vulkan (Vortek passthrough)..."
 mkdir -p /usr/share/vulkan/icd.d
-cat > /usr/share/vulkan/icd.d/android_icd.json << 'EOF'
+
+# Vortek ICD - uses libvulkan_vortek.so for GPU passthrough to Android
+cat > /usr/share/vulkan/icd.d/vortek_icd.json << 'EOF'
 {
     "file_format_version": "1.0.0",
     "ICD": {
-        "library_path": "/system/lib64/libvulkan.so",
-        "api_version": "1.3.0"
+        "library_path": "/lib/libvulkan_vortek.so",
+        "api_version": "1.1.128"
     }
 }
 EOF
+
+# Copy Vortek library if available
+if [ -f /tmp/libvulkan_vortek.so ]; then
+    cp /tmp/libvulkan_vortek.so /lib/
+    chmod 755 /lib/libvulkan_vortek.so
+    log_info "Installed libvulkan_vortek.so"
+fi
+
+# Copy headless surface support source
+if [ -f /tmp/vulkan_headless.c ]; then
+    cp /tmp/vulkan_headless.c /opt/
+    log_info "Copied headless surface source to /opt/"
+fi
+
+# Install build tools for compiling headless wrapper
+log_info "Installing build tools..."
+apt-get install -y --no-install-recommends gcc libc6-dev 2>/dev/null || log_warn "Build tools not installed"
+
+# Compile headless wrapper if source is available
+if [ -f /opt/vulkan_headless.c ]; then
+    log_info "Compiling headless surface wrapper..."
+    gcc -shared -fPIC -O2 -o /lib/libvulkan_headless.so /opt/vulkan_headless.c -ldl -lpthread 2>&1 || log_warn "Headless wrapper compilation failed"
+    if [ -f /lib/libvulkan_headless.so ]; then
+        chmod 755 /lib/libvulkan_headless.so
+        log_info "Installed /lib/libvulkan_headless.so"
+    fi
+fi
 
 # Create Steam launch wrapper
 log_info "Creating Steam launcher..."

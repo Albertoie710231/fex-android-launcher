@@ -140,6 +140,49 @@ object VulkanBridge {
     }
 
     /**
+     * Setup Vortek ICD configuration for Vulkan passthrough via IPC.
+     *
+     * Vortek solves the glibc/Bionic incompatibility by using inter-process communication:
+     * - libvulkan_vortek.so (in container) serializes Vulkan commands
+     * - VortekRenderer (Android side) executes them on the real Mali GPU
+     *
+     * Note: The library is ARM64 because Box64 handles x86→ARM translation.
+     * Vulkan calls from x86 games go through Box64 which calls the ARM64
+     * libvulkan_vortek.so, which then communicates with Android's VortekRenderer.
+     *
+     * @param rootfsPath Path to the container rootfs
+     * @return true if setup was successful
+     */
+    fun setupVortekIcd(rootfsPath: String): Boolean {
+        return try {
+            // Create ICD directory
+            val icdDir = File(rootfsPath, "usr/share/vulkan/icd.d")
+            icdDir.mkdirs()
+
+            // Vortek ICD configuration
+            // Points to the ARM64 Vulkan ICD that communicates with Android's VortekRenderer
+            // (Box64 handles the x86→ARM64 translation layer)
+            val vortekIcd = """
+                {
+                    "file_format_version": "1.0.0",
+                    "ICD": {
+                        "library_path": "/lib/libvulkan_vortek.so",
+                        "api_version": "1.1.128"
+                    }
+                }
+            """.trimIndent()
+
+            File(icdDir, "vortek_icd.json").writeText(vortekIcd)
+            Log.i(TAG, "Vortek ICD configuration created")
+            true
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to setup Vortek ICD", e)
+            false
+        }
+    }
+
+    /**
      * Setup Vulkan ICD configuration for the container.
      * This creates the necessary configuration files for Vulkan passthrough.
      */
@@ -252,12 +295,12 @@ object VulkanBridge {
 
     /**
      * Get recommended Vulkan environment variables for Steam/Proton.
+     *
+     * @param useVortek If true, configure for Vortek passthrough. If false, use direct Android ICD.
+     * @param vortekSocketPath Path to the Vortek Unix socket (required if useVortek is true)
      */
-    fun getProtonVulkanEnv(): Map<String, String> {
-        return mapOf(
-            // Vulkan ICD
-            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/android_icd.json",
-
+    fun getProtonVulkanEnv(useVortek: Boolean = false, vortekSocketPath: String? = null): Map<String, String> {
+        val baseEnv = mutableMapOf(
             // WSI
             "MESA_VK_WSI_PRESENT_MODE" to "fifo",
             "VK_LAYER_PATH" to "/usr/share/vulkan/explicit_layer.d",
@@ -285,6 +328,20 @@ object VulkanBridge {
             // Mali optimizations
             "MALI_NO_ASYNC_COMPUTE" to "1"
         )
+
+        if (useVortek && vortekSocketPath != null) {
+            // Vortek passthrough configuration
+            baseEnv.putAll(mapOf(
+                "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/vortek_icd.json",
+                "VORTEK_SERVER_PATH" to vortekSocketPath,
+                "VK_DRIVER_FILES" to "" // Disable direct driver loading
+            ))
+        } else {
+            // Direct Android ICD (won't work from glibc, but kept for reference)
+            baseEnv["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/android_icd.json"
+        }
+
+        return baseEnv
     }
 
     /**

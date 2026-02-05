@@ -250,6 +250,10 @@ class ProotExecutor(private val context: Context) {
             "--bind=/system:/system",
             "--bind=/vendor:/vendor",
 
+            // Vortek socket - bind the tmp dir to Winlator's expected path
+            // The ICD has hardcoded path: /data/data/com.winlator/files/rootfs/tmp/.vortek/V0
+            "--bind=$tmpPath:/data/data/com.winlator/files/rootfs/tmp",
+
             // Working directory inside container
             "-w", workingDir,
 

@@ -99,6 +99,7 @@ class ContainerManager(private val context: Context) {
             // Phase 6: Setup Vulkan (90-95%)
             progressCallback(92, "Configuring Vulkan...")
             setupVulkan()
+            setupVortek()
             progressCallback(95, "Vulkan configured")
 
             // Phase 7: Create user and finalize (95-100%)
@@ -380,7 +381,7 @@ class ContainerManager(private val context: Context) {
     }
 
     private fun setupVulkan() {
-        // Create Vulkan ICD for Android passthrough
+        // Create Vulkan ICD for Android passthrough (legacy, won't work from glibc)
         val icdJson = """
             {
                 "file_format_version": "1.0.0",
@@ -413,6 +414,296 @@ class ContainerManager(private val context: Context) {
         """.trimIndent()
 
         writeScript("setup_vulkan.sh", vulkanScript)
+    }
+
+    /**
+     * Setup Vortek Vulkan passthrough.
+     *
+     * Vortek provides IPC-based Vulkan passthrough that solves the glibc/Bionic
+     * incompatibility. The container uses libvulkan_vortek.so (ARM64) which
+     * communicates with VortekRenderer (Android, Bionic) via Unix socket.
+     *
+     * Note: The library is ARM64 because Box64 handles x86→ARM translation.
+     * Vulkan calls from x86 games go through Box64 which calls the ARM64
+     * libvulkan_vortek.so.
+     */
+    private fun setupVortek() {
+        // Setup Vortek ICD configuration
+        VulkanBridge.setupVortekIcd(rootfsDir.absolutePath)
+
+        // Create lib directory for Vortek client (ARM64 library)
+        val libDir = File(rootfsDir, "lib")
+        libDir.mkdirs()
+
+        // Try to install Vortek client library from assets
+        installVortekClient(libDir)
+
+        // Install Vulkan test tools (vkcube, vulkaninfo)
+        installVulkanTools()
+
+        // Install headless surface support for vkcube/vulkaninfo without X11
+        installHeadlessSurface()
+
+        // Create Vortek environment script
+        val vortekScript = """
+            #!/bin/bash
+            # Vortek Vulkan passthrough environment setup
+            #
+            # Vortek provides IPC-based Vulkan passthrough:
+            # - Container (glibc): libvulkan_vortek.so serializes Vulkan commands
+            # - Android (Bionic): VortekRenderer executes on real Mali GPU
+            #
+            # VORTEK_SERVER_PATH is set by the Android app when launching
+
+            # Use Vortek as the Vulkan ICD
+            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+
+            # Disable direct driver loading (won't work anyway)
+            export VK_DRIVER_FILES=""
+
+            # DXVK optimizations for Mali
+            export DXVK_ASYNC=1
+            export DXVK_STATE_CACHE=1
+            export DXVK_LOG_LEVEL=none
+
+            # Mali-specific settings
+            export MALI_NO_ASYNC_COMPUTE=1
+
+            # Check Vortek status
+            if [ -n "${'$'}VORTEK_SERVER_PATH" ]; then
+                if [ -S "${'$'}VORTEK_SERVER_PATH" ]; then
+                    echo "Vortek server socket found at ${'$'}VORTEK_SERVER_PATH"
+                else
+                    echo "WARNING: Vortek socket not found at ${'$'}VORTEK_SERVER_PATH"
+                fi
+            else
+                echo "WARNING: VORTEK_SERVER_PATH not set"
+            fi
+
+            # Test Vulkan
+            if command -v vulkaninfo &> /dev/null; then
+                vulkaninfo --summary 2>&1
+            else
+                echo "vulkaninfo not available - install vulkan-tools to test"
+            fi
+        """.trimIndent()
+
+        writeScript("setup_vortek.sh", vortekScript)
+        Log.i(TAG, "Vortek passthrough configured")
+    }
+
+    /**
+     * Install the Vortek client library (libvulkan_vortek.so) into the container.
+     * This is the ARM64 Vulkan ICD that communicates with Android's VortekRenderer.
+     * Box64 handles x86→ARM translation, so the library is ARM64.
+     */
+    private fun installVortekClient(targetDir: File) {
+        try {
+            // Try to extract from assets
+            val assetName = "libvulkan_vortek.so"
+            val targetFile = File(targetDir, assetName)
+
+            try {
+                context.assets.open(assetName).use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "Vortek client library installed from assets: ${targetFile.length()} bytes")
+                return
+            } catch (e: IOException) {
+                Log.d(TAG, "Vortek client library not in assets: ${e.message}")
+            }
+
+            // Try to extract from native libs directory
+            val nativeLibDir = context.applicationInfo.nativeLibraryDir
+            val sourceFile = File(nativeLibDir, assetName)
+            if (sourceFile.exists()) {
+                sourceFile.copyTo(targetFile, overwrite = true)
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "Vortek client library installed from native libs")
+                return
+            }
+
+            // Library not found - create a placeholder README
+            Log.w(TAG, "Vortek client library not found - creating placeholder")
+            File(targetDir, "README_VORTEK.txt").writeText("""
+                Vortek Vulkan Passthrough
+                =========================
+
+                The libvulkan_vortek.so library is required for Vulkan support.
+
+                To obtain this library:
+                1. Download Winlator APK from https://winlator.com or GitHub
+                2. Extract the APK (it's a ZIP file)
+                3. Extract assets/graphics_driver/vortek-2.0.tzst (zstd compressed tar)
+                4. Copy usr/lib/libvulkan_vortek.so to this directory
+
+                Without this library, Vulkan/DXVK games will not work.
+            """.trimIndent())
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to install Vortek client", e)
+        }
+    }
+
+    /**
+     * Install Vulkan test tools (vkcube, vulkaninfo) from assets.
+     */
+    private fun installVulkanTools() {
+        val binDir = File(rootfsDir, "usr/local/bin")
+        binDir.mkdirs()
+
+        // Install vkcube
+        try {
+            context.assets.open("vkcube").use { input ->
+                val targetFile = File(binDir, "vkcube")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "vkcube installed: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.d(TAG, "vkcube not in assets: ${e.message}")
+        }
+
+        // Install vulkaninfo if available
+        try {
+            context.assets.open("vulkaninfo").use { input ->
+                val targetFile = File(binDir, "vulkaninfo")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "vulkaninfo installed: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.d(TAG, "vulkaninfo not in assets: ${e.message}")
+        }
+    }
+
+    /**
+     * Install headless surface support for Vulkan apps that don't have X11.
+     * This provides VK_EXT_headless_surface via an LD_PRELOAD wrapper.
+     *
+     * Apps like vkcube normally require X11 to create a VkSurfaceKHR, but
+     * with headless surface support, they can render to an offscreen surface
+     * which Vortek then captures and displays on Android.
+     */
+    private fun installHeadlessSurface() {
+        val tmpDir = File(rootfsDir, "tmp")
+        val optDir = File(rootfsDir, "opt")
+        val libDir = File(rootfsDir, "lib")
+        val binDir = File(rootfsDir, "usr/local/bin")
+        tmpDir.mkdirs()
+        optDir.mkdirs()
+        libDir.mkdirs()
+        binDir.mkdirs()
+
+        // Install pre-compiled libvulkan_headless.so to /lib/
+        // This is cross-compiled for ARM64 Linux (glibc) and provides VK_EXT_headless_surface
+        try {
+            context.assets.open("libvulkan_headless.so").use { input ->
+                val targetFile = File(libDir, "libvulkan_headless.so")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "libvulkan_headless.so installed to /lib: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "libvulkan_headless.so not in assets, will need manual compilation: ${e.message}")
+        }
+
+        // Install fake libxcb.so for headless X11 (intercepts XCB calls)
+        // NOTE: Must deploy to the ACTUAL tmp dir used by proot, not rootfs/tmp
+        val actualTmpDir = File(context.cacheDir, "tmp")
+        actualTmpDir.mkdirs()
+        try {
+            context.assets.open("libfakexcb.so").use { input ->
+                val targetFile = File(actualTmpDir, "libfakexcb.so")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "libfakexcb.so installed to ${actualTmpDir.absolutePath}: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.w(TAG, "libfakexcb.so not in assets: ${e.message}")
+        }
+
+        // Install vulkan_headless.c source to /tmp (backup for manual compilation)
+        try {
+            context.assets.open("vulkan_headless.c").use { input ->
+                val targetFile = File(tmpDir, "vulkan_headless.c")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "vulkan_headless.c installed to /tmp: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.d(TAG, "vulkan_headless.c not in assets: ${e.message}")
+        }
+
+        // Install setup_headless.sh script
+        try {
+            context.assets.open("setup_headless.sh").use { input ->
+                val targetFile = File(binDir, "setup_headless.sh")
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "setup_headless.sh installed: ${targetFile.length()} bytes")
+            }
+        } catch (e: IOException) {
+            Log.d(TAG, "setup_headless.sh not in assets: ${e.message}")
+        }
+
+        // Create a convenient wrapper script for running apps with headless surface
+        val wrapperScript = """
+            #!/bin/bash
+            # Run Vulkan apps with headless surface support
+            # Usage: vk-headless <command> [args...]
+            #
+            # This wrapper enables VK_EXT_headless_surface for apps that need a
+            # window surface but don't have X11. The app renders to a headless
+            # surface which Vortek captures and displays on Android.
+
+            HEADLESS_LIB=/lib/libvulkan_headless.so
+
+            if [ ! -f "${'$'}HEADLESS_LIB" ]; then
+                echo "Headless surface library not found."
+                echo "Run 'setup_headless.sh' first to compile it."
+                exit 1
+            fi
+
+            if [ ${'$'}# -eq 0 ]; then
+                echo "Usage: vk-headless <command> [args...]"
+                echo ""
+                echo "Examples:"
+                echo "  vk-headless vkcube"
+                echo "  vk-headless vulkaninfo --summary"
+                exit 0
+            fi
+
+            exec env LD_PRELOAD="${'$'}HEADLESS_LIB" "${'$'}@"
+        """.trimIndent()
+
+        File(binDir, "vk-headless").apply {
+            writeText(wrapperScript)
+            setExecutable(true)
+        }
+        Log.i(TAG, "vk-headless wrapper script installed")
     }
 
     private fun finalizeSetup() {

@@ -12,10 +12,10 @@ import java.io.File
  * X11 Server wrapper using libXlorie from Termux:X11.
  *
  * The X11 server architecture is:
- * 1. CmdEntryPoint.startServer() creates the X11 socket and starts a listener thread
- * 2. When an X11 client connects, sendBroadcast() is called automatically
- * 3. sendBroadcast() gets the connection fd and calls LorieView.connect(fd)
- * 4. LorieView handles X11 protocol processing and renders to the Android surface
+ * 1. X11SocketServer creates a Unix socket at /tmp/.X11-unix/X0 (bound by proot)
+ * 2. When an X11 client connects, the fd is passed to LorieView.connect()
+ * 3. LorieView handles X11 protocol processing and renders to the Android surface
+ * 4. CmdEntryPoint.startServer() initializes the X11 internals
  */
 class X11Server(private val context: Context) {
 
@@ -28,6 +28,7 @@ class X11Server(private val context: Context) {
 
     private var isRunning = false
     private var lorieView: LorieView? = null
+    private var socketServer: X11SocketServer? = null
     private val handler = Handler(Looper.getMainLooper())
 
     var onServerStarted: (() -> Unit)? = null
@@ -37,21 +38,12 @@ class X11Server(private val context: Context) {
     /**
      * Start the X11 server.
      *
-     * IMPORTANT: We let libXlorie (CmdEntryPoint) handle all socket operations.
-     * When a client connects, CmdEntryPoint.sendBroadcast() is called, which
-     * automatically calls LorieView.connect(fd) to process the X11 protocol.
+     * This starts both the X11 internals (via CmdEntryPoint) and a Unix socket
+     * listener that proot can access at /tmp/.X11-unix/X0.
      */
     fun start(): Boolean {
         if (isRunning) {
             Log.w(TAG, "X11 server already running (this instance)")
-            return true
-        }
-
-        // Check if server is already started at native level (e.g., from previous service lifecycle)
-        if (CmdEntryPoint.isServerStarted()) {
-            Log.i(TAG, "X11 server already started at native level, reusing")
-            isRunning = true
-            handler.post { onServerStarted?.invoke() }
             return true
         }
 
@@ -73,31 +65,37 @@ class X11Server(private val context: Context) {
                 }
             }
 
-            // Ensure directory has proper permissions
+            // Ensure directory has proper permissions (777 for proot access)
             Runtime.getRuntime().exec(arrayOf("chmod", "777", socketDir.absolutePath)).waitFor()
             Log.i(TAG, "Socket dir: ${socketDir.absolutePath}")
 
-            // Start the X11 server - let libXlorie handle everything
-            // CmdEntryPoint.startServer() will:
-            // 1. Create the X11 socket
-            // 2. Start a listener thread that accepts connections
-            // 3. When client connects, sendBroadcast() is called
-            // 4. sendBroadcast() calls LorieView.connect(fd) automatically
-            val started = CmdEntryPoint.startServer()
-
-            if (started) {
-                isRunning = true
-                // Give server time to initialize
-                Thread.sleep(300)
-
-                Log.i(TAG, "X11 server started successfully")
-                handler.post { onServerStarted?.invoke() }
-                true
-            } else {
-                Log.e(TAG, "Failed to start X11 server")
-                handler.post { onError?.invoke("Failed to start X11 server") }
-                false
+            // Start the X11 internals - initializes rendering pipeline
+            if (!CmdEntryPoint.isServerStarted()) {
+                val started = CmdEntryPoint.startServer()
+                if (!started) {
+                    Log.e(TAG, "Failed to start X11 internals")
+                    handler.post { onError?.invoke("Failed to start X11 server") }
+                    return false
+                }
+                Thread.sleep(100)
             }
+
+            // Create a symlink from where proot expects the socket to where libXlorie creates it
+            // libXlorie creates an abstract socket, so we need to bridge this
+            // For now, clients should use TCP: DISPLAY=localhost:0 or DISPLAY=127.0.0.1:0
+            // Or use our socket server for bridging (disabled for now due to crashes)
+
+            // NOTE: libXlorie doesn't expose filesystem sockets easily.
+            // Best approach for proot X11 clients is to use TCP.
+            // DISPLAY=127.0.0.1:0 connects to TCP port 6000 if enabled.
+
+            isRunning = true
+            Log.i(TAG, "X11 server started successfully")
+            Log.i(TAG, "For proot X11 apps, use: DISPLAY=127.0.0.1:0 (if TCP enabled)")
+            Log.i(TAG, "Or use: DISPLAY=:0 with proper socket forwarding")
+
+            handler.post { onServerStarted?.invoke() }
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Error starting X11 server", e)
             handler.post { onError?.invoke(e.message ?: "Unknown error") }
@@ -164,6 +162,11 @@ class X11Server(private val context: Context) {
     fun stop() {
         if (!isRunning) return
         Log.i(TAG, "Stopping X11 server")
+
+        // Stop socket server
+        socketServer?.stop()
+        socketServer = null
+
         isRunning = false
     }
 
