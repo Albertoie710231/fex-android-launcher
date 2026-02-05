@@ -3,19 +3,23 @@ package com.mediatek.steamlauncher
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.Choreographer
 import android.view.Surface
-import java.io.InputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * TCP socket server for receiving Vulkan frames from proot.
  *
  * Uses TCP on localhost instead of Unix sockets for proot compatibility.
+ * Uses Choreographer for vsync-aligned frame display.
  *
  * The native wrapper sends frames in format:
  * - 4 bytes: width (little-endian uint32)
@@ -43,7 +47,16 @@ class FrameSocketServer(private val port: Int = 19850) {
 
     // Frame stats
     private var frameCount = 0L
+    private var receivedCount = 0L
     private var lastStatsTime = System.currentTimeMillis()
+
+    // Latest frame buffer (triple buffering)
+    private data class FrameData(val width: Int, val height: Int, val pixels: ByteArray)
+    private val latestFrame = AtomicReference<FrameData?>(null)
+
+    // Choreographer for vsync-aligned display
+    private val handler = Handler(Looper.getMainLooper())
+    private var choreographerCallback: Choreographer.FrameCallback? = null
 
     /**
      * Set the output surface for rendering frames.
@@ -51,6 +64,13 @@ class FrameSocketServer(private val port: Int = 19850) {
     fun setOutputSurface(surface: Surface?) {
         outputSurface = surface
         Log.i(TAG, "Output surface set: ${surface != null}")
+
+        // Start/stop choreographer based on surface availability
+        if (surface != null && running.get()) {
+            startChoreographer()
+        } else {
+            stopChoreographer()
+        }
     }
 
     /**
@@ -119,10 +139,54 @@ class FrameSocketServer(private val port: Int = 19850) {
     }
 
     /**
-     * Receive and display frames from client.
+     * Start choreographer for vsync-aligned rendering.
+     */
+    private fun startChoreographer() {
+        if (choreographerCallback != null) return
+
+        choreographerCallback = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (!running.get()) return
+
+                // Render latest frame if available
+                renderLatestFrame()
+
+                // Schedule next frame
+                if (running.get() && outputSurface != null) {
+                    Choreographer.getInstance().postFrameCallback(this)
+                }
+            }
+        }
+
+        handler.post {
+            Choreographer.getInstance().postFrameCallback(choreographerCallback!!)
+        }
+        Log.i(TAG, "Choreographer started")
+    }
+
+    /**
+     * Stop choreographer.
+     */
+    private fun stopChoreographer() {
+        choreographerCallback?.let {
+            handler.post {
+                Choreographer.getInstance().removeFrameCallback(it)
+            }
+        }
+        choreographerCallback = null
+        Log.i(TAG, "Choreographer stopped")
+    }
+
+    /**
+     * Receive frames from client (just stores them, doesn't display).
      */
     private fun receiveFrames(socket: Socket) {
         Log.i(TAG, "Receiving frames from ${socket.inetAddress}")
+
+        // Start choreographer for display
+        if (outputSurface != null) {
+            startChoreographer()
+        }
 
         val inputStream = socket.getInputStream()
         val headerBuffer = ByteArray(8)
@@ -167,15 +231,23 @@ class FrameSocketServer(private val port: Int = 19850) {
                     bytesRead += n
                 }
 
-                // Display frame
-                displayFrame(width, height, pixelBuffer)
+                // Store frame for choreographer to display (copy the buffer)
+                val frameCopy = pixelBuffer.copyOf(pixelSize)
+                latestFrame.set(FrameData(width, height, frameCopy))
+
+                // Save first frame to file for debugging
+                if (receivedCount == 0L) {
+                    saveDebugFrame(width, height, pixelBuffer)
+                }
 
                 // Stats
-                frameCount++
+                receivedCount++
                 val now = System.currentTimeMillis()
                 if (now - lastStatsTime > 5000) {
-                    val fps = frameCount * 1000.0 / (now - lastStatsTime)
-                    Log.i(TAG, "Frame rate: %.1f FPS (%d frames)".format(fps, frameCount))
+                    val recvFps = receivedCount * 1000.0 / (now - lastStatsTime)
+                    val dispFps = frameCount * 1000.0 / (now - lastStatsTime)
+                    Log.i(TAG, "Recv: %.1f FPS, Display: %.1f FPS".format(recvFps, dispFps))
+                    receivedCount = 0
                     frameCount = 0
                     lastStatsTime = now
                 }
@@ -188,7 +260,27 @@ class FrameSocketServer(private val port: Int = 19850) {
             }
         }
 
+        stopChoreographer()
         Log.i(TAG, "Frame receiver ended")
+    }
+
+    /**
+     * Save a frame for debugging.
+     */
+    private fun saveDebugFrame(width: Int, height: Int, pixels: ByteArray) {
+        try {
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
+
+            val file = java.io.File("/data/data/com.mediatek.steamlauncher/files/vkcube_frame.png")
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Log.i(TAG, "Saved first frame to ${file.absolutePath}")
+            bitmap.recycle()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save frame: ${e.message}")
+        }
     }
 
     // Reusable bitmap to avoid allocations
@@ -197,37 +289,22 @@ class FrameSocketServer(private val port: Int = 19850) {
     private var bitmapHeight = 0
 
     /**
-     * Display a frame on the output surface.
+     * Render the latest frame (called from Choreographer on main thread at vsync).
      */
-    private fun displayFrame(width: Int, height: Int, pixels: ByteArray) {
-        // Save first frame to file for debugging
-        if (frameCount == 0L) {
-            try {
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
+    private fun renderLatestFrame() {
+        // Get and clear the latest frame atomically
+        val frame = latestFrame.getAndSet(null) ?: return
 
-                // Save to app's files directory (accessible via run-as)
-                val file = java.io.File("/data/data/com.mediatek.steamlauncher/files/vkcube_frame.png")
-                java.io.FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                }
-                Log.i(TAG, "Saved first frame to ${file.absolutePath}")
-                bitmap.recycle()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to save frame: ${e.message}")
-            }
-        }
-
-        // Render to output surface
         val surface = outputSurface
         if (surface == null || !surface.isValid) {
-            if (frameCount < 5) {
-                Log.w(TAG, "No valid output surface for frame ${frameCount}")
-            }
             return
         }
 
         try {
+            val width = frame.width
+            val height = frame.height
+            val pixels = frame.pixels
+
             // Reuse or create bitmap
             if (frameBitmap == null || bitmapWidth != width || bitmapHeight != height) {
                 frameBitmap?.recycle()
@@ -260,10 +337,7 @@ class FrameSocketServer(private val port: Int = 19850) {
                 canvas.restore()
 
                 surface.unlockCanvasAndPost(canvas)
-
-                if (frameCount < 5) {
-                    Log.i(TAG, "Rendered frame ${frameCount}: ${width}x${height} -> ${canvas.width}x${canvas.height}")
-                }
+                frameCount++
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to render frame: ${e.message}")
@@ -276,6 +350,8 @@ class FrameSocketServer(private val port: Int = 19850) {
     fun stop() {
         Log.i(TAG, "Stopping frame socket server")
         running.set(false)
+
+        stopChoreographer()
 
         clientSocket?.close()
         clientSocket = null

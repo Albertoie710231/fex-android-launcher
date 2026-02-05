@@ -26,6 +26,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 
 // Minimal Vulkan types
 typedef uint32_t VkFlags;
@@ -286,6 +287,15 @@ static int connect_frame_socket(void) {
 
     g_frame_socket_connected = 1;
     fprintf(stderr, "[XCB-Bridge] Connected to frame socket on port %d\n", FRAME_SOCKET_PORT);
+
+    // Set socket to non-blocking for frame dropping when buffer is full
+    int flags = fcntl(g_frame_socket, F_GETFL, 0);
+    fcntl(g_frame_socket, F_SETFL, flags | O_NONBLOCK);
+
+    // Increase send buffer size
+    int bufsize = 4 * 1024 * 1024;  // 4MB buffer
+    setsockopt(g_frame_socket, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
     return 1;
 }
 
@@ -300,6 +310,15 @@ static void send_frame_pitched(uint32_t width, uint32_t height, const void* pixe
 
     ssize_t sent = write(g_frame_socket, header, sizeof(header));
     if (sent != sizeof(header)) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Buffer full, drop this frame
+            static int drop_count = 0;
+            drop_count++;
+            if (drop_count < 5 || drop_count % 100 == 0) {
+                fprintf(stderr, "[XCB-Bridge] Dropping frame (buffer full, dropped %d)\n", drop_count);
+            }
+            return;
+        }
         fprintf(stderr, "[XCB-Bridge] Failed to send frame header: %s\n", strerror(errno));
         close(g_frame_socket);
         g_frame_socket = -1;
@@ -308,29 +327,48 @@ static void send_frame_pitched(uint32_t width, uint32_t height, const void* pixe
     }
 
     // Frame data: RGBA pixels - handle row pitch
+    // For non-blocking socket, we need to handle partial writes
     size_t expected_pitch = width * 4;
     if (row_pitch == expected_pitch) {
         // Tightly packed, send directly
         size_t data_size = width * height * 4;
-        sent = write(g_frame_socket, pixels, data_size);
-        if (sent != (ssize_t)data_size) {
-            fprintf(stderr, "[XCB-Bridge] Failed to send frame data: %s\n", strerror(errno));
-            close(g_frame_socket);
-            g_frame_socket = -1;
-            g_frame_socket_connected = 0;
-            return;
+        size_t total_sent = 0;
+        const uint8_t* ptr = (const uint8_t*)pixels;
+        while (total_sent < data_size) {
+            sent = write(g_frame_socket, ptr + total_sent, data_size - total_sent);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Buffer full mid-frame - wait a bit and retry
+                    usleep(1000);  // 1ms
+                    continue;
+                }
+                fprintf(stderr, "[XCB-Bridge] Failed to send frame data: %s\n", strerror(errno));
+                close(g_frame_socket);
+                g_frame_socket = -1;
+                g_frame_socket_connected = 0;
+                return;
+            }
+            total_sent += sent;
         }
     } else {
         // Row pitch differs - send row by row
         const uint8_t* src = (const uint8_t*)pixels;
         for (uint32_t y = 0; y < height; y++) {
-            sent = write(g_frame_socket, src, expected_pitch);
-            if (sent != (ssize_t)expected_pitch) {
-                fprintf(stderr, "[XCB-Bridge] Failed to send row %u: %s\n", y, strerror(errno));
-                close(g_frame_socket);
-                g_frame_socket = -1;
-                g_frame_socket_connected = 0;
-                return;
+            size_t row_sent = 0;
+            while (row_sent < expected_pitch) {
+                sent = write(g_frame_socket, src + row_sent, expected_pitch - row_sent);
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        usleep(1000);
+                        continue;
+                    }
+                    fprintf(stderr, "[XCB-Bridge] Failed to send row %u: %s\n", y, strerror(errno));
+                    close(g_frame_socket);
+                    g_frame_socket = -1;
+                    g_frame_socket_connected = 0;
+                    return;
+                }
+                row_sent += sent;
             }
             src += row_pitch;
         }

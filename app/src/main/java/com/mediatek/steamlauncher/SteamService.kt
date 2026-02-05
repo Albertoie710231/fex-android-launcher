@@ -385,7 +385,7 @@ class SteamService : Service() {
                         echo "7. Testing vkcube (requires XCB - may fail)..."
                         echo ""
                         export DISPLAY=:0
-                        LD_PRELOAD=/lib/libvulkan_headless.so ${'$'}VKCUBE --c 10 2>&1 || echo "   vkcube exited (expected - requires XCB)"
+                        LD_PRELOAD=/lib/libvulkan_headless.so ${'$'}VKCUBE 2>&1 || echo "   vkcube exited (expected - requires XCB)"
                         unset LD_PRELOAD
                     fi
                 fi
