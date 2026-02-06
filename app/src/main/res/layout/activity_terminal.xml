@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#FF000000">
+
+    <!-- Toolbar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:background="#FF1A1A1A">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:text="Terminal"
+            android:textColor="#FF00FF00"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnClear"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:text="Clear"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnClose"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:text="Close"
+            android:textSize="12sp"
+            android:layout_marginStart="8dp" />
+
+    </LinearLayout>
+
+    <!-- Terminal Output -->
+    <ScrollView
+        android:id="@+id/scrollView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <TextView
+            android:id="@+id/tvOutput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="8dp"
+            android:textColor="#FF00FF00"
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:background="#FF000000" />
+
+    </ScrollView>
+
+    <!-- Quick Commands Row -->
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#FF1A1A1A"
+        android:padding="4dp">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnSetupFex"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Setup FEX"
+                android:textSize="11sp"
+                android:padding="8dp" />
+
+            <Button
+                android:id="@+id/btnTestSem"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Test Sem"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnVulkanInfo"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="vulkaninfo"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnLs"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="ls -la"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnPwd"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="pwd"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+        </LinearLayout>
+
+    </HorizontalScrollView>
+
+    <!-- Command Input -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:background="#FF1A1A1A">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="$ "
+            android:textColor="#FF00FF00"
+            android:textSize="14sp"
+            android:fontFamily="monospace" />
+
+        <EditText
+            android:id="@+id/etCommand"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:textColor="#FFFFFFFF"
+            android:textColorHint="#FF666666"
+            android:hint="Enter command..."
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:background="@android:color/transparent"
+            android:inputType="text"
+            android:imeOptions="actionSend"
+            android:singleLine="true" />
+
+        <Button
+            android:id="@+id/btnSend"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:text="Run"
+            android:textSize="12sp" />
+
+    </LinearLayout>
+
+</LinearLayout>

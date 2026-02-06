@@ -12,7 +12,7 @@ import java.io.File
  * X11 Server wrapper using libXlorie from Termux:X11.
  *
  * The X11 server architecture is:
- * 1. X11SocketServer creates a Unix socket at /tmp/.X11-unix/X0 (bound by proot)
+ * 1. X11SocketServer creates a Unix socket at /tmp/.X11-unix/X0 (bound by FEX container)
  * 2. When an X11 client connects, the fd is passed to LorieView.connect()
  * 3. LorieView handles X11 protocol processing and renders to the Android surface
  * 4. CmdEntryPoint.startServer() initializes the X11 internals
@@ -39,7 +39,7 @@ class X11Server(private val context: Context) {
      * Start the X11 server.
      *
      * This starts both the X11 internals (via CmdEntryPoint) and a Unix socket
-     * listener that proot can access at /tmp/.X11-unix/X0.
+     * listener that the FEX container can access at /tmp/.X11-unix/X0.
      */
     fun start(): Boolean {
         if (isRunning) {
@@ -65,7 +65,7 @@ class X11Server(private val context: Context) {
                 }
             }
 
-            // Ensure directory has proper permissions (777 for proot access)
+            // Ensure directory has proper permissions (777 for FEX container access)
             Runtime.getRuntime().exec(arrayOf("chmod", "777", socketDir.absolutePath)).waitFor()
             Log.i(TAG, "Socket dir: ${socketDir.absolutePath}")
 
@@ -80,18 +80,18 @@ class X11Server(private val context: Context) {
                 Thread.sleep(100)
             }
 
-            // Create a symlink from where proot expects the socket to where libXlorie creates it
+            // Create a symlink from where the FEX container expects the socket to where libXlorie creates it
             // libXlorie creates an abstract socket, so we need to bridge this
             // For now, clients should use TCP: DISPLAY=localhost:0 or DISPLAY=127.0.0.1:0
             // Or use our socket server for bridging (disabled for now due to crashes)
 
             // NOTE: libXlorie doesn't expose filesystem sockets easily.
-            // Best approach for proot X11 clients is to use TCP.
+            // Best approach for FEX container X11 clients is to use TCP.
             // DISPLAY=127.0.0.1:0 connects to TCP port 6000 if enabled.
 
             isRunning = true
             Log.i(TAG, "X11 server started successfully")
-            Log.i(TAG, "For proot X11 apps, use: DISPLAY=127.0.0.1:0 (if TCP enabled)")
+            Log.i(TAG, "For FEX container X11 apps, use: DISPLAY=127.0.0.1:0 (if TCP enabled)")
             Log.i(TAG, "Or use: DISPLAY=:0 with proper socket forwarding")
 
             handler.post { onServerStarted?.invoke() }

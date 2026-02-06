@@ -43,4 +43,11 @@ object X11SocketHelper {
      */
     @JvmStatic
     external fun unlinkSocket(path: String)
+
+    /**
+     * Read data from a socket into a buffer.
+     * Returns bytes read, 0 on EOF, -1 on error.
+     */
+    @JvmStatic
+    external fun readSocket(fd: Int, buffer: ByteArray, offset: Int, length: Int): Int
 }

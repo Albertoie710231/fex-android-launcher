@@ -1,6 +1,6 @@
 # MediaTek Steam Gaming App
 
-A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimensity tablets using Vortek Vulkan IPC passthrough, proot isolation, and x86 emulation.
+A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimensity tablets using Vortek Vulkan IPC passthrough and FEX-Emu x86-64 emulation.
 
 ## Architecture
 
@@ -26,12 +26,12 @@ A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimens
 │  │  - Choreographer vsync (60 FPS)                         ││
 │  └─────────────────────────────────────────────────────────┘│
 ├─────────────────────────────────────────────────────────────┤
-│                    PRoot Container                           │
+│              FEX-Emu (Direct, no PRoot)                      │
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │ Ubuntu 22.04 RootFS                                     ││
+│  │ FEXLoader (ARM64 native)                                ││
+│  │  ├── x86-64 rootfs (Ubuntu 22.04 from fex-emu.gg)     ││
 │  │  ├── libvulkan_vortek.so (Vulkan ICD)                  ││
 │  │  │   └── Serializes Vulkan calls → sends via socket    ││
-│  │  ├── Box64/FEX (x86 → ARM64 translation)               ││
 │  │  ├── Steam Client                                       ││
 │  │  ├── DXVK (Direct3D → Vulkan)                          ││
 │  │  └── Proton (Wine-based Windows compat)                 ││
@@ -41,12 +41,25 @@ A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimens
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Key Design: No PRoot
+
+FEX-Emu runs directly via `ProcessBuilder` — no PRoot, no ptrace overhead:
+
+```
+App → ProcessBuilder → ld-linux-aarch64.so.1 → FEXLoader → x86-64 bash/Steam
+```
+
+FEX provides its own rootfs overlay that handles filesystem redirection:
+- `/bin`, `/usr/lib`, etc. → redirected to FEX's x86-64 rootfs
+- `/dev`, `/proc`, `/sys` → host devices directly (including GPU)
+- `/tmp` → redirected to rootfs `/tmp/` (symlinks for Vortek/X11 sockets)
+
 ## Vortek: How Mali GPU Works
 
 The key innovation is **Vortek IPC passthrough** - bridging glibc (container) and Bionic (Android):
 
 ```
-Container (glibc)              Android (Bionic)
+FEX Container (glibc)          Android (Bionic)
 ┌─────────────────┐            ┌─────────────────┐
 │ Game/Steam      │            │                 │
 │      ↓          │            │                 │
@@ -78,34 +91,91 @@ This bypasses the glibc/Bionic binary incompatibility that prevents loading Andr
 
 ## Building
 
-1. Open the project in Android Studio
+1. Download vendor sources for the NDK-built `unsquashfs` tool:
+   ```bash
+   bash scripts/fetch_unsquashfs_source.sh
+   ```
 
-2. Sync Gradle files
-
-3. Build the project:
+2. Build the project:
    ```bash
    ./gradlew assembleDebug
    ```
 
-4. Install on device:
+3. Install on device:
    ```bash
-   ./gradlew installDebug
+   adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 
 ## First Run Setup
 
 1. Launch the app and grant storage permissions
 
-2. Click "Setup Container" to download and configure the Linux rootfs
+2. Click **"Setup Container"** — this will:
+   - Extract FEX ARM64 binaries from bundled `fex-bin.tgz`
+   - Download x86-64 SquashFS rootfs (~995MB) from `rootfs.fex-emu.gg`
+   - Extract rootfs with NDK-built `unsquashfs` (~2GB extracted)
+   - Configure FEX (`Config.json`, thunks)
+   - Setup Vortek Vulkan ICD in the rootfs
+   - Download and extract Steam
 
-3. After setup, the app will automatically install:
-   - Box64 with BOX32 support (x86_64 and x86 emulation on ARM64-only devices)
-   - Required x86 libraries
-   - Patched PRoot with futex/semaphore support
+3. Open Terminal and verify FEX works
 
-4. Go to Settings > "Install Steam" to install Steam
+4. Click **"Launch Steam"** to start Steam via FEX
 
-5. Click "Launch Steam" to start
+## Testing FEX via ADB
+
+### Verify FEXLoader runs
+
+```bash
+FEXDIR="/data/data/com.mediatek.steamlauncher/files/fex"
+FEXHOME="/data/data/com.mediatek.steamlauncher/files/fex-home"
+
+adb shell "run-as com.mediatek.steamlauncher sh -c '
+  export HOME=$FEXHOME
+  export USE_HEAP=1
+  export FEX_DISABLETELEMETRY=1
+  $FEXDIR/lib/ld-linux-aarch64.so.1 \
+    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
+    $FEXDIR/bin/FEXLoader --version
+'"
+```
+
+Expected output: `FEX-Emu (FEX-2506)`
+
+### Start FEXServer and run x86-64 commands
+
+FEXServer must be running for FEXLoader to execute guest binaries:
+
+```bash
+FEXDIR="/data/data/com.mediatek.steamlauncher/files/fex"
+FEXHOME="/data/data/com.mediatek.steamlauncher/files/fex-home"
+TMPDIR="/data/data/com.mediatek.steamlauncher/cache/tmp"
+
+# Start FEXServer (persistent for 60s)
+adb shell "run-as com.mediatek.steamlauncher sh -c '
+  export HOME=$FEXHOME TMPDIR=$TMPDIR USE_HEAP=1 FEX_DISABLETELEMETRY=1
+  mkdir -p $TMPDIR
+  $FEXDIR/lib/ld-linux-aarch64.so.1 \
+    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
+    $FEXDIR/bin/FEXServer -f -p 60 &
+  sleep 2
+  $FEXDIR/lib/ld-linux-aarch64.so.1 \
+    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
+    $FEXDIR/bin/FEXLoader -- /bin/uname -a
+'"
+```
+
+Expected output: `Linux ... x86_64 GNU/Linux`
+
+### Test unsquashfs binary
+
+```bash
+NATIVELIB=$(dirname $(adb shell pm path com.mediatek.steamlauncher | cut -d: -f2 | tr -d '\r\n'))/lib/arm64
+
+adb shell "run-as com.mediatek.steamlauncher $NATIVELIB/libunsquashfs.so -version"
+```
+
+Expected output: `unsquashfs version 4.6.1`
 
 ## Android 12+ Phantom Process Fix
 
@@ -129,11 +199,14 @@ adb shell "/system/bin/dumpsys activity settings | grep max_phantom"
 app/
 ├── src/main/
 │   ├── java/com/mediatek/steamlauncher/
-│   │   ├── SteamLauncherApp.kt     # Application class
+│   │   ├── SteamLauncherApp.kt     # Application class, path helpers
 │   │   ├── MainActivity.kt          # Main launcher UI
 │   │   ├── SteamService.kt          # Foreground service
-│   │   ├── ContainerManager.kt      # RootFS management
-│   │   ├── ProotExecutor.kt         # PRoot JNI wrapper
+│   │   ├── ContainerManager.kt      # FEX rootfs setup & management
+│   │   ├── FexExecutor.kt           # FEXLoader process execution
+│   │   ├── TerminalActivity.kt      # Interactive FEX terminal
+│   │   ├── SettingsActivity.kt      # Settings & diagnostics
+│   │   ├── VulkanBridge.kt          # Vulkan/Vortek ICD setup
 │   │   ├── VortekRenderer.kt        # Vortek Vulkan wrapper
 │   │   ├── FramebufferBridge.kt     # HardwareBuffer → Surface
 │   │   ├── FrameSocketServer.kt     # TCP frame receiver
@@ -141,36 +214,45 @@ app/
 │   │   ├── X11SocketHelper.kt       # Unix socket helper
 │   │   └── ...
 │   ├── cpp/
+│   │   ├── CMakeLists.txt           # NDK build (includes unsquashfs)
 │   │   ├── steamlauncher.cpp        # JNI bridge
 │   │   ├── framebuffer_bridge.cpp   # HardwareBuffer JNI
 │   │   ├── x11_socket.cpp           # Unix socket JNI
-│   │   ├── vulkan_headless_wrapper.c # Headless surface wrapper
-│   │   └── lorie/                   # X11 server implementation
+│   │   └── vendor/                  # squashfs-tools & xz-utils source
 │   ├── jniLibs/arm64-v8a/
 │   │   ├── libvortekrenderer.so     # Android Vulkan executor
-│   │   ├── libhook_impl.so          # Mali driver hook
+│   │   ├── libhook_impl.so         # Mali driver hook
 │   │   └── ...
 │   ├── assets/
+│   │   ├── fex-bin.tgz             # FEX ARM64 binaries + glibc 2.38
 │   │   ├── libvulkan_vortek.so      # Container Vulkan ICD
 │   │   ├── libvulkan_headless.so    # Headless surface wrapper
-│   │   ├── setup.sh                 # Container setup script
 │   │   └── vkcube, vulkaninfo       # Test binaries
 │   └── res/
 │       └── layout/                  # UI layouts
-└── build.gradle.kts
+├── build.gradle.kts
+└── scripts/
+    └── fetch_unsquashfs_source.sh   # Downloads vendor source for NDK build
 ```
 
 ## Key Components
 
-### SteamService
-Foreground service that keeps the proot container alive. Required for Android 12+ to prevent the system from killing background processes.
+### FexExecutor
+Runs FEXLoader directly via `ProcessBuilder`:
+- Invokes FEXLoader through bundled `ld-linux-aarch64.so.1` (bypasses missing `/opt/fex/` on Android)
+- Clears Android env pollution (LD_PRELOAD, ANDROID_*, etc.)
+- Sets `USE_HEAP=1` to avoid SBRK allocation issues
+- Creates symlinks in FEX rootfs `/tmp/` for Vortek and X11 sockets
 
 ### ContainerManager
-Manages the Linux rootfs lifecycle:
-- Downloads Ubuntu 22.04 arm64 base
-- Configures X11, Vulkan, and Steam dependencies
-- Installs x86 emulator (Box64/FEX)
-- Extracts Steam bootstrap from .deb
+Manages the FEX environment lifecycle:
+- Extracts FEX ARM64 binaries from bundled `fex-bin.tgz`
+- Downloads and extracts x86-64 SquashFS rootfs via NDK-built `unsquashfs`
+- Writes FEX Config.json and thunks.json
+- Sets up Vortek ICD and Steam
+
+### SteamService
+Foreground service that keeps the FEX container alive. Required for Android 12+ to prevent the system from killing background processes.
 
 ### VortekRenderer
 Android-side Vulkan execution:
@@ -179,10 +261,11 @@ Android-side Vulkan execution:
 - Renders to HardwareBuffer (GPU memory)
 
 ### FramebufferBridge
-GPU frame delivery to screen:
-- Wraps HardwareBuffer as Bitmap (GPU-backed, zero-copy)
-- Blits to Android Surface via Canvas
-- Choreographer-based vsync (60 FPS target)
+Zero-copy GPU frame display:
+1. VortekRenderer renders to AHardwareBuffer (GPU memory)
+2. FramebufferBridge wraps as Bitmap (GPU-backed)
+3. Blits to Android Surface via Canvas
+4. Choreographer syncs to 60 FPS vsync
 
 ### libvulkan_vortek.so (Container ICD)
 Container-side Vulkan serialization:
@@ -196,75 +279,10 @@ Provides X11 display server functionality:
 - Translates Android touch events to X11 mouse events
 - Handles keyboard input
 
-### ProotExecutor
-Wraps proot execution:
-- Binds /dev for device access
-- Binds X11 and Vortek sockets
-- Configures environment for x86 emulation
-
-## Testing Steam via ADB
-
-To verify Steam runs correctly through the patched PRoot and Box32, use this command:
-
-```bash
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  export NATIVELIB=\$(dirname \$(pm path com.mediatek.steamlauncher | cut -d: -f2))/lib/arm64
-  export LD_LIBRARY_PATH=files/lib-override:\$NATIVELIB
-  export PROOT_LOADER=\$NATIVELIB/libproot-loader.so
-  export PROOT_TMP_DIR=cache/proot-tmp
-  export PROOT_NO_SECCOMP=1
-
-  timeout 15 \$NATIVELIB/libproot.so --rootfs=files/rootfs \
-    -b /dev -b /proc -b /sys \
-    -w /home/user \
-    /bin/sh -c \"
-      export HOME=/home/user
-      export DISPLAY=:0
-      export BOX64_LOG=1
-      export BOX64_LD_LIBRARY_PATH=/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu
-      export LD_LIBRARY_PATH=/lib/i386-linux-gnu:/usr/lib/i386-linux-gnu
-      export STEAM_RUNTIME=0
-      /usr/local/bin/box32 /home/user/.local/share/Steam/ubuntu12_32/steam 2>&1
-    \"
-'"
-```
-
-Expected output (success):
-```
-[BOX32] Personality set to 32bits
-[BOX32] Using Box32 to load 32bits elf
-[BOX32] Rename process to "steam"
-[BOX32] Using native(wrapped) libdl.so.2
-[BOX32] Using native(wrapped) librt.so.1
-[BOX32] Using native(wrapped) libm.so.6
-[BOX32] Using native(wrapped) libpthread.so.0
-[BOX32] Using native(wrapped) libc.so.6
-[BOX32] Using native(wrapped) ld-linux.so.2
-```
-
-If you see the above output without "semaphore creation failed" errors, the patched PRoot is working correctly. Steam will wait for an X11 display server to continue.
-
-### Fix libtalloc symlink after reinstall
-
-After reinstalling the APK, the libtalloc symlink may break. Fix it with:
-
-```bash
-APP_PATH=$(adb shell "pm path com.mediatek.steamlauncher" | cut -d: -f2 | tr -d '\r\n')
-NATIVELIB=$(dirname "$APP_PATH")/lib/arm64
-
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  rm -f files/lib-override/libtalloc.so.2
-  mkdir -p files/lib-override
-  ln -sf $NATIVELIB/libtalloc.so files/lib-override/libtalloc.so.2
-'"
-```
-
 ## Troubleshooting
 
-### Steam crashes with "semaphore creation failed"
-This is a **Box64 limitation on Android** - Box64 wraps pthread to Bionic, which rejects semaphores.
-- **Solution:** Migrate to FEX-Emu (see TODO.md Phase 2)
-- This is NOT fixable by patching PRoot
+### FEXLoader: "Couldn't execute: FEXServer"
+FEXServer must be started before FEXLoader can execute guest binaries. The app handles this automatically via `FexExecutor`, but for manual ADB testing, start FEXServer first (see testing section above).
 
 ### Vulkan/vkcube not rendering
 1. Check Vortek ICD is configured:
@@ -274,17 +292,11 @@ This is a **Box64 limitation on Android** - Box64 wraps pthread to Bionic, which
    ```
 2. Check VortekRenderer is running (Android logs)
 3. Run `vulkaninfo --summary` - should show Mali GPU
-4. For headless apps, ensure `LD_PRELOAD=/lib/libvulkan_headless.so`
 
 ### Black screen / no rendering
 - For Vulkan apps: Check FramebufferBridge is receiving frames
 - For X11 apps: Verify X11 socket exists `/tmp/.X11-unix/X0`
 - Check DISPLAY is set: `echo $DISPLAY` should show `:0`
-
-### Low FPS / stuttering
-- vkcube renders at 15-40 FPS (variable render time in PRoot)
-- Display runs at 60 FPS via Choreographer
-- Frame pacing optimization is WIP
 
 ### App killed by Android
 - Run the phantom process fix commands via ADB
@@ -298,12 +310,23 @@ MIT License
 ## Credits
 
 - [Winlator](https://github.com/brunodev85/winlator) - Vortek Vulkan IPC passthrough
-- [Box64](https://github.com/ptitSeb/box64) - x86_64 emulation (with BOX32 support)
-- [FEX-Emu](https://github.com/FEX-Emu/FEX) - x86 emulation with glibc emulation (planned)
-- [PRoot](https://github.com/termux/proot) - User-space chroot (Termux fork)
+- [FEX-Emu](https://github.com/FEX-Emu/FEX) - x86-64 emulation with glibc emulation (FEX-2506)
 - [Termux:X11](https://github.com/termux/termux-x11) - X11 server inspiration
 
 ## Technical Notes
+
+### FEXLoader Invocation on Android
+
+FEX binaries have `PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1` hardcoded. On Android, `/opt/fex/` doesn't exist. We bypass this by invoking FEXLoader through the bundled dynamic linker directly:
+
+```bash
+${fexDir}/lib/ld-linux-aarch64.so.1 \
+  --library-path ${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu \
+  ${fexDir}/bin/FEXLoader \
+  -- /bin/bash -c "command"
+```
+
+Where `fexDir = ${context.filesDir}/fex` (extracted from `fex-bin.tgz`).
 
 ### Vortek IPC Architecture
 Vortek solves the fundamental problem that Android's Vulkan driver (vulkan.mali.so) uses Bionic libc, but container apps use glibc. You cannot load a Bionic library from glibc code.
@@ -315,20 +338,23 @@ Vortek solves the fundamental problem that Android's Vulkan driver (vulkan.mali.
 - `libvortekrenderer.so` (Bionic, Android) - Executes on real Mali GPU
 - `libhook_impl.so` - Intercepts vulkan.mali.so loading
 
-### VK_EXT_headless_surface
-The `vulkan_headless_wrapper.c` adds headless surface support for apps that don't need X11/XCB:
-- Wraps libvulkan_vortek.so
-- Adds VK_EXT_headless_surface extension
-- Used by vkcube for windowless rendering
+### Socket Access in FEX
 
-### FramebufferBridge
-Zero-copy GPU frame display:
-1. VortekRenderer renders to AHardwareBuffer (GPU memory)
-2. FramebufferBridge wraps as Bitmap (GPU-backed)
-3. Blits to Android Surface via Canvas
-4. Choreographer syncs to 60 FPS vsync
+FEX redirects `/tmp` to rootfs `/tmp/`. To make Vortek and X11 sockets accessible from the FEX environment, symlinks are created in the rootfs:
 
-### x86 Emulation (Current Blocker)
-**Box64** wraps pthread to Android Bionic → semaphores fail on Android kernel.
+```
+${fexRootfsDir}/tmp/.vortek/V0 → ${actualTmpDir}/.vortek/V0
+${fexRootfsDir}/tmp/.X11-unix/X0 → ${actualX11SocketDir}/X0
+```
 
-**FEX-Emu** (planned) emulates x86 glibc → semaphores use futex → Android supports this.
+### FEX-Emu Build Notes
+
+- FEX binaries are bundled as `fex-bin.tgz` in assets (`.tgz` extension prevents AAPT decompression)
+- Binaries have `RUNPATH=/opt/fex/lib` pointing to bundled glibc 2.38 libs
+- `FEXInterpreter` is a binfmt handler — do NOT pass `--help`/`--version` to it
+- Use `FEXLoader --version` for testing, `FEXLoader -- /path/to/x86/binary` for running x86 programs
+- SquashFS rootfs from `rootfs.fex-emu.gg` is extracted by NDK-built `unsquashfs` (packaged as `libunsquashfs.so`)
+
+### NDK-built unsquashfs
+
+`unsquashfs` is compiled from squashfs-tools 4.6.1 source via Android NDK as part of the normal APK build. This eliminates the need for an ARM64 Ubuntu rootfs just to run `apt-get install squashfs-tools`. Sources are downloaded by `scripts/fetch_unsquashfs_source.sh` into `app/src/main/cpp/vendor/`.

@@ -1,11 +1,6 @@
 #!/bin/bash
 # FEX-Emu setup script for Steam on Android
-# This script installs FEX in the ARM64 Ubuntu rootfs and sets up x86-64 environment
-#
-# Key difference from Box64:
-# - Box64: Uses native ARM64 libs, wraps pthread to Bionic → semaphores FAIL
-# - FEX: Uses x86 libs from x86 rootfs, emulates glibc → semaphores WORK
-
+# Downloads and installs FEX binaries, then sets up x86-64 rootfs
 set -e
 
 echo "========================================"
@@ -18,140 +13,182 @@ if [ ! -f /etc/os-release ]; then
     exit 1
 fi
 
+# Ensure HOME is set
+export HOME="${HOME:-/home/user}"
+export PATH="/opt/fex/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
+
+# Create directories only if they don't exist (avoids proot issues)
+[ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null || true
+[ -d "/usr/local/bin" ] || mkdir -p /usr/local/bin 2>/dev/null || true
+
 # ============================================
-# Step 1: Add FEX PPA and install
+# Step 1: Install FEX binaries to /opt/fex
 # ============================================
 echo ""
-echo "=== Step 1: Installing FEX-Emu ==="
+echo "=== Step 1: Installing FEX binaries ==="
 
-# Check if already installed
-if command -v FEXInterpreter &> /dev/null || command -v FEX &> /dev/null; then
-    FEX_BIN=$(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-    echo "FEX already installed at: $FEX_BIN"
+# FEX binaries are built with interpreter path /opt/fex/lib/ld-linux-aarch64.so.1
+# so they MUST be installed to /opt/fex/ for the bundled glibc to be found
+FEX_DIR="/opt/fex"
+[ -d "$FEX_DIR" ] || mkdir -p "$FEX_DIR" 2>/dev/null || true
+
+# Check if FEX is already installed with bundled libs
+if [ -x "$FEX_DIR/bin/FEXInterpreter" ] && [ -f "$FEX_DIR/lib/aarch64-linux-gnu/libc.so.6" ]; then
+    echo "FEX already installed at $FEX_DIR"
 else
-    # Add PPA
-    if ! grep -q "fex-emu/fex" /etc/apt/sources.list.d/*.list 2>/dev/null; then
-        echo "Adding FEX PPA..."
-        apt-get update -qq
-        apt-get install -y software-properties-common gpg
-        add-apt-repository -y ppa:fex-emu/fex
-        apt-get update -qq
-    fi
+    echo "Extracting FEX binaries from assets..."
 
-    # Detect ARM version and install appropriate package
-    # MediaTek Dimensity chips are ARMv8.2+
-    echo "Installing FEX for ARMv8.2..."
-    apt-get install -y fex-emu-armv8.2 || {
-        echo "ARMv8.2 failed, trying ARMv8.0..."
-        apt-get install -y fex-emu-armv8.0
-    }
+    # Extract from bundled assets
+    # We use .tgz extension to prevent Android AAPT from decompressing
+    # Also check .tar.gz and .tar as fallbacks
+    FEX_ARCHIVE=""
+    FEX_TAR_OPTS=""
+    for f in /assets/fex-bin.tgz /assets/fex-bin.tar.gz /assets/fex-bin.tar; do
+        if [ -f "$f" ]; then
+            FEX_ARCHIVE="$f"
+            break
+        fi
+    done
 
-    # Verify installation
-    if ! command -v FEXInterpreter &> /dev/null && ! command -v FEX &> /dev/null; then
-        echo "ERROR: FEX installation failed"
+    if [ -z "$FEX_ARCHIVE" ]; then
+        echo "ERROR: FEX binaries not found in /assets/"
+        ls -la /assets/ 2>/dev/null || echo "Cannot list /assets/"
         exit 1
     fi
 
-    FEX_BIN=$(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-    echo "FEX installed at: $FEX_BIN"
+    echo "Extracting from: $FEX_ARCHIVE"
+    # Try gzip first, fallback to plain tar (in case AAPT decompressed it)
+    tar -xzf "$FEX_ARCHIVE" -C "$FEX_DIR" 2>/dev/null || \
+    tar -xf "$FEX_ARCHIVE" -C "$FEX_DIR" 2>/dev/null || {
+        echo "ERROR: Failed to extract FEX from $FEX_ARCHIVE"
+        exit 1
+    }
+
+    # Make binaries executable
+    chmod +x "$FEX_DIR/bin/"* 2>/dev/null || true
+    # Libraries need execute permission for the dynamic linker
+    chmod +x "$FEX_DIR/lib/"*.so* 2>/dev/null || true
+    chmod +x "$FEX_DIR/lib/aarch64-linux-gnu/"*.so* 2>/dev/null || true
+
+    # Verify installation
+    if [ -x "$FEX_DIR/bin/FEXInterpreter" ]; then
+        echo "FEX installed at: $FEX_DIR"
+        ls -la "$FEX_DIR/bin/" 2>/dev/null
+        echo ""
+        echo "Bundled libraries:"
+        ls -la "$FEX_DIR/lib/aarch64-linux-gnu/"*.so* 2>/dev/null || echo "  (none found)"
+    else
+        echo "ERROR: FEXInterpreter not found after extraction"
+        echo "Contents of $FEX_DIR:"
+        find "$FEX_DIR" -type f 2>/dev/null | head -20
+        exit 1
+    fi
+fi
+
+# Create symlinks in standard PATH locations
+ln -sf "$FEX_DIR/bin/FEXInterpreter" /usr/local/bin/FEXInterpreter 2>/dev/null || \
+    ln -sf "$FEX_DIR/bin/FEXInterpreter" "$HOME/.local/bin/FEXInterpreter" 2>/dev/null || true
+ln -sf "$FEX_DIR/bin/FEXLoader" /usr/local/bin/FEXLoader 2>/dev/null || true
+ln -sf "$FEX_DIR/bin/FEXServer" /usr/local/bin/FEXServer 2>/dev/null || true
+ln -sf "$FEX_DIR/bin/FEXRootFSFetcher" /usr/local/bin/FEXRootFSFetcher 2>/dev/null || true
+
+# ============================================
+# Step 2: Test FEX
+# ============================================
+echo ""
+echo "=== Step 2: Testing FEX ==="
+
+export USE_HEAP=1
+export FEX_DISABLETELEMETRY=1
+
+echo "Running FEX test..."
+FEX_VERSION=$("$FEX_DIR/bin/FEXLoader" --version 2>&1)
+if [ $? -eq 0 ] && echo "$FEX_VERSION" | grep -q "FEX"; then
+    echo "SUCCESS: $FEX_VERSION"
+else
+    echo ""
+    echo "WARNING: FEX failed to start!"
+    echo "Output: $FEX_VERSION"
+    echo ""
+    echo "Checking library resolution..."
+    ls -la "$FEX_DIR/lib/ld-linux-aarch64.so.1" 2>/dev/null || echo "  /opt/fex/lib/ld-linux-aarch64.so.1 missing!"
+    ls -la "$FEX_DIR/lib/" 2>/dev/null || echo "  /opt/fex/lib/ missing!"
+    echo ""
+    echo "If you see 'Illegal instruction' or SIGILL, FEX is not compatible"
+    echo "with this device's CPU/kernel combination."
+    exit 1
 fi
 
 # ============================================
-# Step 2: Download x86-64 RootFS
+# Step 3: Download x86-64 RootFS
 # ============================================
 echo ""
-echo "=== Step 2: Setting up x86-64 RootFS ==="
+echo "=== Step 3: Setting up x86-64 RootFS ==="
 
 FEX_ROOTFS_DIR="$HOME/.fex-emu/RootFS"
 ROOTFS_NAME="Ubuntu_22_04"
-mkdir -p "$FEX_ROOTFS_DIR"
+[ -d "$FEX_ROOTFS_DIR" ] || mkdir -p "$FEX_ROOTFS_DIR" 2>/dev/null || true
 
-if [ -d "$FEX_ROOTFS_DIR/$ROOTFS_NAME" ]; then
-    echo "x86-64 RootFS already exists at $FEX_ROOTFS_DIR/$ROOTFS_NAME"
+# FEX rootfs can be a directory or a SquashFS/EroFS image file
+ROOTFS_SQSH="$FEX_ROOTFS_DIR/${ROOTFS_NAME}.sqsh"
+ROOTFS_ERO="$FEX_ROOTFS_DIR/${ROOTFS_NAME}.ero"
+
+if [ -f "$ROOTFS_SQSH" ] || [ -f "$ROOTFS_ERO" ]; then
+    echo "x86-64 RootFS image already exists"
+    ls -la "$FEX_ROOTFS_DIR/"${ROOTFS_NAME}.* 2>/dev/null
+elif [ -d "$FEX_ROOTFS_DIR/$ROOTFS_NAME" ] && [ -f "$FEX_ROOTFS_DIR/$ROOTFS_NAME/usr/lib/x86_64-linux-gnu/libc.so.6" ]; then
+    echo "x86-64 RootFS directory already exists at $FEX_ROOTFS_DIR/$ROOTFS_NAME"
 else
-    echo "Downloading x86-64 RootFS (~2GB)..."
+    echo "Downloading x86-64 RootFS SquashFS image (~300MB)..."
+    echo "This may take several minutes depending on your connection."
 
-    # Use FEXRootFSFetcher if available
-    if command -v FEXRootFSFetcher &> /dev/null; then
-        echo "Using FEXRootFSFetcher..."
-        # Run non-interactively - select Ubuntu 22.04
-        echo "1" | FEXRootFSFetcher || {
-            echo "FEXRootFSFetcher failed, trying manual download..."
-        }
+    # Install curl if not available
+    if ! command -v curl &> /dev/null; then
+        echo "Installing curl..."
+        apt-get update -qq 2>/dev/null
+        apt-get install -y -qq curl ca-certificates 2>&1 || true
     fi
 
-    # Check if download succeeded
-    if [ ! -d "$FEX_ROOTFS_DIR/$ROOTFS_NAME" ]; then
-        echo ""
-        echo "Attempting manual download..."
+    # Use the official FEX rootfs server (SquashFS format)
+    ROOTFS_URL="https://rootfs.fex-emu.gg/Ubuntu_22_04/2025-01-08/Ubuntu_22_04.sqsh"
 
-        # Try direct download from FEX rootfs server
-        ROOTFS_URL="https://rootfs.fex-emu.com/file/fex-rootfs/Ubuntu_22_04.tar.gz"
-        ROOTFS_TAR="$FEX_ROOTFS_DIR/${ROOTFS_NAME}.tar.gz"
-
-        if [ ! -f "$ROOTFS_TAR" ]; then
-            echo "Downloading from $ROOTFS_URL..."
-            curl -L -o "$ROOTFS_TAR" "$ROOTFS_URL" || wget -O "$ROOTFS_TAR" "$ROOTFS_URL" || {
-                echo ""
-                echo "ERROR: Could not download rootfs automatically."
-                echo "Please download manually from: https://rootfs.fex-emu.com/"
-                echo "Extract to: $FEX_ROOTFS_DIR/$ROOTFS_NAME/"
-                exit 1
-            }
-        fi
-
-        # Extract
-        echo "Extracting rootfs..."
-        mkdir -p "$FEX_ROOTFS_DIR/$ROOTFS_NAME"
-        tar -xzf "$ROOTFS_TAR" -C "$FEX_ROOTFS_DIR/$ROOTFS_NAME" --strip-components=1 || {
-            # Try without strip-components
-            tar -xzf "$ROOTFS_TAR" -C "$FEX_ROOTFS_DIR/"
-        }
-
-        # Cleanup
-        rm -f "$ROOTFS_TAR"
+    echo "Downloading from: $ROOTFS_URL"
+    if command -v curl &> /dev/null; then
+        curl -C - -L --progress-bar -f -o "$ROOTFS_SQSH" "$ROOTFS_URL"
+    elif command -v wget &> /dev/null; then
+        wget -c --show-progress -O "$ROOTFS_SQSH" "$ROOTFS_URL"
+    else
+        echo "ERROR: Neither curl nor wget available after install attempt"
+        echo "Please install curl manually: apt-get install -y curl"
+        exit 1
     fi
 
-    echo "x86-64 RootFS installed at $FEX_ROOTFS_DIR/$ROOTFS_NAME"
-fi
+    if [ ! -f "$ROOTFS_SQSH" ] || [ ! -s "$ROOTFS_SQSH" ]; then
+        echo "ERROR: Download failed"
+        rm -f "$ROOTFS_SQSH"
+        exit 1
+    fi
 
-# ============================================
-# Step 3: Install Steam in x86-64 RootFS
-# ============================================
-echo ""
-echo "=== Step 3: Installing Steam in x86-64 RootFS ==="
+    echo "RootFS image downloaded: $(du -h "$ROOTFS_SQSH" | cut -f1)"
 
-X86_ROOTFS="$FEX_ROOTFS_DIR/$ROOTFS_NAME"
+    # Extract SquashFS to directory (needed since squashfuse doesn't work in proot)
+    echo ""
+    echo "Extracting SquashFS to directory..."
+    echo "This may take several minutes..."
 
-# Check if Steam is already installed in x86 rootfs
-if [ -f "$X86_ROOTFS/usr/bin/steam" ] || [ -f "$X86_ROOTFS/home/user/.steam/steam/steam.sh" ]; then
-    echo "Steam already installed in x86-64 rootfs"
-else
-    echo "Installing Steam in x86-64 rootfs..."
+    # Install unsquashfs if needed
+    if ! command -v unsquashfs &> /dev/null; then
+        apt-get install -y -qq squashfs-tools 2>&1 || true
+    fi
 
-    # Create install script for x86 rootfs
-    cat > /tmp/install_steam_x86.sh << 'STEAMSCRIPT'
-#!/bin/bash
-set -e
-dpkg --add-architecture i386
-apt-get update
-apt-get install -y steam-installer || {
-    # Manual install if steam-installer not available
-    apt-get install -y curl
-    cd /tmp
-    curl -L -o steam.deb https://cdn.cloudflare.steamstatic.com/client/installer/steam.deb
-    dpkg -i steam.deb || apt-get install -f -y
-    rm steam.deb
-}
-echo "Steam installed"
-STEAMSCRIPT
-    chmod +x /tmp/install_steam_x86.sh
-
-    # Run in FEX
-    echo "Running Steam install via FEX (this may take a while)..."
-    FEX /tmp/install_steam_x86.sh || {
-        echo "Note: Steam installation via FEX may need manual completion"
-    }
+    if command -v unsquashfs &> /dev/null; then
+        unsquashfs -d "$FEX_ROOTFS_DIR/$ROOTFS_NAME" -f "$ROOTFS_SQSH" 2>&1 | tail -5
+        echo "Extraction complete"
+    else
+        echo "ERROR: unsquashfs not available, cannot extract rootfs"
+        echo "Install squashfs-tools: apt-get install -y squashfs-tools"
+        exit 1
+    fi
 fi
 
 # ============================================
@@ -161,128 +198,76 @@ echo ""
 echo "=== Step 4: Configuring FEX ==="
 
 FEX_CONFIG_DIR="$HOME/.fex-emu"
-mkdir -p "$FEX_CONFIG_DIR"
+[ -d "$FEX_CONFIG_DIR" ] || mkdir -p "$FEX_CONFIG_DIR" 2>/dev/null || true
 
 # Main config
 cat > "$FEX_CONFIG_DIR/Config.json" << EOF
 {
   "Config": {
-    "RootFS": "$ROOTFS_NAME"
+    "RootFS": "$ROOTFS_NAME",
+    "ThunkConfig": "$FEX_CONFIG_DIR/thunks.json",
+    "X87ReducedPrecision": "1"
   }
 }
 EOF
 
-# Thunks config for Vortek Vulkan (forward Vulkan calls to our native ICD)
-mkdir -p "$FEX_CONFIG_DIR/AppConfig"
-cat > "$FEX_CONFIG_DIR/AppConfig/steam.json" << 'EOF'
-{
-  "Env": {
-    "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/vortek_icd.json",
-    "STEAM_RUNTIME": "1"
-  }
-}
-EOF
+# Thunks config for GPU passthrough
+if [ -f "$FEX_DIR/config/thunks.json" ]; then
+    cp "$FEX_DIR/config/thunks.json" "$FEX_CONFIG_DIR/thunks.json"
+fi
 
-echo "FEX configuration created at $FEX_CONFIG_DIR/"
+echo "FEX configuration created at $FEX_CONFIG_DIR/Config.json"
+cat "$FEX_CONFIG_DIR/Config.json"
 
 # ============================================
-# Step 5: Create wrapper scripts
+# Step 5: Create helper scripts
 # ============================================
 echo ""
-echo "=== Step 5: Creating launcher wrappers ==="
+echo "=== Step 5: Creating helper scripts ==="
 
-# FEX-Steam launcher
-cat > /usr/local/bin/fex-steam << 'EOF'
-#!/bin/bash
-# FEX wrapper for Steam
-# Uses x86-64 rootfs with glibc emulation (semaphores work!)
-
-# FEX config
-export FEX_ROOTFS="$HOME/.fex-emu/RootFS/Ubuntu_22_04"
-
-# Vulkan via Vortek
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
-
-# Display
-export DISPLAY=${DISPLAY:-:0}
-
-# Find FEX binary
-FEX_BIN=$(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-if [ -z "$FEX_BIN" ]; then
-    echo "ERROR: FEX not found"
-    exit 1
+# Determine where to install scripts
+SCRIPT_DIR="/usr/local/bin"
+if [ ! -w "$SCRIPT_DIR" ]; then
+    SCRIPT_DIR="$HOME/.local/bin"
+    [ -d "$SCRIPT_DIR" ] || mkdir -p "$SCRIPT_DIR" 2>/dev/null || true
 fi
 
-# Run Steam
-echo "Starting Steam via FEX..."
-exec "$FEX_BIN" -- /usr/bin/steam "$@"
-EOF
-chmod +x /usr/local/bin/fex-steam
+FEX_LOADER="$FEX_DIR/bin/FEXLoader"
 
-# FEX shell for debugging
-cat > /usr/local/bin/fex-shell << 'EOF'
+# fex-shell - x86-64 shell
+cat > "$SCRIPT_DIR/fex-shell" << SCRIPT
 #!/bin/bash
-# FEX x86-64 shell for debugging
+export USE_HEAP=1
+export FEX_DISABLETELEMETRY=1
+export PATH="/opt/fex/bin:\$HOME/.local/bin:\$PATH"
+export HOME="\${HOME:-/home/user}"
+exec "$FEX_LOADER" -- /bin/bash "\$@"
+SCRIPT
+chmod +x "$SCRIPT_DIR/fex-shell"
 
-export FEX_ROOTFS="$HOME/.fex-emu/RootFS/Ubuntu_22_04"
-
-FEX_BIN=$(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-if [ -z "$FEX_BIN" ]; then
-    echo "ERROR: FEX not found"
-    exit 1
-fi
-
-echo "Starting x86-64 shell via FEX..."
-exec "$FEX_BIN" -- /bin/bash "$@"
-EOF
-chmod +x /usr/local/bin/fex-shell
-
-# Semaphore test
-cat > /usr/local/bin/fex-test-sem << 'EOF'
+# fex-run - run x86-64 commands
+cat > "$SCRIPT_DIR/fex-run" << SCRIPT
 #!/bin/bash
-# Test semaphores work under FEX
+export USE_HEAP=1
+export FEX_DISABLETELEMETRY=1
+export PATH="/opt/fex/bin:\$HOME/.local/bin:\$PATH"
+export HOME="\${HOME:-/home/user}"
+exec "$FEX_LOADER" -- "\$@"
+SCRIPT
+chmod +x "$SCRIPT_DIR/fex-run"
 
-export FEX_ROOTFS="$HOME/.fex-emu/RootFS/Ubuntu_22_04"
+echo "Helper scripts created in $SCRIPT_DIR:"
+echo "  fex-shell    - Start x86-64 bash shell"
+echo "  fex-run      - Run x86-64 command"
 
-FEX_BIN=$(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-
-# Create test program
-cat > /tmp/sem_test.c << 'CCODE'
-#include <semaphore.h>
-#include <stdio.h>
-int main() {
-    sem_t sem;
-    if (sem_init(&sem, 0, 1) == -1) {
-        perror("sem_init FAILED");
-        return 1;
-    }
-    printf("Semaphore test PASSED!\n");
-    sem_destroy(&sem);
-    return 0;
-}
-CCODE
-
-echo "Compiling semaphore test (x86-64)..."
-"$FEX_BIN" -- gcc -o /tmp/sem_test /tmp/sem_test.c -lpthread
-
-echo "Running semaphore test via FEX..."
-"$FEX_BIN" -- /tmp/sem_test
-EOF
-chmod +x /usr/local/bin/fex-test-sem
-
+# ============================================
+# Done
+# ============================================
 echo ""
 echo "========================================"
 echo "  FEX-Emu Setup Complete!"
 echo "========================================"
 echo ""
-echo "Commands available:"
-echo "  fex-steam     - Launch Steam via FEX"
-echo "  fex-shell     - Start x86-64 bash shell"
-echo "  fex-test-sem  - Test semaphore support"
-echo ""
-echo "RootFS: $FEX_ROOTFS_DIR/$ROOTFS_NAME"
-echo "Config: $FEX_CONFIG_DIR"
-echo ""
-echo "To test semaphores work (the main fix):"
-echo "  fex-test-sem"
+echo "To get an x86-64 shell:"
+echo "  fex-shell"
 echo ""

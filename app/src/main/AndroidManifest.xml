@@ -74,6 +74,14 @@
             android:immersive="true"
             android:theme="@style/Theme.SteamLauncher.Fullscreen" />
 
+        <activity
+            android:name=".TerminalActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Foreground service for proot container -->
         <service
             android:name=".SteamService"

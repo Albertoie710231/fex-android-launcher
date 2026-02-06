@@ -95,8 +95,8 @@ class SettingsActivity : AppCompatActivity() {
                 VulkanBridge.getVulkanInfo(this@SettingsActivity)
             }
 
-            val prootVersion = withContext(Dispatchers.IO) {
-                app.prootExecutor.getProotVersion()
+            val fexVersion = withContext(Dispatchers.IO) {
+                app.fexExecutor.getFexVersion()
             }
 
             val containerStatus = withContext(Dispatchers.IO) {
@@ -109,7 +109,7 @@ class SettingsActivity : AppCompatActivity() {
 
             binding.apply {
                 tvVulkanInfo.text = vulkanInfo
-                tvProotVersion.text = "PRoot: $prootVersion"
+                tvProotVersion.text = "FEX: $fexVersion"
                 tvContainerStatus.text = "Container: $containerStatus"
             }
         }
@@ -198,29 +198,29 @@ class SettingsActivity : AppCompatActivity() {
             val result = withContext(Dispatchers.IO) {
                 val sb = StringBuilder()
 
-                // Test box64
-                sb.appendLine("=== Box64 Test ===")
-                val box64Result = app.prootExecutor.executeBlocking(
-                    "/usr/local/bin/box64 --version",
-                    timeoutMs = 10000
+                // Test FEX environment
+                sb.appendLine("=== FEX-Emu Test ===")
+                val fexResult = app.fexExecutor.executeBlocking(
+                    "uname -a",
+                    timeoutMs = 15000
                 )
-                sb.appendLine(box64Result.output.ifEmpty { "Exit code: ${box64Result.exitCode}" })
+                sb.appendLine(fexResult.output.ifEmpty { "Exit code: ${fexResult.exitCode}" })
 
-                // Test box32
-                sb.appendLine("\n=== Box32 Test ===")
-                val box32Result = app.prootExecutor.executeBlocking(
-                    "/usr/local/bin/box32 --version",
+                // Check architecture
+                sb.appendLine("\n=== Architecture ===")
+                val archResult = app.fexExecutor.executeBlocking(
+                    "echo \"Arch: \$(uname -m)\" && echo \"Kernel: \$(uname -r)\"",
                     timeoutMs = 10000
                 )
-                sb.appendLine(box32Result.output.ifEmpty { "Exit code: ${box32Result.exitCode}" })
+                sb.appendLine(archResult.output.ifEmpty { "Exit code: ${archResult.exitCode}" })
 
-                // Check files exist
-                sb.appendLine("\n=== Binary Check ===")
-                val lsResult = app.prootExecutor.executeBlocking(
-                    "/bin/bash -c 'ls -la /usr/local/bin/box*'",
+                // Check basic tools
+                sb.appendLine("\n=== Tools Check ===")
+                val toolsResult = app.fexExecutor.executeBlocking(
+                    "which bash tar ls cat && echo 'All tools found'",
                     timeoutMs = 10000
                 )
-                sb.appendLine(lsResult.output.ifEmpty { "Exit code: ${lsResult.exitCode}" })
+                sb.appendLine(toolsResult.output.ifEmpty { "Exit code: ${toolsResult.exitCode}" })
 
                 sb.toString()
             }
@@ -229,7 +229,7 @@ class SettingsActivity : AppCompatActivity() {
             binding.btnTestBox64.text = "Test Box64"
 
             androidx.appcompat.app.AlertDialog.Builder(this@SettingsActivity)
-                .setTitle("Box64 Test Results")
+                .setTitle("FEX-Emu Test Results")
                 .setMessage(result.take(3000))
                 .setPositiveButton("OK", null)
                 .show()
@@ -246,7 +246,7 @@ class SettingsActivity : AppCompatActivity() {
             binding.btnTestVulkan.isEnabled = false
 
             val result = withContext(Dispatchers.IO) {
-                VulkanBridge.testVulkanInContainer(app.prootExecutor)
+                VulkanBridge.testVulkanInContainer(app.fexExecutor)
             }
 
             binding.btnTestVulkan.isEnabled = true

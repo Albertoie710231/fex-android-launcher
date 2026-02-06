@@ -16,7 +16,7 @@ import kotlinx.coroutines.*
 import java.io.File
 
 /**
- * Foreground service that manages the proot container and X11 server.
+ * Foreground service that manages the FEX container and X11 server.
  */
 class SteamService : Service() {
 
@@ -34,7 +34,7 @@ class SteamService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var x11Server: X11Server? = null
-    private var prootProcess: Process? = null
+    private var fexProcess: Process? = null
     private var pendingAction: String? = null
     private var surfaceReady = false
     private var vortekStarted = false
@@ -50,7 +50,7 @@ class SteamService : Service() {
     // Vortek socket path - must be accessible from both Android and container
     private val vortekSocketPath: String by lazy { "${app.getTmpDir()}/vortek.sock" }
 
-    // Frame socket for receiving Vulkan frames from proot (TCP on localhost:19850)
+    // Frame socket for receiving Vulkan frames from FEX container (TCP on localhost:19850)
     private var frameSocketServer: FrameSocketServer? = null
     private var vulkanFrameSurface: Surface? = null  // Stored for when server starts later
 
@@ -117,13 +117,13 @@ class SteamService : Service() {
 
     private suspend fun stopExistingProcesses() = withContext(Dispatchers.IO) {
         Log.i(TAG, "Stopping existing processes...")
-        prootProcess?.let {
+        fexProcess?.let {
             if (it.isAlive) {
                 it.destroyForcibly()
                 it.waitFor()
             }
         }
-        prootProcess = null
+        fexProcess = null
         delay(200)
     }
 
@@ -204,8 +204,8 @@ class SteamService : Service() {
             Log.w(TAG, "Failed to deploy libfakexcb.so: ${e.message}")
         }
 
-        // Deploy pre-compiled libvulkan_headless.so to rootfs /lib (always overwrite to get latest)
-        val rootfsLibDir = java.io.File(app.getRootfsDir(), "lib")
+        // Deploy pre-compiled libvulkan_headless.so to FEX rootfs /lib
+        val rootfsLibDir = java.io.File(app.getFexRootfsDir(), "lib")
         try {
             assets.open("libvulkan_headless.so").use { input ->
                 val targetFile = java.io.File(rootfsLibDir, "libvulkan_headless.so")
@@ -243,8 +243,8 @@ class SteamService : Service() {
 
         val env = buildEnvironmentMap(hostTmpDir)
 
-        // Run Vulkan/X11 test
-        prootProcess = app.prootExecutor.execute(
+        // Run Vulkan/X11 test in FEX x86-64 environment
+        fexProcess = app.fexExecutor.execute(
             command = """
                 echo "=== Vortek Vulkan Rendering Test ==="
                 echo ""
@@ -402,78 +402,35 @@ class SteamService : Service() {
                 echo "Keeping terminal alive..."
                 sleep 300
             """.trimIndent(),
-            environment = env,
-            workingDir = "/home/user"
+            environment = env
         )
 
         monitorProcess("TERMINAL")
     }
 
-    // Set to true to use FEX-Emu instead of Box64
-    // FEX emulates x86 glibc → semaphores work on Android
-    // Box64 wraps to Bionic → semaphores fail on Android
-    private val useFexEmulator = true
-
     private suspend fun startSteam() = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Starting Steam with ${if (useFexEmulator) "FEX-Emu" else "Box64"}...")
+        Log.i(TAG, "Starting Steam via FEX-Emu...")
 
         val hostTmpDir = app.getTmpDir()
+        val env = buildEnvironmentMap(hostTmpDir)
 
-        val env = buildEnvironmentMap(hostTmpDir).toMutableMap().apply {
-            if (useFexEmulator) {
-                // FEX-Emu settings
-                put("FEX_ROOTFS", "\$HOME/.fex-emu/RootFS/Ubuntu_22_04")
-            } else {
-                // Box64 specific settings
-                put("BOX64_LOG", "1")
-                put("BOX64_DYNAREC", "1")
-            }
-        }
-
-        val script = if (useFexEmulator) {
-            """
-            #!/bin/bash
+        // Steam is installed in the FEX rootfs at /usr/bin/steam
+        // FEXLoader handles x86-64 emulation transparently
+        val command = """
             echo "Starting Steam via FEX-Emu..."
-            export FEX_ROOTFS="${'$'}HOME/.fex-emu/RootFS/Ubuntu_22_04"
-
-            # Check if FEX is installed
-            FEX_BIN=${'$'}(command -v FEX 2>/dev/null || command -v FEXInterpreter 2>/dev/null)
-            if [ -z "${'$'}FEX_BIN" ]; then
-                echo "ERROR: FEX not installed. Run setup_fex.sh first."
-                exit 1
-            fi
-
-            # Check if x86 rootfs exists
-            if [ ! -d "${'$'}FEX_ROOTFS" ]; then
-                echo "ERROR: x86-64 rootfs not found at ${'$'}FEX_ROOTFS"
-                echo "Run setup_fex.sh to download it."
-                exit 1
-            fi
-
-            # Run Steam through FEX
-            exec "${'$'}FEX_BIN" -- /usr/bin/steam "${'$'}@"
-            """.trimIndent()
-        } else {
-            """
-            #!/bin/bash
-            echo "Starting Steam via Box64..."
-            if [ -f "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam" ]; then
-                exec /usr/local/bin/box32 "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
+            if [ -f /usr/bin/steam ]; then
+                exec /usr/bin/steam "${'$'}@"
+            elif [ -f "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam" ]; then
+                exec "${'$'}HOME/.local/share/Steam/ubuntu12_32/steam"
             else
-                echo "Steam not found"
+                echo "Steam not found at /usr/bin/steam or ~/.local/share/Steam/"
                 exit 1
             fi
-            """.trimIndent()
-        }
+        """.trimIndent()
 
-        val scriptFile = File(app.getTmpDir(), "launch.sh")
-        scriptFile.writeText(script)
-        scriptFile.setExecutable(true)
-
-        prootProcess = app.prootExecutor.execute(
-            command = "/bin/bash /tmp/launch.sh",
-            environment = env,
-            workingDir = "/home/user"
+        fexProcess = app.fexExecutor.execute(
+            command = command,
+            environment = env
         )
 
         monitorProcess("STEAM")
@@ -481,7 +438,7 @@ class SteamService : Service() {
 
     private fun monitorProcess(tag: String) {
         serviceScope.launch {
-            prootProcess?.let { process ->
+            fexProcess?.let { process ->
                 launch {
                     try {
                         process.inputStream.bufferedReader().useLines { lines ->
@@ -503,7 +460,7 @@ class SteamService : Service() {
 
     fun getX11Server(): X11Server? = x11Server
 
-    fun isRunning(): Boolean = prootProcess?.isAlive == true
+    fun isRunning(): Boolean = fexProcess?.isAlive == true
 
     /**
      * Called by GameActivity when the LorieView surface is ready.
@@ -549,7 +506,7 @@ class SteamService : Service() {
 
         Log.i(TAG, "Starting action: $action with surface ${surfaceWidth}x${surfaceHeight}")
         serviceScope.launch {
-            // Start Vortek renderer FIRST (before X11/proot)
+            // Start Vortek renderer FIRST (before X11/FEX)
             // This creates the socket that the container will connect to
             startVortekServer()
 
@@ -610,9 +567,8 @@ class SteamService : Service() {
             if (socketFile.exists()) {
                 Log.i(TAG, "Vortek socket created successfully")
 
-                // Create symlink at path expected by Winlator's libvulkan_vortek.so
-                // The ICD has hardcoded: /data/data/com.winlator/files/rootfs/tmp/.vortek/V0
-                // With proot bind, this maps to $tmpDir/.vortek/V0
+                // Create symlink at path expected by libvulkan_vortek.so
+                // FexExecutor also creates symlinks in the FEX rootfs /tmp/
                 try {
                     val vortekDir = File(app.getTmpDir(), ".vortek")
                     if (!vortekDir.exists()) {
@@ -635,7 +591,7 @@ class SteamService : Service() {
             Log.e(TAG, "Failed to start Vortek server")
         }
 
-        // Start frame socket server to receive Vulkan frames from proot
+        // Start frame socket server to receive Vulkan frames from FEX container
         startFrameSocketServer()
     }
 
@@ -701,8 +657,8 @@ class SteamService : Service() {
 
         // Add Vortek Vulkan passthrough environment if available
         if (vortekStarted) {
-            // Inside proot, /tmp is bound to the Android tmp dir
-            // So the socket path inside the container is /tmp/vortek.sock
+            // FEX redirects guest /tmp → fexRootfs/tmp/
+            // FexExecutor creates symlinks there pointing to actual sockets
             val containerSocketPath = "/tmp/vortek.sock"
 
             env.putAll(mapOf(
@@ -806,7 +762,7 @@ class SteamService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "SteamService destroying")
-        prootProcess?.destroyForcibly()
+        fexProcess?.destroyForcibly()
         x11Server?.stop()
         stopFrameSocketServer()
         stopVortekServer()

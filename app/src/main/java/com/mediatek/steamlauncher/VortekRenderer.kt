@@ -7,7 +7,7 @@ import com.winlator.xenvironment.components.VortekRendererComponent
 /**
  * Kotlin wrapper for the Vortek Vulkan passthrough renderer.
  *
- * Vortek provides a bridge between glibc applications running in proot/Box64
+ * Vortek provides a bridge between glibc applications running in FEX
  * and Android's Bionic-based Vulkan drivers. It works via IPC:
  *
  * 1. VortekRenderer (Android/Bionic side) - Runs as a native server that
@@ -15,7 +15,7 @@ import com.winlator.xenvironment.components.VortekRendererComponent
  *
  * 2. libvulkan_vortek.so (Container/ARM64 side) - A Vulkan ICD that serializes
  *    Vulkan calls and sends them to the Android renderer via Unix socket.
- *    Note: It's ARM64 because Box64 handles x86→ARM translation.
+ *    Note: It's ARM64 because FEX handles x86→ARM translation.
  *
  * This solves the fundamental incompatibility between Android's Bionic libc
  * and the container's glibc - you cannot load a Bionic .so from glibc code.

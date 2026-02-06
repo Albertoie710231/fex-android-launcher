@@ -16,9 +16,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * TCP socket server for receiving Vulkan frames from proot.
+ * TCP socket server for receiving Vulkan frames from the FEX container.
  *
- * Uses TCP on localhost instead of Unix sockets for proot compatibility.
+ * Uses TCP on localhost instead of Unix sockets for FEX container compatibility.
  * Uses Choreographer for vsync-aligned frame display.
  *
  * The native wrapper sends frames in format:

@@ -233,21 +233,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Start service with terminal action
-        val serviceIntent = Intent(this, SteamService::class.java).apply {
-            action = SteamService.ACTION_START_TERMINAL
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
-
-        val gameIntent = Intent(this, GameActivity::class.java).apply {
-            putExtra("mode", "terminal")
-        }
-        startActivity(gameIntent)
+        // Launch the interactive terminal activity
+        val terminalIntent = Intent(this, TerminalActivity::class.java)
+        startActivity(terminalIntent)
     }
 
     private fun updateStatus(message: String) {

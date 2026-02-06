@@ -347,15 +347,13 @@ object VulkanBridge {
     /**
      * Test Vulkan functionality inside the container.
      */
-    fun testVulkanInContainer(prootExecutor: ProotExecutor): String {
-        val result = prootExecutor.executeBlocking(
+    fun testVulkanInContainer(fexExecutor: FexExecutor): String {
+        val result = fexExecutor.executeBlocking(
             command = """
-                source /opt/scripts/vulkan_env.sh 2>/dev/null
                 if command -v vulkaninfo &> /dev/null; then
                     vulkaninfo --summary 2>&1
                 else
                     echo "vulkaninfo not installed"
-                    echo "Install with: apt install vulkan-tools"
                 fi
             """.trimIndent(),
             environment = getProtonVulkanEnv()

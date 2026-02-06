@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Unix domain socket server for X11 connections.
  *
- * Creates a filesystem-based Unix socket at /tmp/.X11-unix/X0 (inside proot)
+ * Creates a filesystem-based Unix socket at /tmp/.X11-unix/X0 (inside FEX container)
  * that X11 clients can connect to. When clients connect, the fd is passed
  * to LorieView for X11 protocol processing.
  */
@@ -40,7 +40,7 @@ class X11SocketServer(private val socketPath: String) {
             val parentDir = socketFile.parentFile
             parentDir?.mkdirs()
 
-            // Set directory permissions to 777 so proot can access
+            // Set directory permissions to 777 so FEX container can access
             parentDir?.let {
                 Runtime.getRuntime().exec(arrayOf("chmod", "777", it.absolutePath)).waitFor()
                 Log.i(TAG, "Set permissions on: ${it.absolutePath}")

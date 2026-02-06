@@ -66,12 +66,13 @@ public class CmdEntryPoint {
             return true;
         }
 
-        Log.i(TAG, "Starting X11 server on :0");
+        Log.i(TAG, "Starting X11 server on :0 with TCP enabled");
         try {
             instance = new CmdEntryPoint();
-            // Pass display and try to set resolution via arguments
-            // libXlorie may accept -screen or other Xorg-style arguments
-            start(new String[]{":0"});
+            // Pass display number and enable TCP listening
+            // -listen tcp: enable TCP connections on port 6000
+            // -ac: disable access control (allow any client to connect)
+            start(new String[]{":0", "-listen", "tcp", "-ac"});
 
             // Start listening for connections in background thread
             listenerThread = new Thread(() -> {

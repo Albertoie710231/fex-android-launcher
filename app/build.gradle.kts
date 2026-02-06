@@ -66,11 +66,14 @@ android {
         }
     }
 
+    androidResources {
+        // Prevent AAPT from decompressing these asset files
+        noCompress += listOf("tgz", "tar.gz", "tar.xz", "tar", "gz", "xz")
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // Don't strip proot - the stripping process corrupts it
-            keepDebugSymbols += "**/libproot.so"
         }
     }
 }
