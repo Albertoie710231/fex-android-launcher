@@ -1,0 +1,58 @@
+# Build FEX-Emu for ARM64 Linux (glibc)
+# Usage: docker build --platform linux/arm64 -f Dockerfile.fex -t fex-builder .
+#        docker run --rm -v $(pwd)/out:/out fex-builder
+
+FROM --platform=linux/arm64 ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    cmake \
+    ninja-build \
+    pkg-config \
+    ccache \
+    clang \
+    llvm \
+    lld \
+    libdrm-dev \
+    libxcb-present-dev \
+    libxcb-dri2-0-dev \
+    libxcb-dri3-dev \
+    libxcb-glx0-dev \
+    libxcb-shm0-dev \
+    libxshmfence-dev \
+    libclang-dev \
+    libsdl2-dev \
+    libepoxy-dev \
+    libssl-dev \
+    nasm \
+    python3-clang \
+    squashfs-tools \
+    libc-bin \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone FEX
+WORKDIR /build
+RUN git clone --depth 1 --recurse-submodules https://github.com/FEX-Emu/FEX.git
+
+# Build FEX (without thunks for simplicity - thunks need cross-compilers)
+WORKDIR /build/FEX/Build
+RUN CC=clang CXX=clang++ cmake \
+    -DCMAKE_INSTALL_PREFIX=/opt/fex \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DUSE_LINKER=lld \
+    -DENABLE_LTO=True \
+    -DBUILD_TESTS=False \
+    -DENABLE_ASSERTIONS=False \
+    -DBUILD_THUNKS=False \
+    -G Ninja .. \
+    && ninja -j$(nproc)
+
+# Install to /opt/fex
+RUN ninja install
+
+# Copy output on run
+CMD cp -r /opt/fex/* /out/ && echo "FEX binaries copied to /out/"

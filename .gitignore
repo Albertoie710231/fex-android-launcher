@@ -29,3 +29,19 @@ app/.cxx/
 # OS files
 .DS_Store
 Thumbs.db
+
+# FEX-Emu build workspace (cloned sources, build outputs, downloaded archives)
+fex-emu/fex-src/
+fex-emu/out/
+fex-emu/fex-binaries/
+fex-emu/fex-ppa-extract/
+fex-emu/fexdroid/
+fex-emu/libstdcpp-extract/
+fex-emu/libstdcpp-jammy/
+fex-emu/*.tar.gz
+fex-emu/*.tar.xz
+fex-emu/*.tgz
+fex-emu/*.deb
+
+# Pre-patch backup
+app/src/main/jniLibs/arm64-v8a/*.orig
