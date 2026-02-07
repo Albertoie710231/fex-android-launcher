@@ -37,6 +37,7 @@ class TerminalActivity : AppCompatActivity() {
     private var lineCount = 0
     private var isRunning = false
     private var currentJob: Job? = null
+    private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,6 +47,8 @@ class TerminalActivity : AppCompatActivity() {
         scrollView = findViewById(R.id.scrollView)
         etCommand = findViewById(R.id.etCommand)
         btnSend = findViewById(R.id.btnSend)
+
+        currentDir = app.getFexHomeDir()
 
         setupUI()
         showWelcome()
@@ -181,13 +184,26 @@ class TerminalActivity : AppCompatActivity() {
         appendOutput("$ $command\n")
         setRunning(true)
 
+        // Detect cd commands to update working directory
+        val isCdCommand = command.trim().let {
+            it == "cd" || it.startsWith("cd ") || it.startsWith("cd\t")
+        }
+
+        // Wrap command: cd to current dir first, then run command.
+        // If it's a cd command, also emit pwd at the end so we can capture the new dir.
+        val wrappedCommand = if (isCdCommand) {
+            "cd '$currentDir' && $command && pwd"
+        } else {
+            "cd '$currentDir' && $command"
+        }
+
         currentJob = scope.launch {
             try {
                 val env = buildEnvironment()
 
                 // Execute command via FEXLoader
                 val process = app.fexExecutor.execute(
-                    command = command,
+                    command = wrappedCommand,
                     environment = env
                 )
 
@@ -204,6 +220,7 @@ class TerminalActivity : AppCompatActivity() {
                 val reader = process.inputStream.bufferedReader()
                 val buffer = CharArray(1024)
                 var totalRead = 0
+                val fullOutput = StringBuilder()
 
                 try {
                     while (isActive) {
@@ -214,14 +231,40 @@ class TerminalActivity : AppCompatActivity() {
 
                         totalRead += count
                         val text = String(buffer, 0, count)
+                        fullOutput.append(text)
                         Log.d(TAG, "Read text (${text.length} chars): ${text.take(200)}")
-                        withContext(Dispatchers.Main) {
-                            appendOutput(text)
+
+                        // For cd commands, don't show the trailing pwd output
+                        if (!isCdCommand) {
+                            withContext(Dispatchers.Main) {
+                                appendOutput(text)
+                            }
                         }
                     }
                 } catch (e: Exception) {
                     if (isActive) {
                         Log.e(TAG, "Read error", e)
+                    }
+                }
+
+                // For cd commands, extract the new directory from pwd output
+                if (isCdCommand) {
+                    val outputStr = fullOutput.toString()
+                    // Find the last non-empty line before [FEX exit code: 0]
+                    val lines = outputStr.lines()
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() && !it.startsWith("[FEX exit code:") }
+                    val newDir = lines.lastOrNull()
+                    if (newDir != null && newDir.startsWith("/")) {
+                        currentDir = newDir
+                        withContext(Dispatchers.Main) {
+                            appendOutput("$currentDir\n")
+                        }
+                    } else {
+                        // cd failed — show the output as-is
+                        withContext(Dispatchers.Main) {
+                            appendOutput(outputStr)
+                        }
                     }
                 }
 
