@@ -7,7 +7,7 @@ import java.io.IOException
 
 /**
  * Executes commands inside the FEX-Emu x86-64 environment.
- * Runs FEXLoader directly via ProcessBuilder — no PRoot needed.
+ * Runs FEXLoader via ProcessBuilder through the bundled ld.so — no PRoot needed.
  *
  * FEXLoader is an ARM64 binary that loads an x86-64 rootfs overlay
  * and JIT-compiles x86-64 instructions to ARM64. It provides:
@@ -15,9 +15,10 @@ import java.io.IOException
  * - glibc semaphore support (no Bionic issues)
  * - GPU passthrough via thunks (Vulkan/OpenGL)
  *
- * Since the FEX binaries have PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1
- * (which doesn't exist on Android), we invoke FEXLoader through the bundled
- * dynamic linker directly.
+ * On Android 10+ (targetSdk 29+), SELinux prevents executing binaries from
+ * app_data_file locations. FEX binaries are packaged as JNI libs (lib*.so)
+ * in nativeLibraryDir which has executable SELinux context. We invoke
+ * FEXLoader through the bundled ld-linux-aarch64.so.1 from nativeLibDir.
  */
 class FexExecutor(private val context: Context) {
 
@@ -31,7 +32,7 @@ class FexExecutor(private val context: Context) {
     private val app: SteamLauncherApp
         get() = context.applicationContext as SteamLauncherApp
 
-    /** Directory containing FEX binaries (FEXLoader, FEXInterpreter, etc.) */
+    /** Directory containing FEX libraries (glibc, libFEXCore, etc.) */
     private val fexDir: String
         get() = app.getFexDir()
 
@@ -51,17 +52,29 @@ class FexExecutor(private val context: Context) {
     private val x11SocketDir: String
         get() = app.getX11SocketDir()
 
-    /** Path to the bundled dynamic linker */
-    private val ldLinuxPath: String
-        get() = "$fexDir/lib/ld-linux-aarch64.so.1"
+    /**
+     * Directory containing native libs with executable SELinux context.
+     * On Android 10+ (targetSdk 29+), only files in nativeLibraryDir can be executed
+     * by untrusted_app. FEX binaries are packaged as lib*.so in jniLibs/arm64-v8a/.
+     */
+    private val nativeLibDir: String
+        get() = context.applicationInfo.nativeLibraryDir
 
-    /** Path to FEXLoader binary */
+    /** Path to the bundled dynamic linker (in nativeLibDir for exec permission) */
+    private val ldLinuxPath: String
+        get() = "$nativeLibDir/libld_linux_aarch64.so"
+
+    /** Path to FEXLoader binary (in nativeLibDir for exec permission) */
     private val fexLoaderPath: String
-        get() = "$fexDir/bin/FEXLoader"
+        get() = "$nativeLibDir/libFEX.so"
+
+    /** Path to FEXServer binary (in nativeLibDir for exec permission) */
+    private val fexServerPath: String
+        get() = "$nativeLibDir/libFEXServer.so"
 
     /** Library path for FEXLoader's dependencies */
     private val fexLibPath: String
-        get() = "$fexDir/lib:$fexDir/lib/aarch64-linux-gnu"
+        get() = "$nativeLibDir:$fexDir/lib:$fexDir/lib/aarch64-linux-gnu"
 
     init {
         // Ensure directories exist
@@ -69,6 +82,15 @@ class FexExecutor(private val context: Context) {
         File(tmpDir, "shm").mkdirs()
         File(x11SocketDir).mkdirs()
         File(fexHomeDir).mkdirs()
+
+        Log.i(TAG, "FexExecutor init: nativeLibDir=$nativeLibDir")
+        Log.i(TAG, "  ld.so=$ldLinuxPath exists=${File(ldLinuxPath).exists()}")
+        Log.i(TAG, "  FEX=$fexLoaderPath exists=${File(fexLoaderPath).exists()}")
+        Log.i(TAG, "  FEXServer=$fexServerPath exists=${File(fexServerPath).exists()}")
+        Log.i(TAG, "  fexDir=$fexDir")
+        Log.i(TAG, "  rootfs=$fexRootfsDir")
+        Log.i(TAG, "  home=$fexHomeDir")
+        Log.i(TAG, "  tmpDir=$tmpDir")
     }
 
     /**
@@ -97,6 +119,14 @@ class FexExecutor(private val context: Context) {
         // Ensure FEXServer is running (required for guest binary execution)
         ensureFexServerRunning()
 
+        // Verify FEXServer socket exists (FEXLoader will hang without it)
+        val socketFiles = File(tmpDir).listFiles()?.filter { it.name.endsWith("FEXServer.Socket") } ?: emptyList()
+        if (socketFiles.isEmpty()) {
+            Log.e(TAG, "No FEXServer socket found in $tmpDir — FEXLoader will likely hang!")
+        } else {
+            Log.d(TAG, "FEXServer socket: ${socketFiles.first().absolutePath}")
+        }
+
         // Ensure socket symlinks exist in FEX rootfs /tmp/
         ensureSocketSymlinks()
 
@@ -115,11 +145,10 @@ class FexExecutor(private val context: Context) {
         return try {
             val baseEnv = buildBaseEnvironment()
 
-            // Build the shell command that invokes FEXLoader directly.
-            // FEX binaries are patched with patchelf to use the correct PT_INTERP
-            // pointing to the bundled ld-linux-aarch64.so.1, so they can be
-            // invoked directly. This makes /proc/self/exe point to FEXLoader
-            // (not ld.so), which is required for child process exec to work.
+            // Build the shell command that invokes FEXLoader via the bundled ld.so.
+            // FEX binaries live in nativeLibraryDir (executable SELinux context).
+            // We invoke ld.so explicitly so it loads FEXLoader with the correct
+            // library path, bypassing the hardcoded PT_INTERP.
             val shellCommand = buildString {
                 // Clear Android environment pollution
                 append("unset LD_PRELOAD TMPDIR PREFIX BOOTCLASSPATH ANDROID_ART_ROOT ANDROID_DATA && ")
@@ -132,10 +161,17 @@ class FexExecutor(private val context: Context) {
                 append("export FEX_DISABLETELEMETRY=1 && ")
                 // LD_LIBRARY_PATH for FEX native libraries (RPATH alone isn't sufficient)
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
+                // FEX_SELF_LDSO/FEX_SELF_LIBPATH tell our patched FEX how to re-exec
+                // itself for child processes via ld.so wrapper (on Android, FEX's
+                // PT_INTERP doesn't exist and /proc/self/exe points to ld.so)
+                append("export FEX_SELF_LDSO='$ldLinuxPath' && ")
+                append("export FEX_SELF_LIBPATH='$fexLibPath' && ")
 
-                // Invoke FEXLoader directly (PT_INTERP patched to bundled ld.so)
-                append("exec '$fexLoaderPath'")
-                append(" -- /bin/bash -c '${guestCommand.replace("'", "'\\''")}'")
+                // Invoke via ld.so wrapper: ld.so --library-path <path> FEXLoader <guest>
+                // Note: no 'exec' - let shell survive to report errors
+                append("'$ldLinuxPath' --library-path '$fexLibPath' '$fexLoaderPath'")
+                append(" /bin/bash -c '${guestCommand.replace("'", "'\\''")}'")
+                append(" ; echo \"[FEX exit code: \$?]\"")
             }
 
             Log.d(TAG, "Shell command: $shellCommand")
@@ -208,7 +244,6 @@ class FexExecutor(private val context: Context) {
      */
     @Synchronized
     private fun ensureFexServerRunning() {
-        val fexServerPath = "$fexDir/bin/FEXServer"
         if (!File(fexServerPath).exists()) {
             Log.w(TAG, "FEXServer not found at: $fexServerPath")
             return
@@ -229,6 +264,15 @@ class FexExecutor(private val context: Context) {
         }
 
         try {
+            // Kill any orphaned FEXServer processes from previous sessions
+            killOrphanedFexServers()
+
+            // Clean up stale socket files
+            File(tmpDir).listFiles()?.filter { it.name.endsWith("FEXServer.Socket") }?.forEach { socket ->
+                Log.d(TAG, "Removing stale FEXServer socket: ${socket.name}")
+                socket.delete()
+            }
+
             val baseEnv = buildBaseEnvironment()
             val shellCommand = buildString {
                 append("unset LD_PRELOAD TMPDIR PREFIX BOOTCLASSPATH ANDROID_ART_ROOT && ")
@@ -238,7 +282,8 @@ class FexExecutor(private val context: Context) {
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=1 && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
-                append("exec '$fexServerPath'")
+                // Invoke FEXServer via ld.so wrapper (same as FEXLoader)
+                append("exec '$ldLinuxPath' --library-path '$fexLibPath' '$fexServerPath'")
                 append(" -f -p 300") // foreground, persistent for 5 minutes
             }
 
@@ -251,10 +296,43 @@ class FexExecutor(private val context: Context) {
             }
 
             fexServerProcess = processBuilder.start()
-            Log.i(TAG, "FEXServer started")
+            Log.i(TAG, "FEXServer started (pid=${fexServerProcess?.hashCode()})")
+
+            // Drain FEXServer output in background thread to prevent pipe buffer fill
+            // and to capture any error messages for debugging
+            val serverProcess = fexServerProcess
+            Thread {
+                try {
+                    serverProcess?.inputStream?.bufferedReader()?.use { reader ->
+                        reader.forEachLine { line ->
+                            Log.d(TAG, "FEXServer OUT: $line")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "FEXServer output reader stopped: ${e.message}")
+                }
+                Log.d(TAG, "FEXServer output stream closed")
+            }.apply { isDaemon = true }.start()
 
             // Give FEXServer time to create its socket
-            Thread.sleep(1500)
+            Thread.sleep(2000)
+
+            // Verify FEXServer is still alive
+            val alive = try {
+                fexServerProcess?.exitValue()
+                false // exitValue() returned = process exited
+            } catch (e: IllegalThreadStateException) {
+                true // still running
+            }
+
+            // Check socket existence
+            val tmpFiles = File(tmpDir).listFiles()?.map { it.name } ?: emptyList()
+            Log.i(TAG, "FEXServer alive=$alive, TMPDIR=$tmpDir, files=${tmpFiles.joinToString()}")
+
+            if (!alive) {
+                Log.e(TAG, "FEXServer died during startup!")
+                fexServerProcess = null
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start FEXServer", e)
         }
@@ -312,6 +390,114 @@ class FexExecutor(private val context: Context) {
         val shmDir = File(rootfsTmp, "shm")
         if (!shmDir.exists()) {
             createSymlink(shmDir, File(tmpDir, "shm"))
+        }
+    }
+
+    /**
+     * Kill any orphaned FEXServer processes from previous app sessions.
+     * These can persist with PPID=1 and block socket creation.
+     *
+     * Also cleans up stale lock files. FEXServer uses file locking to ensure
+     * single-instance operation. A stale lock (from a killed but not cleaned-up
+     * process) will block new FEXServer instances from starting (silent exit 255).
+     */
+    private fun killOrphanedFexServers() {
+        try {
+            // Find FEXServer processes by searching for our binary name in /proc
+            val result = ProcessBuilder("/system/bin/sh", "-c",
+                "ps -e -o pid,args 2>/dev/null | grep -i '[F]EXServer\\|[l]ibFEXServer' || true"
+            ).redirectErrorStream(true).start()
+            val output = result.inputStream.bufferedReader().readText().trim()
+            result.waitFor()
+
+            if (output.isNotEmpty()) {
+                Log.d(TAG, "Found FEXServer processes:\n$output")
+                output.lines().forEach { line ->
+                    val pid = line.trim().split("\\s+".toRegex()).firstOrNull()?.toIntOrNull()
+                    if (pid != null && pid > 1) {
+                        Log.d(TAG, "Killing orphaned FEXServer PID=$pid")
+                        android.os.Process.killProcess(pid)
+                    }
+                }
+                // Give time for processes to die
+                Thread.sleep(500)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cleaning up orphaned FEXServer: ${e.message}")
+        }
+
+        // Clean up stale lock files that block FEXServer startup.
+        // FEXServer holds a read lock on Server.lock while running.
+        // If it dies without cleanup, the lock file remains but no lock is held.
+        // However, if the process is still alive (orphaned), the lock prevents
+        // new FEXServer instances from starting (InitializeServerPipe returns false).
+        cleanupStaleLockFiles()
+    }
+
+    /**
+     * Check and clean up stale FEXServer lock files.
+     * Uses fcntl F_GETLK to detect if any process holds the lock.
+     * If a process holds it, try to kill it. Then remove the lock files.
+     */
+    private fun cleanupStaleLockFiles() {
+        val serverDir = File(fexHomeDir, ".fex-emu/Server")
+        val lockFile = File(serverDir, "Server.lock")
+        val rootfsLockFile = File(serverDir, "RootFS.lock")
+
+        if (!lockFile.exists()) return
+
+        try {
+            // Use fuser or check /proc to find who holds the lock
+            // Since we can't use fcntl from Kotlin, use a shell command
+            val result = ProcessBuilder("/system/bin/sh", "-c",
+                "flock -n '${lockFile.absolutePath}' true 2>/dev/null; echo \$?"
+            ).redirectErrorStream(true).start()
+            val exitStr = result.inputStream.bufferedReader().readText().trim()
+            result.waitFor()
+
+            if (exitStr == "0") {
+                // Lock is free - stale file, safe to remove
+                Log.d(TAG, "Server.lock exists but is unlocked (stale), removing")
+                lockFile.delete()
+                rootfsLockFile.delete()
+            } else {
+                // Lock is held - find and kill the holder
+                Log.w(TAG, "Server.lock is held by another process, attempting cleanup")
+
+                // Try to find the PID via lsof or /proc scan
+                val lsofResult = ProcessBuilder("/system/bin/sh", "-c",
+                    "ls /proc/*/fd/* 2>/dev/null | while read f; do " +
+                    "readlink \$f 2>/dev/null | grep -q '${lockFile.absolutePath}' && echo \$f; " +
+                    "done | head -5"
+                ).redirectErrorStream(true).start()
+                val lsofOutput = lsofResult.inputStream.bufferedReader().readText().trim()
+                lsofResult.waitFor()
+
+                if (lsofOutput.isNotEmpty()) {
+                    Log.d(TAG, "Lock held by: $lsofOutput")
+                    // Extract PIDs from /proc/<pid>/fd/<fd>
+                    lsofOutput.lines().forEach { fdPath ->
+                        val pid = fdPath.split("/").getOrNull(2)?.toIntOrNull()
+                        if (pid != null && pid > 1 && pid != android.os.Process.myPid()) {
+                            Log.d(TAG, "Killing lock holder PID=$pid")
+                            android.os.Process.killProcess(pid)
+                        }
+                    }
+                    Thread.sleep(500)
+                }
+
+                // Force-remove lock files
+                lockFile.delete()
+                rootfsLockFile.delete()
+                Log.d(TAG, "Removed stale lock files")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cleaning up lock files: ${e.message}")
+            // Best-effort: just delete them
+            try {
+                lockFile.delete()
+                rootfsLockFile.delete()
+            } catch (_: Exception) {}
         }
     }
 
@@ -386,7 +572,7 @@ class FexExecutor(private val context: Context) {
         if (!isFexAvailable()) return "Not installed"
 
         return try {
-            val shellCommand = "'$fexLoaderPath' --version"
+            val shellCommand = "LD_LIBRARY_PATH='$fexLibPath' '$ldLinuxPath' --library-path '$fexLibPath' '$fexLoaderPath' --version"
             val process = ProcessBuilder("/system/bin/sh", "-c", shellCommand)
                 .redirectErrorStream(true)
                 .start()

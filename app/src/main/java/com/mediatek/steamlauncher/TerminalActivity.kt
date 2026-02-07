@@ -126,6 +126,27 @@ class TerminalActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnPwd).setOnClickListener {
             executeCommand("echo \"PWD: \$(pwd)\" && echo \"HOME: \$HOME\" && echo \"USER: \$USER\" && echo \"ARCH: \$(uname -m)\"")
         }
+
+        // Seccomp test — runs native ARM64 binary directly (NOT through FEX)
+        // to identify which syscalls Android's seccomp filter blocks
+        findViewById<Button>(R.id.btnSeccomp).setOnClickListener {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val testBinary = "$nativeLibDir/libseccomp_test.so"
+            val ldsoPath = "$nativeLibDir/libld_linux_aarch64.so"
+            executeNativeCommand(testBinary, mapOf("SECCOMP_TEST_LDSO" to ldsoPath))
+        }
+
+        // FEXServer diagnostic — tests each init step to find what fails
+        findViewById<Button>(R.id.btnFexDiag).setOnClickListener {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val diagBinary = "$nativeLibDir/libfexserver_diag.so"
+            val fexHomeDir = (application as SteamLauncherApp).getFexHomeDir()
+            val tmpDir = (application as SteamLauncherApp).getTmpDir()
+            executeNativeCommand(diagBinary, mapOf(
+                "HOME" to fexHomeDir,
+                "TMPDIR" to tmpDir
+            ))
+        }
     }
 
     private fun showWelcome() {
@@ -179,15 +200,21 @@ class TerminalActivity : AppCompatActivity() {
                 }
 
                 // Read output
+                Log.d(TAG, "Starting to read process output...")
                 val reader = process.inputStream.bufferedReader()
                 val buffer = CharArray(1024)
+                var totalRead = 0
 
                 try {
                     while (isActive) {
+                        Log.d(TAG, "Calling reader.read()...")
                         val count = reader.read(buffer)
+                        Log.d(TAG, "reader.read() returned: $count")
                         if (count == -1) break
 
+                        totalRead += count
                         val text = String(buffer, 0, count)
+                        Log.d(TAG, "Read text (${text.length} chars): ${text.take(200)}")
                         withContext(Dispatchers.Main) {
                             appendOutput(text)
                         }
@@ -198,12 +225,16 @@ class TerminalActivity : AppCompatActivity() {
                     }
                 }
 
+                Log.d(TAG, "Read loop finished. Total bytes read: $totalRead")
+
                 // Wait for process to complete
-                val completed = withTimeoutOrNull(600_000) {
+                val exitCode = withTimeoutOrNull(600_000) {
                     withContext(Dispatchers.IO) {
                         process.waitFor()
                     }
                 }
+                Log.d(TAG, "Process exit code: $exitCode")
+                val completed = exitCode
 
                 if (completed == null) {
                     process.destroyForcibly()
@@ -224,6 +255,66 @@ class TerminalActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Command execution failed", e)
+                withContext(Dispatchers.Main) {
+                    appendOutput("\n[ERROR: ${e.message}]\n")
+                    setRunning(false)
+                }
+            }
+        }
+    }
+
+    /**
+     * Execute a native ARM64 binary directly (not through FEX).
+     * Used for diagnostics that need to run in the app's seccomp context.
+     */
+    private fun executeNativeCommand(binaryPath: String, env: Map<String, String> = emptyMap()) {
+        if (isRunning) {
+            appendOutput("[Busy - wait for current command to finish]\n")
+            return
+        }
+
+        appendOutput("$ [native] $binaryPath\n")
+        setRunning(true)
+
+        currentJob = scope.launch {
+            try {
+                val processBuilder = ProcessBuilder(binaryPath).apply {
+                    redirectErrorStream(true)
+                    environment().putAll(env)
+                }
+
+                val process = processBuilder.start()
+                val reader = process.inputStream.bufferedReader()
+                val buffer = CharArray(1024)
+
+                try {
+                    while (isActive) {
+                        val count = reader.read(buffer)
+                        if (count == -1) break
+                        val text = String(buffer, 0, count)
+                        withContext(Dispatchers.Main) {
+                            appendOutput(text)
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (isActive) Log.e(TAG, "Native read error", e)
+                }
+
+                val exitCode = withTimeoutOrNull(30_000) {
+                    withContext(Dispatchers.IO) { process.waitFor() }
+                }
+
+                if (exitCode == null) {
+                    process.destroyForcibly()
+                    withContext(Dispatchers.Main) { appendOutput("\n[Timed out]\n") }
+                }
+
+                withContext(Dispatchers.Main) {
+                    appendOutput("\n")
+                    setRunning(false)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Native command failed", e)
                 withContext(Dispatchers.Main) {
                     appendOutput("\n[ERROR: ${e.message}]\n")
                     setRunning(false)

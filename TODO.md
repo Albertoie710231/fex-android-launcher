@@ -1,120 +1,136 @@
 # Development TODO
 
-## Current Status (2026-02-05)
+## Current Status (2026-02-06)
 
 ### Architecture: FEX-Direct (No PRoot)
 
 ```
-App → ProcessBuilder → ld-linux-aarch64.so.1 → FEXLoader → x86-64 bash/Steam
+App → ProcessBuilder → ld.so → FEXLoader → x86-64 bash/Steam
 ```
 
-PRoot has been completely eliminated. FEX-Emu runs directly via ProcessBuilder:
-- FEXLoader is an ARM64 native binary that JIT-compiles x86-64 → ARM64
-- FEX provides its own x86-64 rootfs overlay (Ubuntu 22.04)
-- Vortek IPC passthrough bridges glibc↔Bionic for Mali GPU access
+PRoot eliminated. FEX binaries in `jniLibs/arm64-v8a/` (nativeLibDir) for SELinux exec
+permission. Invoked via ld.so wrapper. Child re-exec via FEX_SELF_LDSO/FEX_SELF_LIBPATH.
 
 ### What's Working
-- [x] **FEX-Emu (FEX-2506)** runs directly on Android via bundled ld-linux-aarch64.so.1
-- [x] **FEXServer management** - auto-started before guest execution, persistent 5 minutes
-- [x] **FEXLoader --version** verified on device: `FEX-Emu (FEX-2506)`
-- [x] **NDK-built unsquashfs** - compiles from source (squashfs-tools 4.6.1 + xz-utils 5.4.5)
-- [x] **FEX binary extraction** from bundled `fex-bin.tgz` asset
+
+- [x] **FEX-Emu (FEX-2506)** runs on Android via ld.so wrapper from nativeLibDir
+- [x] **FEXServer management** - auto-started, persistent 5 minutes, stale lock cleanup
+- [x] **Child process exec** - FEX_SELF_LDSO/FEX_SELF_LIBPATH for re-exec via ld.so
+- [x] **LD_LIBRARY_PATH** set explicitly (RPATH alone insufficient on Android)
+- [x] **Container setup via app UI** - full flow works end-to-end
+- [x] **FEX rootfs download** (993MB SquashFS, zstd-compressed)
+- [x] **NDK-built unsquashfs** (squashfs-tools 4.6.1 + xz 5.4.5 + zstd 1.5.5)
+- [x] **Hardlink fallback** - unsquashfs patched to copy when link() fails on Android
+- [x] **ETXTBSY handling** - skip busy files during FEX binary extraction
+- [x] **x86-64 execution** - `uname -a` → x86_64, `cat /etc/os-release` → Ubuntu 22.04.5 LTS
+- [x] **Child exec inside bash** - `$(uname -m)` = x86_64, `/usr/bin/uname -m` from bash = x86_64
+- [x] **Semaphores** - sem_init/sem_wait/sem_post all PASS via FEX glibc futex emulation
 - [x] **Vortek Vulkan passthrough** - Mali GPU rendering via Unix socket IPC
 - [x] **vkcube renders** at 15-40 FPS on screen
-- [x] **FramebufferBridge** - HardwareBuffer → Surface display with Choreographer vsync
-- [x] **Interactive terminal** (TerminalActivity) for running FEX commands
-- [x] **APK builds and installs** cleanly (no PRoot artifacts)
-- [x] **App launches** without crashes, shows container status
+- [x] **Interactive terminal** (TerminalActivity)
+- [x] **Steam download & installation** - .deb extracted into FEX rootfs + bootstrap extracted
+- [x] **Steam binary loads via FEX** - x86 (i386) binary emulated successfully
+- [x] **DNS resolution** - fixed by writing /etc/resolv.conf into rootfs
+- [x] **Seccomp bypass** - glibc binary-patched for set_robust_list/rseq (return -ENOSYS)
+- [x] **FEXServer stale lock cleanup** - detects and kills orphaned FEXServers
 
-### What's NOT Yet Tested (Needs FEX Rootfs)
-- [ ] **Container setup via app UI** - download + extract FEX x86-64 rootfs
-- [ ] **x86-64 command execution** - needs rootfs extracted first (`/bin/uname` etc.)
-- [ ] **Semaphore test** - FEX emulates glibc semaphores via futex (should work)
-- [ ] **Vortek ICD in FEX rootfs** - `libvulkan_vortek.so` + ICD JSON config
-- [ ] **Steam launch via FEX** - `FEXLoader -- /bin/bash -c "steam"`
-- [ ] **DXVK game rendering** - Direct3D → Vulkan → Vortek → Mali GPU
-- [ ] **X11 display** - X11 socket symlinks in FEX rootfs `/tmp/.X11-unix/`
+### Previous Blocker: FEX mkdir/rmdir/unlink Not Redirected (SOLVED)
+
+Steam failed with a **fatal assertion** in breakpad: `mkdir("/tmp/dumps")` failed.
+
+**Root cause found (2026-02-06):** FEX's `mkdir`, `rmdir`, `unlink`, `link`, `symlink`,
+`rename` syscalls were **NOT going through the rootfs overlay** at all. They called native
+`::mkdir(pathname)` with the raw guest path (e.g., `/tmp/dumps`). On Android, `/tmp`
+doesn't exist → `ENOENT`. Meanwhile, `open()`, `stat()`, `access()` etc. DID go through
+`FileManager::GetEmulatedFDPath()` for rootfs path translation.
+
+**Fix: Custom FEX build** — Added `Mkdir`, `Mkdirat`, `Rmdir`, `Unlink`, `Unlinkat`,
+`Symlink`, `Symlinkat`, `Link`, `Linkat`, `Rename`, `Renameat`, `Renameat2` methods to
+`FileManager` (same pattern as `Open`/`Mknod`: try rootfs path first via
+`GetEmulatedFDPath()`, fall back to native). Updated `FS.cpp` and `Passthrough.cpp`.
+
+**Winlator investigation:** Winlator uses PRoot/Box64 with a fully writable extracted
+rootfs — they never use FEX's overlay, so they never face this issue.
+
+---
+
+### Previous Blocker: Android Seccomp (SOLVED)
+
+FEX died with **exit code 159** (signal 31 = SIGSYS) when launched from the app.
+App processes inherit strict seccomp filter from zygote (`SECCOMP_RET_KILL_PROCESS`).
+
+**Blocked syscalls identified** (via `libseccomp_test.so` from app):
+- `set_robust_list` (99) — glibc `__tls_init_tp()` during ld.so early init
+- `rseq` (293) — glibc `__libc_early_init()` during ld.so early init
+- Both called BEFORE any constructors → signal handlers can't catch them
+
+**Fix: Binary-patch glibc** (`scripts/patch_glibc_seccomp.py`):
+- Replaces `svc #0` with `movn x0, #37` (return -ENOSYS) for blocked syscalls
+- glibc handles -ENOSYS gracefully for both syscalls
+- Patched: `libld_linux_aarch64.so` (jniLibs) + `libc.so.6` (fex-bin.tgz)
+
+### Previous Blocker: FEXServer Exit 255 / Stale Lock (SOLVED)
+
+FEXServer exited silently with code 255 after the seccomp fix was applied.
+
+**Root cause:** Orphaned FEXServer (from previous adb test) held read lock on
+`$HOME/.fex-emu/Server/Server.lock`. New FEXServer couldn't acquire write lock →
+`InitializeServerPipe()` returned false → silent exit -1. The `return -1` paths in
+Main.cpp have NO log messages, making this completely silent even in foreground mode.
+
+**Fix:** `cleanupStaleLockFiles()` in `FexExecutor.kt`:
+- Checks if Server.lock is held (via `flock -n`)
+- If locked: scans /proc to find holder PID, kills it
+- Force-removes stale Server.lock and RootFS.lock
+
+**Diagnostic tool:** `libfexserver_diag.so` — tests each FEXServer init step
+(lock folder, lock file, abstract socket, filesystem socket, epoll, eventfd, setsid).
+Run via "FEX Diag" button in Terminal.
+
+### Current: Needs App Context Testing
+
+All adb tests pass (FEXServer + FEXLoader + child exec). Need to verify from app
+(with seccomp filter active) that the glibc patches and lock cleanup work correctly.
+Test via Terminal: "FEX Diag" button, then `uname -a`.
 
 ---
 
 ## Remaining Tasks
 
-### Phase 1: Container Setup (Next)
+### Phase 1: Core Infrastructure — DONE
 
-1. **Trigger container setup on device**
-   - Press "Setup Container" in app
-   - Verify: FEX binary extraction from `fex-bin.tgz`
-   - Verify: SquashFS rootfs download (~995MB) from `rootfs.fex-emu.gg`
-   - Verify: `unsquashfs` extraction (~2GB) into `fex-rootfs/Ubuntu_22_04/`
-   - Verify: FEX Config.json + thunks.json written
-   - Verify: Vortek ICD installed in rootfs
+1. ~~**Solve the /tmp/dumps issue**~~ — Custom FEX build with rootfs-redirected mkdir/rmdir/unlink
+2. ~~**Fix seccomp kills**~~ — Binary-patch glibc (set_robust_list, rseq → -ENOSYS)
+3. ~~**Fix FEXServer stale locks**~~ — cleanupStaleLockFiles() in FexExecutor.kt
+4. **Verify from app context** — test Terminal buttons with seccomp active
 
-2. **Test basic x86-64 execution**
-   - Open terminal, run `uname -a` → expect `x86_64 GNU/Linux`
-   - Run `cat /etc/os-release` → expect Ubuntu 22.04
-   - Run `ls /bin/` → expect full x86-64 userland
+**Custom FEX build details:**
+- Cross-compiled from x86_64 host using `build_fex_cross.sh` (avoids QEMU segfaults)
+- Clang + lld with Ubuntu multiarch ARM64 sysroot
+- Packaged via `package_fex.sh` → `fex-bin.tgz`
+- glibc binary-patched via `scripts/patch_glibc_seccomp.py`
 
-3. **Test semaphores**
-   ```bash
-   # Compile and run inside FEX x86-64 environment
-   cat > /tmp/sem_test.c << 'EOF'
-   #include <semaphore.h>
-   #include <stdio.h>
-   int main() {
-       sem_t sem;
-       if (sem_init(&sem, 0, 1) == -1) {
-           perror("sem_init");
-           return 1;
-       }
-       printf("Semaphore created successfully!\n");
-       sem_destroy(&sem);
-       return 0;
-   }
-   EOF
-   gcc /tmp/sem_test.c -o /tmp/sem_test -lpthread
-   /tmp/sem_test
-   ```
+### Phase 2: Steam Launch
 
-### Phase 2: Vulkan in FEX
+3. **Steam bootstrap update** — Steam will try to update itself on first run
+4. **X11 display connection** — DISPLAY=:0, X11 socket symlinks
+5. **Vulkan passthrough for Steam** — VK_ICD_FILENAMES + Vortek socket
+6. **Steam login** — keyboard input via X11
 
-4. **Verify Vortek ICD setup**
-   ```bash
-   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
-   vulkaninfo --summary  # Should show Mali GPU
-   ```
+### Phase 3: Game Testing
 
-5. **Test vkcube via FEX**
-   ```bash
-   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
-   export LD_PRELOAD=/lib/libvulkan_headless.so
-   ./vkcube --c 1000
-   ```
-
-### Phase 3: Steam
-
-6. **Download and install Steam**
-   - ContainerManager downloads Steam bootstrap
-   - Extract to `${fexHomeDir}/.local/share/Steam/`
-
-7. **Launch Steam via FEX**
-   ```bash
-   FEXLoader -- /bin/bash -c "
-     export DISPLAY=:0
-     export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
-     steam
-   "
-   ```
-
-8. **Test game with DXVK**
-   - Install small game via Steam
-   - Verify DXVK → Vulkan → Vortek → Mali rendering
+7. **Install small game** via Steam
+8. **DXVK rendering** — Direct3D → Vulkan → Vortek → Mali
+9. **Performance** — frame rates, memory usage
+10. **Input** — touch → X11 mouse events, keyboard
 
 ### Phase 4: Polish
 
-9. **Android 12+ phantom process fix** - verify foreground service keeps FEX alive
-10. **Touch/keyboard input** via X11 server
-11. **Performance optimization** - frame latency, memory usage
-12. **Error handling** - graceful recovery from FEXServer crashes
+11. **ContainerManager.downloadAndExtractSteam()** — integrate Steam install into setup flow
+12. **Fix DNS in setup** — auto-write resolv.conf during container setup
+13. **Fix rootfs /lib symlink protection** — prevent tar from replacing /lib → usr/lib
+14. **Android 12+ phantom process fix** — verify foreground service
+15. **Error handling** — graceful recovery from FEXServer crashes
 
 ---
 
@@ -122,50 +138,50 @@ PRoot has been completely eliminated. FEX-Emu runs directly via ProcessBuilder:
 
 ### FEXLoader Invocation on Android
 
-FEX binaries have `PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1` hardcoded. On Android, `/opt/fex/` doesn't exist. Bypass via bundled dynamic linker:
-
+FEX binaries live in `nativeLibDir` (jniLibs/arm64-v8a/) for SELinux exec permission.
+Invoked via bundled ld.so wrapper:
 ```bash
-${fexDir}/lib/ld-linux-aarch64.so.1 \
-  --library-path ${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu \
-  ${fexDir}/bin/FEXLoader \
-  -- /bin/bash -c "command"
+export LD_LIBRARY_PATH=${nativeLibDir}:${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu
+export FEX_SELF_LDSO=${nativeLibDir}/libld_linux_aarch64.so
+export FEX_SELF_LIBPATH="${LD_LIBRARY_PATH}"
+${nativeLibDir}/libld_linux_aarch64.so --library-path ${LD_LIBRARY_PATH} \
+    ${nativeLibDir}/libFEX.so /bin/bash -c "command"
 ```
 
-### FEXServer Requirement
+Note: Do NOT use `--` before `/bin/bash` — FEXLoader treats `--` as end of its options,
+but the shell may interpret it as a command name.
 
-FEXServer must be running before FEXLoader can execute guest binaries. It provides rootfs overlay mounting services. `FexExecutor` auto-starts it with `-f -p 300` (foreground, persistent 5 min).
+### PATH Must Be Set Inside Guest Bash
 
-The server socket is created at `$TMPDIR/<uid>.FEXServer.Socket`, so TMPDIR must be consistent between FEXServer and FEXLoader.
-
-### Socket Access in FEX
-
-FEX redirects `/tmp` → `${fexRootfsDir}/tmp/`. Symlinks in rootfs `/tmp/` point to actual Android sockets:
+Without explicit PATH, guest bash resolves tools to `/system/bin/` (ARM64 Android binaries)
+which fail with "Operation not permitted":
+```bash
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
-${fexRootfsDir}/tmp/.vortek/V0 → ${actualTmpDir}/.vortek/V0
-${fexRootfsDir}/tmp/.X11-unix/X0 → ${actualX11SocketDir}/X0
+The app's `FexExecutor.kt` does this automatically via `buildBaseEnvironment()`.
+
+### Steam Installation (from host side)
+
+FEX rootfs is read-only from guest. Steam .deb must be extracted from Android/host side:
+```bash
+# On host: extract steam.deb
+ar x steam.deb && tar xJf data.tar.xz -C rootfs/
+# Extract bootstrap
+tar xJf rootfs/usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz -C fex-home/.local/share/Steam/
 ```
 
-### NDK-Built unsquashfs
+### Rootfs /lib Symlink Warning
 
-squashfs-tools 4.6.1 compiled with Android NDK as `libunsquashfs.so`:
-- Requires vendored xz-utils 5.4.5 source with hand-crafted `config.h`
-- Android Bionic quirks: no `-lpthread` (built into libc), no `lutimes()`, needs `_GNU_SOURCE`
-- Sources downloaded via `scripts/fetch_unsquashfs_source.sh`
+Ubuntu 22.04 rootfs has `/lib → usr/lib` symlink. Extracting tar archives with `./lib/` entries
+into the rootfs will **replace the symlink with a real directory**, breaking the rootfs.
+Always check after extraction:
+```bash
+ls -la rootfs/lib  # Should show: lib -> usr/lib
+```
 
-### Why FEX Instead of Box64
+### DNS in FEX Rootfs
 
-| Aspect | Box64 | FEX |
-|--------|-------|-----|
-| pthread handling | Wraps to host Bionic → semaphores FAIL | Emulates x86 glibc → futex → WORKS |
-| Rootfs | Needs ARM64 rootfs + x86 libs | Provides own x86-64 rootfs |
-| Disk usage | ~1.5GB (ARM64 + FEX rootfs) | ~1GB (FEX rootfs only) |
-| Syscall overhead | PRoot ptrace on every syscall | Native ARM64, no ptrace |
-
----
-
-## Resources
-
-- [FEX-Emu](https://github.com/FEX-Emu/FEX) - x86-64 emulation with glibc emulation
-- [Winlator](https://github.com/brunodev85/winlator) - Vortek Vulkan IPC passthrough source
-- [FEX rootfs](https://rootfs.fex-emu.gg) - x86-64 SquashFS rootfs downloads
-- [Termux:X11](https://github.com/termux/termux-x11) - X11 server inspiration
+FEX rootfs doesn't have working DNS by default. Fix:
+```bash
+echo "nameserver 8.8.8.8" > rootfs/etc/resolv.conf
+```

@@ -124,48 +124,85 @@ This bypasses the glibc/Bionic binary incompatibility that prevents loading Andr
 
 ## Testing FEX via ADB
 
-### Verify FEXLoader runs
+FEX binaries are **patched with patchelf** so `PT_INTERP` points to the device path
+(`/data/data/com.mediatek.steamlauncher/files/fex/lib/ld-linux-aarch64.so.1`).
+This means FEXLoader can be invoked **directly** — no `ld-linux-aarch64.so.1` wrapper needed.
+However, `LD_LIBRARY_PATH` must be set explicitly (RPATH alone isn't sufficient on Android).
+
+### Important: PATH inside FEX bash
+
+When running commands inside FEX bash from ADB, you **must set PATH explicitly**:
 
 ```bash
-FEXDIR="/data/data/com.mediatek.steamlauncher/files/fex"
-FEXHOME="/data/data/com.mediatek.steamlauncher/files/fex-home"
-
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  export HOME=$FEXHOME
-  export USE_HEAP=1
-  export FEX_DISABLETELEMETRY=1
-  $FEXDIR/lib/ld-linux-aarch64.so.1 \
-    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
-    $FEXDIR/bin/FEXLoader --version
-'"
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
-Expected output: `FEX-Emu (FEX-2506)`
+Without this, bash inherits Android's PATH and resolves tools to `/system/bin/` (ARM64 Android
+binaries), which fail with "Operation not permitted" inside FEX. The app's `FexExecutor.kt`
+handles this automatically via `buildBaseEnvironment()`, but manual ADB tests need it.
 
-### Start FEXServer and run x86-64 commands
+### Quick test (push a script)
 
-FEXServer must be running for FEXLoader to execute guest binaries:
+Multiline `sh -c` commands break over ADB. For reliable testing, push a script file:
 
 ```bash
-FEXDIR="/data/data/com.mediatek.steamlauncher/files/fex"
-FEXHOME="/data/data/com.mediatek.steamlauncher/files/fex-home"
-TMPDIR="/data/data/com.mediatek.steamlauncher/cache/tmp"
+cat > /tmp/fex_test.sh << 'EOF'
+#!/system/bin/sh
+FEXDIR=/data/data/com.mediatek.steamlauncher/files/fex
+TMPDIR=/data/data/com.mediatek.steamlauncher/files/tmp
+HOME=/data/data/com.mediatek.steamlauncher/files/fex-home
+export TMPDIR HOME USE_HEAP=1 FEX_DISABLETELEMETRY=1
+export LD_LIBRARY_PATH=$FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu
+unset LD_PRELOAD BOOTCLASSPATH ANDROID_ART_ROOT ANDROID_I18N_ROOT
+unset ANDROID_TZDATA_ROOT COLORTERM DEX2OATBOOTCLASSPATH ANDROID_DATA
 
-# Start FEXServer (persistent for 60s)
-adb shell "run-as com.mediatek.steamlauncher sh -c '
-  export HOME=$FEXHOME TMPDIR=$TMPDIR USE_HEAP=1 FEX_DISABLETELEMETRY=1
-  mkdir -p $TMPDIR
-  $FEXDIR/lib/ld-linux-aarch64.so.1 \
-    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
-    $FEXDIR/bin/FEXServer -f -p 60 &
-  sleep 2
-  $FEXDIR/lib/ld-linux-aarch64.so.1 \
-    --library-path $FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu \
-    $FEXDIR/bin/FEXLoader -- /bin/uname -a
-'"
+# Start FEXServer (required before FEXLoader can run guest binaries)
+$FEXDIR/bin/FEXServer -f -p 300 &
+sleep 3
+
+echo "=== FEXLoader version ==="
+$FEXDIR/bin/FEXLoader --version
+
+echo "=== uname -a (direct) ==="
+$FEXDIR/bin/FEXLoader -- /bin/uname -a
+
+echo "=== os-release ==="
+$FEXDIR/bin/FEXLoader -- /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; head -4 /etc/os-release"
+
+echo "=== Child exec (arch, tools) ==="
+$FEXDIR/bin/FEXLoader -- /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; echo arch=\$(uname -m); echo ls=\$(which ls); echo bash=\$BASH_VERSION"
+EOF
+
+adb push /tmp/fex_test.sh /data/local/tmp/fex_test.sh
+adb shell run-as com.mediatek.steamlauncher sh /data/local/tmp/fex_test.sh
 ```
 
-Expected output: `Linux ... x86_64 GNU/Linux`
+Expected output:
+```
+=== FEXLoader version ===
+FEX-Emu (FEX-2506)
+=== uname -a (direct) ===
+Linux localhost 6.1.134 #FEX-2506 SMP ... x86_64 x86_64 x86_64 GNU/Linux
+=== os-release ===
+PRETTY_NAME="Ubuntu 22.04.5 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.5 LTS (Jammy Jellyfish)"
+=== Child exec (arch, tools) ===
+arch=x86_64
+ls=/usr/bin/ls
+bash=5.1.16(1)-release
+```
+
+### Verify FEXLoader runs (one-liner)
+
+```bash
+adb shell run-as com.mediatek.steamlauncher env \
+  LD_LIBRARY_PATH=/data/data/com.mediatek.steamlauncher/files/fex/lib \
+  /data/data/com.mediatek.steamlauncher/files/fex/bin/FEXLoader --version
+```
+
+Expected: `FEX-Emu (FEX-2506)`
 
 ### Test unsquashfs binary
 
@@ -175,7 +212,7 @@ NATIVELIB=$(dirname $(adb shell pm path com.mediatek.steamlauncher | cut -d: -f2
 adb shell "run-as com.mediatek.steamlauncher $NATIVELIB/libunsquashfs.so -version"
 ```
 
-Expected output: `unsquashfs version 4.6.1`
+Expected: `unsquashfs version 4.6.1`
 
 ## Android 12+ Phantom Process Fix
 
@@ -238,10 +275,13 @@ app/
 ## Key Components
 
 ### FexExecutor
-Runs FEXLoader directly via `ProcessBuilder`:
-- Invokes FEXLoader through bundled `ld-linux-aarch64.so.1` (bypasses missing `/opt/fex/` on Android)
+Runs FEXLoader directly via `ProcessBuilder` (binaries patched with patchelf):
+- Invokes FEXLoader directly (PT_INTERP patched to device path, no ld.so wrapper)
+- Sets `LD_LIBRARY_PATH` for FEX native libraries (RPATH alone isn't sufficient on Android)
 - Clears Android env pollution (LD_PRELOAD, ANDROID_*, etc.)
+- Sets PATH to `/usr/local/bin:/usr/bin:/bin` so guest bash finds rootfs tools (not `/system/bin/`)
 - Sets `USE_HEAP=1` to avoid SBRK allocation issues
+- Manages FEXServer lifecycle (must be running before FEXLoader can execute guest binaries)
 - Creates symlinks in FEX rootfs `/tmp/` for Vortek and X11 sockets
 
 ### ContainerManager
@@ -317,14 +357,25 @@ MIT License
 
 ### FEXLoader Invocation on Android
 
-FEX binaries have `PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1` hardcoded. On Android, `/opt/fex/` doesn't exist. We bypass this by invoking FEXLoader through the bundled dynamic linker directly:
+FEX binaries originally have `PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1` hardcoded. On Android, `/opt/fex/` doesn't exist. We solve this with **patchelf** at build time:
 
 ```bash
-${fexDir}/lib/ld-linux-aarch64.so.1 \
-  --library-path ${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu \
-  ${fexDir}/bin/FEXLoader \
-  -- /bin/bash -c "command"
+# Applied to all FEX binaries (FEXLoader, FEXServer, FEXInterpreter, etc.)
+patchelf --set-interpreter /data/data/com.mediatek.steamlauncher/files/fex/lib/ld-linux-aarch64.so.1 FEXLoader
+patchelf --set-rpath /data/data/com.mediatek.steamlauncher/files/fex/lib FEXLoader
 ```
+
+This allows **direct invocation** without the ld.so wrapper:
+
+```bash
+export LD_LIBRARY_PATH=${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu
+${fexDir}/bin/FEXLoader -- /bin/bash -c "command"
+```
+
+Direct invocation is critical because it makes `/proc/self/exe` point to FEXLoader (not ld.so),
+which is required for child process exec to work (FEX re-executes via `/proc/self/exe`).
+
+**LD_LIBRARY_PATH is required** — RPATH alone isn't sufficient on Android's dynamic linker.
 
 Where `fexDir = ${context.filesDir}/fex` (extracted from `fex-bin.tgz`).
 
@@ -350,10 +401,14 @@ ${fexRootfsDir}/tmp/.X11-unix/X0 → ${actualX11SocketDir}/X0
 ### FEX-Emu Build Notes
 
 - FEX binaries are bundled as `fex-bin.tgz` in assets (`.tgz` extension prevents AAPT decompression)
-- Binaries have `RUNPATH=/opt/fex/lib` pointing to bundled glibc 2.38 libs
+- Binaries are **patched with patchelf**: PT_INTERP and RPATH point to device paths
+- `LD_LIBRARY_PATH` must be set at runtime (RPATH alone isn't sufficient on Android)
 - `FEXInterpreter` is a binfmt handler — do NOT pass `--help`/`--version` to it
 - Use `FEXLoader --version` for testing, `FEXLoader -- /path/to/x86/binary` for running x86 programs
-- SquashFS rootfs from `rootfs.fex-emu.gg` is extracted by NDK-built `unsquashfs` (packaged as `libunsquashfs.so`)
+- FEXServer must be running before FEXLoader can execute guest binaries (start with `-f -p 300`)
+- SquashFS rootfs from `rootfs.fex-emu.gg` uses **zstd compression** — unsquashfs must be built with zstd support
+- SquashFS rootfs is extracted by NDK-built `unsquashfs` (packaged as `libunsquashfs.so`)
+- Android doesn't support hardlinks in app data dirs — unsquashfs is patched to copy files as fallback
 
 ### NDK-built unsquashfs
 

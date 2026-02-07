@@ -247,3 +247,27 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/squashfs-tools/unsquashfs.c")
 else()
     message(STATUS "squashfs-tools source not found in vendor/. Run scripts/fetch_unsquashfs_source.sh")
 endif()
+
+# ============================================================
+# seccomp_test - Identifies which syscalls Android's seccomp blocks
+# Tests each FEX-used syscall in a forked child to safely detect kills
+# ============================================================
+add_executable(seccomp_test seccomp_test.c)
+target_compile_definitions(seccomp_test PRIVATE _GNU_SOURCE)
+set_target_properties(seccomp_test PROPERTIES
+    OUTPUT_NAME "seccomp_test"
+    SUFFIX ".so"
+    PREFIX "lib"
+)
+
+# ============================================================
+# fexserver_diag - Diagnoses FEXServer initialization failures
+# Tests each startup step (lock files, sockets, epoll, etc.)
+# ============================================================
+add_executable(fexserver_diag fexserver_diag.c)
+target_compile_definitions(fexserver_diag PRIVATE _GNU_SOURCE)
+set_target_properties(fexserver_diag PROPERTIES
+    OUTPUT_NAME "fexserver_diag"
+    SUFFIX ".so"
+    PREFIX "lib"
+)
