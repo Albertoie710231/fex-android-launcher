@@ -28,6 +28,7 @@ import shutil
 BLOCKED_SYSCALLS = {
     99:  "set_robust_list",  # glibc __tls_init_tp → NPTL robust mutex
     293: "rseq",             # glibc __libc_early_init → restartable sequences
+    435: "clone3",           # glibc pthread_create → falls back to clone(220)
 }
 
 # aarch64 instruction encodings (little-endian)

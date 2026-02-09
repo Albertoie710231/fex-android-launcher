@@ -622,6 +622,21 @@ class ContainerManager(private val context: Context) {
         File(rootfsTmp, ".vortek").mkdirs()
         File(rootfsTmp, "shm").mkdirs()
 
+        // Create /etc/resolv.conf for DNS resolution inside FEX guest
+        val resolvConf = File(fexRootfsDir, "etc/resolv.conf")
+        if (!resolvConf.exists() || resolvConf.readText().isBlank()) {
+            resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+            Log.i(TAG, "Created resolv.conf with Google DNS")
+        }
+
+        // Allow apt to work with potentially stale GPG keys in the rootfs
+        val aptInsecure = File(fexRootfsDir, "etc/apt/apt.conf.d/99allow-insecure")
+        if (!aptInsecure.exists()) {
+            aptInsecure.parentFile?.mkdirs()
+            aptInsecure.writeText("Acquire::AllowInsecureRepositories \"true\";\nAcquire::AllowDowngradeToInsecureRepositories \"true\";\n")
+            Log.i(TAG, "Created apt insecure repositories config")
+        }
+
         // Ensure FEX binaries have execute permission
         File(fexDir, "bin").listFiles()?.forEach { it.setExecutable(true) }
         File(fexDir, "lib").listFiles()?.forEach {
