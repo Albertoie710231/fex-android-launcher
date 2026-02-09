@@ -1483,12 +1483,12 @@ VkResult vkEnumerateInstanceExtensionProperties(
     VkResult result = real_vkEnumerateInstanceExtensionProperties(pLayerName, &real_count, NULL);
     if (result != VK_SUCCESS) return result;
 
-    // Add VK_EXT_headless_surface and VK_KHR_xcb_surface
-    uint32_t total = real_count + 2;
+    // Add VK_KHR_surface, VK_EXT_headless_surface and VK_KHR_xcb_surface
+    uint32_t total = real_count + 3;
 
     if (!pProperties) {
         *pPropertyCount = total;
-        fprintf(stderr, "[XCB-Bridge] Extensions: %u (real=%u + headless + xcb_surface)\n", total, real_count);
+        fprintf(stderr, "[XCB-Bridge] Extensions: %u (real=%u + surface + headless + xcb_surface)\n", total, real_count);
         return VK_SUCCESS;
     }
 
@@ -1498,6 +1498,11 @@ VkResult vkEnumerateInstanceExtensionProperties(
     uint32_t idx = real_count;
     uint32_t added = 0;
 
+    if (*pPropertyCount > idx) {
+        strncpy(pProperties[idx].extensionName, "VK_KHR_surface", VK_MAX_EXTENSION_NAME_SIZE);
+        pProperties[idx].specVersion = 25;
+        idx++; added++;
+    }
     if (*pPropertyCount > idx) {
         strncpy(pProperties[idx].extensionName, "VK_EXT_headless_surface", VK_MAX_EXTENSION_NAME_SIZE);
         pProperties[idx].specVersion = 1;
@@ -1510,8 +1515,8 @@ VkResult vkEnumerateInstanceExtensionProperties(
     }
 
     *pPropertyCount = real_count + added;
-    fprintf(stderr, "[XCB-Bridge] Added %u extensions (headless + xcb_surface)\n", added);
-    return (added == 2) ? VK_SUCCESS : VK_INCOMPLETE;
+    fprintf(stderr, "[XCB-Bridge] Added %u extensions (surface + headless + xcb_surface)\n", added);
+    return (added == 3) ? VK_SUCCESS : VK_INCOMPLETE;
 }
 
 // Intercept vkCreateInstance
@@ -1528,26 +1533,28 @@ VkResult vkCreateInstance(
     }
 
     // Filter out extensions we provide
-    int has_headless = 0, has_xcb = 0;
+    int has_our_ext = 0;
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
-        if (strcmp(ext, "VK_EXT_headless_surface") == 0) has_headless = 1;
-        if (strcmp(ext, "VK_KHR_xcb_surface") == 0) has_xcb = 1;
+        if (strcmp(ext, "VK_KHR_surface") == 0 ||
+            strcmp(ext, "VK_EXT_headless_surface") == 0 ||
+            strcmp(ext, "VK_KHR_xcb_surface") == 0) has_our_ext = 1;
     }
 
-    if (!has_headless && !has_xcb) {
+    if (!has_our_ext) {
         VkResult r = real_vkCreateInstance(pCreateInfo, pAllocator, pInstance);
         if (r == VK_SUCCESS) g_current_instance = *pInstance;
         return r;
     }
 
-    // Filter out our extensions
+    // Filter out our extensions before passing to real ICD
     const char** filtered = malloc(pCreateInfo->enabledExtensionCount * sizeof(char*));
     uint32_t filtered_count = 0;
 
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
-        if (strcmp(ext, "VK_EXT_headless_surface") != 0 &&
+        if (strcmp(ext, "VK_KHR_surface") != 0 &&
+            strcmp(ext, "VK_EXT_headless_surface") != 0 &&
             strcmp(ext, "VK_KHR_xcb_surface") != 0) {
             filtered[filtered_count++] = ext;
         } else {
@@ -1571,6 +1578,50 @@ VkResult vkCreateInstance(
 }
 
 // Intercept vkGetInstanceProcAddr
+// Inject VK_KHR_swapchain into device extensions
+static VkResult my_vkEnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice,
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties)
+{
+    typedef VkResult (*PFN)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
+    PFN real_fn = (PFN)real_vkGetInstanceProcAddr(g_current_instance, "vkEnumerateDeviceExtensionProperties");
+    if (!real_fn) return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+    uint32_t real_count = 0;
+    VkResult result = real_fn(physicalDevice, pLayerName, &real_count, NULL);
+    if (result != VK_SUCCESS) return result;
+
+    // Check if VK_KHR_swapchain already exists
+    if (pProperties == NULL) {
+        *pPropertyCount = real_count + 1; // +1 for VK_KHR_swapchain
+        return VK_SUCCESS;
+    }
+
+    uint32_t get_count = *pPropertyCount < real_count ? *pPropertyCount : real_count;
+    result = real_fn(physicalDevice, pLayerName, &get_count, pProperties);
+
+    // Check if already present
+    for (uint32_t i = 0; i < get_count; i++) {
+        if (strcmp(pProperties[i].extensionName, "VK_KHR_swapchain") == 0) {
+            *pPropertyCount = get_count;
+            return result;
+        }
+    }
+
+    // Add VK_KHR_swapchain
+    if (*pPropertyCount > real_count) {
+        strncpy(pProperties[real_count].extensionName, "VK_KHR_swapchain", VK_MAX_EXTENSION_NAME_SIZE);
+        pProperties[real_count].specVersion = 70;
+        *pPropertyCount = real_count + 1;
+        fprintf(stderr, "[XCB-Bridge] Injected VK_KHR_swapchain device extension\n");
+    } else {
+        *pPropertyCount = get_count;
+    }
+    return VK_SUCCESS;
+}
+
 PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
 {
     if (!real_vkGetInstanceProcAddr) {
@@ -1580,6 +1631,8 @@ PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance instance, const char* pName)
     // Our implementations
     if (strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0)
         return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0)
+        return (PFN_vkVoidFunction)my_vkEnumerateDeviceExtensionProperties;
     if (strcmp(pName, "vkCreateInstance") == 0)
         return (PFN_vkVoidFunction)vkCreateInstance;
     if (strcmp(pName, "vkCreateHeadlessSurfaceEXT") == 0)

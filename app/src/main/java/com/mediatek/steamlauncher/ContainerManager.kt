@@ -497,6 +497,9 @@ class ContainerManager(private val context: Context) {
         // Install Vulkan test tools
         installVulkanTools()
 
+        // Guest-side: Install headless Vulkan wrapper (x86-64) for vkcube frame capture
+        installHeadlessWrapper()
+
         Log.i(TAG, "Vortek passthrough configured (guest + host)")
     }
 
@@ -602,6 +605,28 @@ class ContainerManager(private val context: Context) {
                 stale.delete()
                 Log.i(TAG, "Removed stale ARM64 $tool from /usr/local/bin (rootfs has x86-64 version)")
             }
+        }
+    }
+
+    /**
+     * Install the x86-64 headless Vulkan wrapper into the rootfs.
+     * This provides fake XCB + headless surface support via LD_PRELOAD,
+     * enabling vkcube to render without an X11 server and capture frames via TCP.
+     */
+    private fun installHeadlessWrapper() {
+        val targetFile = File(fexRootfsDir, "usr/lib/libvulkan_headless.so")
+        try {
+            context.assets.open("libvulkan_headless.so").use { input ->
+                targetFile.parentFile?.mkdirs()
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            targetFile.setExecutable(true)
+            targetFile.setReadable(true, false)
+            Log.i(TAG, "Headless Vulkan wrapper installed: ${targetFile.absolutePath}")
+        } catch (e: IOException) {
+            Log.w(TAG, "Headless Vulkan wrapper not found in assets: ${e.message}")
         }
     }
 

@@ -38,6 +38,7 @@ class TerminalActivity : AppCompatActivity() {
     private var isRunning = false
     private var currentJob: Job? = null
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
+    private var frameSocketServer: FrameSocketServer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,6 +53,9 @@ class TerminalActivity : AppCompatActivity() {
 
         // Start VortekRenderer for Vulkan passthrough (doesn't need a surface)
         startVortekRenderer()
+
+        // Start frame socket server for vkcube frame capture
+        startFrameSocketServer()
 
         setupUI()
         showWelcome()
@@ -482,9 +486,22 @@ class TerminalActivity : AppCompatActivity() {
         }
     }
 
+    private fun startFrameSocketServer() {
+        if (frameSocketServer != null) return
+        frameSocketServer = FrameSocketServer().apply {
+            if (start()) {
+                Log.i(TAG, "Frame socket server started on TCP 19850")
+            } else {
+                Log.e(TAG, "Failed to start frame socket server")
+            }
+        }
+    }
+
     override fun onDestroy() {
         currentJob?.cancel()
         scope.cancel()
+        frameSocketServer?.stop()
+        frameSocketServer = null
         VortekRenderer.stop()
         super.onDestroy()
     }
