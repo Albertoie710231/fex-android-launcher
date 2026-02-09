@@ -69,10 +69,17 @@ class TerminalActivity : AppCompatActivity() {
         // Start frame socket server for vkcube frame capture
         startFrameSocketServer()
 
+        // Request 120Hz display refresh rate
+        request120Hz()
+
         // Wire up SurfaceView for real-time Vulkan display
         vulkanSurface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 surfaceReady = true
+                // Request 120Hz on the surface itself
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    holder.surface.setFrameRate(120f, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+                }
                 if (isDisplayMode) {
                     frameSocketServer?.setOutputSurface(holder.surface)
                     Log.i(TAG, "Vulkan display surface created and connected")
@@ -484,6 +491,29 @@ class TerminalActivity : AppCompatActivity() {
      * Unlike SteamService, the Terminal doesn't have a surface, but VortekRenderer
      * doesn't need one — it just needs a socket path and context.
      */
+    private fun request120Hz() {
+        // Find a 120Hz display mode and set it on the window
+        val display = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            this.display
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay
+        } ?: return
+
+        val modes = display.supportedModes
+        val mode120 = modes.filter { it.refreshRate >= 119f }
+            .maxByOrNull { it.refreshRate }
+
+        if (mode120 != null) {
+            window.attributes = window.attributes.apply {
+                preferredDisplayModeId = mode120.modeId
+            }
+            Log.i(TAG, "Requested 120Hz display mode: ${mode120.physicalWidth}x${mode120.physicalHeight}@${mode120.refreshRate}")
+        } else {
+            Log.i(TAG, "120Hz not available. Modes: ${modes.map { "${it.refreshRate}Hz" }}")
+        }
+    }
+
     private fun startVortekRenderer() {
         if (!VortekRenderer.loadLibrary()) {
             Log.w(TAG, "Vortek renderer not available — Vulkan passthrough disabled")

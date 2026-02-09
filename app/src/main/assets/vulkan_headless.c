@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -266,10 +267,30 @@ static VkPhysicalDevice g_physical_device = NULL;
 
 // Frame output socket - use TCP localhost for proot compatibility
 #define FRAME_SOCKET_PORT 19850
+
+// Vsync emulation: cap frame rate to ~60 FPS so vkcube rotation speed is normal
+#define TARGET_FRAME_NS (8333333ULL)  // ~8.33ms = 120 FPS
+static uint64_t g_last_present_ns = 0;
+
+static uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 static int g_frame_socket = -1;
 static int g_frame_socket_connected = 0;
 
-// Connect to frame output socket (TCP on localhost)
+// Non-blocking send buffer: holds one complete frame (header + pixels).
+// We drain it asynchronously; if the previous frame isn't fully sent when a
+// new one arrives, we skip the new frame.  This keeps vkcube running at full
+// speed and avoids TCP back-pressure throttling the render loop.
+static uint8_t* g_pending_buf = NULL;
+static size_t   g_pending_cap = 0;
+static size_t   g_pending_total = 0;
+static size_t   g_pending_sent = 0;
+static uint64_t g_frames_dropped = 0;
+
+// Connect to frame output socket (TCP on localhost, NON-BLOCKING)
 static int connect_frame_socket(void) {
     if (g_frame_socket_connected) return 1;
 
@@ -297,78 +318,110 @@ static int connect_frame_socket(void) {
         return 0;
     }
 
-    g_frame_socket_connected = 1;
-    fprintf(stderr, "[XCB-Bridge] Connected to frame socket on port %d\n", FRAME_SOCKET_PORT);
-
-    // Set socket to non-blocking for frame dropping when buffer is full
+    // Set non-blocking so writes never stall the render loop
     int flags = fcntl(g_frame_socket, F_GETFL, 0);
     fcntl(g_frame_socket, F_SETFL, flags | O_NONBLOCK);
 
-    // Use small send buffer to drop frames quickly when display can't keep up
-    int bufsize = 500 * 500 * 4 * 2;  // ~2 frames worth
-    setsockopt(g_frame_socket, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    // TCP_NODELAY reduces latency by disabling Nagle's algorithm
+    int nodelay = 1;
+    setsockopt(g_frame_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+    // Large send buffer: 4MB setting = 8MB actual (Linux doubles it).
+    // Fits ~8 frames of 500x500, reduces EAGAIN frequency.
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(g_frame_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    g_frame_socket_connected = 1;
+    g_pending_total = 0;
+    g_pending_sent = 0;
+    fprintf(stderr, "[XCB-Bridge] Connected to frame socket on port %d (non-blocking)\n", FRAME_SOCKET_PORT);
     return 1;
 }
 
-// Send a frame to the socket
+static void disconnect_frame_socket(void) {
+    if (g_frame_socket >= 0) close(g_frame_socket);
+    g_frame_socket = -1;
+    g_frame_socket_connected = 0;
+    g_pending_total = 0;
+    g_pending_sent = 0;
+}
+
+// Drain pending send buffer without blocking.
+// Returns: 1 = all sent, 0 = would block (more to send), -1 = error
+static int drain_pending(void) {
+    while (g_pending_sent < g_pending_total) {
+        ssize_t n = write(g_frame_socket, g_pending_buf + g_pending_sent,
+                          g_pending_total - g_pending_sent);
+        if (n > 0) {
+            g_pending_sent += n;
+        } else if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;  // real error (EPIPE, etc.)
+        } else {
+            return -1;  // connection closed
+        }
+    }
+    g_pending_total = 0;
+    g_pending_sent = 0;
+    return 1;
+}
+
+// Send a frame to the socket (non-blocking, drops frame if pipe is full)
 static void send_frame_pitched(uint32_t width, uint32_t height, const void* pixels, size_t row_pitch) {
     if (!g_frame_socket_connected && !connect_frame_socket()) {
-        return;  // Can't connect, skip frame
-    }
-
-    // Frame header: width (4 bytes) + height (4 bytes)
-    uint32_t header[2] = { width, height };
-
-    ssize_t sent = write(g_frame_socket, header, sizeof(header));
-    if (sent != sizeof(header)) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Buffer full, drop this frame
-            static int drop_count = 0;
-            drop_count++;
-            if (drop_count < 5 || drop_count % 100 == 0) {
-                fprintf(stderr, "[XCB-Bridge] Dropping frame (buffer full, dropped %d)\n", drop_count);
-            }
-            return;
-        }
-        fprintf(stderr, "[XCB-Bridge] Failed to send frame header: %s\n", strerror(errno));
-        close(g_frame_socket);
-        g_frame_socket = -1;
-        g_frame_socket_connected = 0;
         return;
     }
 
-    // Frame data: RGBA pixels - handle row pitch
-    // For non-blocking socket, drop frame if buffer is full (don't retry mid-frame)
-    size_t expected_pitch = width * 4;
-    if (row_pitch == expected_pitch) {
-        // Tightly packed, send directly
-        size_t data_size = width * height * 4;
-        sent = write(g_frame_socket, pixels, data_size);
-        if (sent != (ssize_t)data_size) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Buffer full, frame already partially sent - this is bad, reconnect
-                close(g_frame_socket);
-                g_frame_socket = -1;
-                g_frame_socket_connected = 0;
-            }
+    // If there's pending data from a previous frame, try to drain it
+    if (g_pending_total > 0) {
+        int r = drain_pending();
+        if (r < 0) {
+            disconnect_frame_socket();
             return;
         }
+        if (r == 0) {
+            // Previous frame still draining — drop this new frame to avoid blocking
+            g_frames_dropped++;
+            return;
+        }
+    }
+
+    // Build complete frame in pending buffer: [header 8 bytes][pixels]
+    size_t expected_pitch = width * 4;
+    size_t pixel_size = width * height * 4;
+    size_t frame_size = 8 + pixel_size;
+
+    if (g_pending_cap < frame_size) {
+        free(g_pending_buf);
+        g_pending_buf = (uint8_t*)malloc(frame_size);
+        g_pending_cap = frame_size;
+    }
+
+    // Header
+    uint32_t header[2] = { width, height };
+    memcpy(g_pending_buf, header, 8);
+
+    // Pixels (handle row pitch)
+    if (row_pitch == expected_pitch) {
+        memcpy(g_pending_buf + 8, pixels, pixel_size);
     } else {
-        // Row pitch differs - send row by row
+        uint8_t* dst = g_pending_buf + 8;
         const uint8_t* src = (const uint8_t*)pixels;
         for (uint32_t y = 0; y < height; y++) {
-            sent = write(g_frame_socket, src, expected_pitch);
-            if (sent != (ssize_t)expected_pitch) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    close(g_frame_socket);
-                    g_frame_socket = -1;
-                    g_frame_socket_connected = 0;
-                }
-                return;
-            }
+            memcpy(dst, src, expected_pitch);
+            dst += expected_pitch;
             src += row_pitch;
         }
+    }
+
+    g_pending_total = frame_size;
+    g_pending_sent = 0;
+
+    // Try to send as much as possible right now
+    int r = drain_pending();
+    if (r < 0) {
+        disconnect_frame_socket();
     }
 }
 
@@ -1401,6 +1454,25 @@ VkResult vkQueuePresentKHR(
                 if (fn) return fn(queue, pPresentInfo);
             }
         }
+    }
+
+    // Vsync emulation: sleep until next 16.67ms boundary (~60 FPS cap).
+    // This prevents vkcube from spinning too fast (rotation is per-frame)
+    // and keeps frame rate stable so rotation speed is uniform.
+    {
+        uint64_t now = get_time_ns();
+        if (g_last_present_ns > 0) {
+            uint64_t elapsed = now - g_last_present_ns;
+            if (elapsed < TARGET_FRAME_NS) {
+                uint64_t sleep_ns = TARGET_FRAME_NS - elapsed;
+                struct timespec ts = {
+                    .tv_sec = (time_t)(sleep_ns / 1000000000ULL),
+                    .tv_nsec = (long)(sleep_ns % 1000000000ULL)
+                };
+                nanosleep(&ts, NULL);
+            }
+        }
+        g_last_present_ns = get_time_ns();
     }
 
     return VK_SUCCESS;
