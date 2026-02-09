@@ -584,6 +584,20 @@ class SteamService : Service() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to create Vortek symlink", e)
                 }
+
+                // Create V0 symlink in app data dir — libvulkan_vortek.so has hardcoded
+                // path /data/data/com.mediatek.steamlauncher/V0
+                try {
+                    val appDataDir = app.dataDir
+                    val v0Symlink = File(appDataDir, "V0")
+                    if (v0Symlink.exists()) {
+                        v0Symlink.delete()
+                    }
+                    Runtime.getRuntime().exec(arrayOf("ln", "-sf", vortekSocketPath, v0Symlink.absolutePath)).waitFor()
+                    Log.i(TAG, "Created V0 symlink: ${v0Symlink.absolutePath} -> $vortekSocketPath")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to create V0 symlink in app data dir", e)
+                }
             } else {
                 Log.w(TAG, "Vortek started but socket not found at expected path")
             }

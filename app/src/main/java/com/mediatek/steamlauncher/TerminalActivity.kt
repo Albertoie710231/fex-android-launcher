@@ -50,6 +50,9 @@ class TerminalActivity : AppCompatActivity() {
 
         currentDir = app.getFexHomeDir()
 
+        // Start VortekRenderer for Vulkan passthrough (doesn't need a surface)
+        startVortekRenderer()
+
         setupUI()
         showWelcome()
     }
@@ -401,15 +404,88 @@ class TerminalActivity : AppCompatActivity() {
             "TMPDIR" to "/tmp",
             "DEBIAN_FRONTEND" to "noninteractive",
 
-            // Vortek Vulkan configuration
+            // Vortek Vulkan configuration (guest paths — FEX maps /tmp → rootfs/tmp/)
             "VORTEK_SERVER_PATH" to "/tmp/vortek.sock",
             "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/vortek_icd.json"
         )
     }
 
+    /**
+     * Start VortekRenderer for Vulkan passthrough.
+     * Unlike SteamService, the Terminal doesn't have a surface, but VortekRenderer
+     * doesn't need one — it just needs a socket path and context.
+     */
+    private fun startVortekRenderer() {
+        if (!VortekRenderer.loadLibrary()) {
+            Log.w(TAG, "Vortek renderer not available — Vulkan passthrough disabled")
+            return
+        }
+
+        if (VortekRenderer.isRunning()) {
+            Log.d(TAG, "VortekRenderer already running")
+            return
+        }
+
+        val socketPath = "${app.getTmpDir()}/vortek.sock"
+
+        // Delete stale socket
+        val socketFile = java.io.File(socketPath)
+        if (socketFile.exists()) {
+            socketFile.delete()
+        }
+
+        if (VortekRenderer.start(socketPath, this)) {
+            Log.i(TAG, "VortekRenderer started at: $socketPath")
+
+            // Set a dummy WindowInfoProvider for headless Vulkan (e.g., vulkaninfo).
+            // Without this, VortekRenderer rejects client connections.
+            VortekRenderer.setWindowInfoProvider(object : com.winlator.xenvironment.components.VortekRendererComponent.WindowInfoProvider {
+                override fun getWindowWidth(windowId: Int): Int = 1920
+                override fun getWindowHeight(windowId: Int): Int = 1080
+                override fun getWindowHardwareBuffer(windowId: Int): Long = 0
+                override fun updateWindowContent(windowId: Int) {}
+            })
+
+            // Create .vortek/V0 symlink (expected by VORTEK_SERVER_PATH env var)
+            try {
+                val vortekDir = java.io.File(app.getTmpDir(), ".vortek")
+                vortekDir.mkdirs()
+                val symlinkFile = java.io.File(vortekDir, "V0")
+                if (symlinkFile.exists()) {
+                    symlinkFile.delete()
+                }
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", "../vortek.sock", symlinkFile.absolutePath)
+                ).waitFor()
+                Log.i(TAG, "Created Vortek symlink: ${symlinkFile.absolutePath} -> ../vortek.sock")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create Vortek symlink", e)
+            }
+
+            // Create V0 symlink in app data dir — libvulkan_vortek.so has hardcoded
+            // path /data/data/com.mediatek.steamlauncher/V0
+            try {
+                val appDataDir = java.io.File(applicationInfo.dataDir)
+                val v0Symlink = java.io.File(appDataDir, "V0")
+                if (v0Symlink.exists()) {
+                    v0Symlink.delete()
+                }
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", socketPath, v0Symlink.absolutePath)
+                ).waitFor()
+                Log.i(TAG, "Created V0 symlink: ${v0Symlink.absolutePath} -> $socketPath")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create V0 symlink in app data dir", e)
+            }
+        } else {
+            Log.e(TAG, "Failed to start VortekRenderer")
+        }
+    }
+
     override fun onDestroy() {
         currentJob?.cancel()
         scope.cancel()
+        VortekRenderer.stop()
         super.onDestroy()
     }
 }

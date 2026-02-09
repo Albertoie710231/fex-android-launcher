@@ -161,6 +161,10 @@ class FexExecutor(private val context: Context) {
                 append("export FEX_DISABLETELEMETRY=1 && ")
                 // LD_LIBRARY_PATH for FEX native libraries (RPATH alone isn't sufficient)
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
+                // Vulkan host-side ICD for thunks: host thunk → ICD loader → Vortek
+                append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
+                append("export VK_DRIVER_FILES='${baseEnv["VK_DRIVER_FILES"]}' && ")
+                append("export VORTEK_SERVER_PATH='${baseEnv["VORTEK_SERVER_PATH"]}' && ")
                 // FEX_SELF_LDSO/FEX_SELF_LIBPATH tell our patched FEX how to re-exec
                 // itself for child processes via ld.so wrapper (on Android, FEX's
                 // PT_INTERP doesn't exist and /proc/self/exe points to ld.so)
@@ -282,6 +286,10 @@ class FexExecutor(private val context: Context) {
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=1 && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
+                // Vulkan host-side ICD for thunks
+                append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
+                append("export VK_DRIVER_FILES='${baseEnv["VK_DRIVER_FILES"]}' && ")
+                append("export VORTEK_SERVER_PATH='${baseEnv["VORTEK_SERVER_PATH"]}' && ")
                 // Invoke FEXServer via ld.so wrapper (same as FEXLoader)
                 append("exec '$ldLinuxPath' --library-path '$fexLibPath' '$fexServerPath'")
                 append(" -f -p 300") // foreground, persistent for 5 minutes
@@ -513,6 +521,9 @@ class FexExecutor(private val context: Context) {
     }
 
     private fun buildBaseEnvironment(): Map<String, String> {
+        // Host Vortek ICD JSON — tells the Vulkan ICD loader where to find libvulkan_vortek.so
+        val hostIcdJson = "$fexHomeDir/.fex-emu/vortek_host_icd.json"
+
         return mapOf(
             // FEX reads Config.json from $HOME/.fex-emu/
             "HOME" to fexHomeDir,
@@ -532,6 +543,16 @@ class FexExecutor(private val context: Context) {
 
             // Library path for FEX native binaries
             "LD_LIBRARY_PATH" to fexLibPath,
+
+            // Vulkan host-side ICD configuration for thunks.
+            // When the host thunk calls dlopen("libvulkan.so.1"), the ICD loader
+            // reads these env vars to find the Vortek ICD JSON, which points to
+            // libvulkan_vortek.so (ARM64 glibc Vortek client).
+            "VK_ICD_FILENAMES" to hostIcdJson,
+            "VK_DRIVER_FILES" to hostIcdJson,
+
+            // Vortek socket path for the Vortek client to connect to VortekRenderer
+            "VORTEK_SERVER_PATH" to "$tmpDir/.vortek/V0",
 
             // Android system paths (accessible via FEX's host fallthrough)
             "ANDROID_ROOT" to "/system",

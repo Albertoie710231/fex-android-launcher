@@ -172,7 +172,7 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
     @Override
     public boolean handleRequest(ConnectedClient client) throws IOException {
         XInputStream inputStream = client.getInputStream();
-        if (inputStream.available() < 1) {
+        if (inputStream == null || inputStream.available() < 1) {
             return false;
         }
 

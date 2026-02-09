@@ -383,11 +383,18 @@ class ContainerManager(private val context: Context) {
     // ============================================================
 
     /**
-     * Write FEX config files (Config.json, thunks.json).
+     * Write FEX config files (Config.json, thunks.json, ThunksDB.json).
+     *
+     * Thunk configuration requires:
+     * - Config.json: ThunkHostLibs (ARM64 host thunks), ThunkGuestLibs (x86-64 guest thunks)
+     * - thunks.json: Which thunks to enable (GL, Vulkan)
+     * - ThunksDB.json: Database mapping library names to overlay paths
      */
     private fun writeFexConfig() {
         val configDir = File(fexHomeDir, ".fex-emu")
         configDir.mkdirs()
+
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
 
         // Point RootFS to the extracted rootfs directory
         // FEX looks in ~/.fex-emu/RootFS/<name>/ for the rootfs
@@ -406,26 +413,58 @@ class ContainerManager(private val context: Context) {
             }
         }
 
+        // ThunkHostLibs: ARM64 host thunk .so files (in nativeLibDir for SELinux exec)
+        // ThunkGuestLibs: x86-64 guest thunk .so files (HOST filesystem path, not rootfs-relative)
+        // FEX checks FHU::Filesystem::Exists() on HOST, so must be absolute HOST path
+        val thunkGuestLibsPath = "${fexRootfsDir.absolutePath}/opt/fex/share/fex-emu/GuestThunks"
+
         File(configDir, "Config.json").writeText("""
 {
   "Config": {
     "RootFS": "${SteamLauncherApp.FEX_ROOTFS_NAME}",
     "ThunkConfig": "${configDir.absolutePath}/thunks.json",
+    "ThunkHostLibs": "$nativeLibDir",
+    "ThunkGuestLibs": "$thunkGuestLibsPath",
     "X87ReducedPrecision": "1"
   }
 }
         """.trimIndent())
 
-        // Thunks config for GPU passthrough
-        val bundledThunks = File(fexDir, "config/thunks.json")
-        val thunksFile = File(configDir, "thunks.json")
-        if (bundledThunks.exists()) {
-            bundledThunks.copyTo(thunksFile, overwrite = true)
-        } else if (!thunksFile.exists()) {
-            thunksFile.writeText("""{"ThunksDB": {"GL": 1, "Vulkan": 1}}""")
-        }
+        // Thunks config: enable Vulkan passthrough, disable GL (no host GL available)
+        File(configDir, "thunks.json").writeText("""{"ThunksDB": {"GL": 0, "Vulkan": 1}}""")
+
+        // Deploy ThunksDB.json — FEX's LoadThunkDatabase() looks for it at
+        // $HOME/.fex-emu/ThunksDB.json on the HOST filesystem
+        deployThunksDB(configDir)
 
         Log.i(TAG, "FEX config written to $configDir")
+    }
+
+    /**
+     * Deploy ThunksDB.json from assets to the FEX config directory.
+     * This database maps library names (e.g. "Vulkan") to overlay paths
+     * that FEX intercepts with guest thunk libraries.
+     */
+    private fun deployThunksDB(configDir: File) {
+        val targetFile = File(configDir, "ThunksDB.json")
+        try {
+            context.assets.open("ThunksDB.json").use { input ->
+                FileOutputStream(targetFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            Log.i(TAG, "ThunksDB.json deployed to ${targetFile.absolutePath}")
+        } catch (e: IOException) {
+            Log.w(TAG, "ThunksDB.json not in assets, checking fex dir")
+            // Fallback: copy from extracted FEX binaries
+            val fallback = File(fexDir, "share/fex-emu/ThunksDB.json")
+            if (fallback.exists()) {
+                fallback.copyTo(targetFile, overwrite = true)
+                Log.i(TAG, "ThunksDB.json deployed from fex dir")
+            } else {
+                Log.e(TAG, "ThunksDB.json not found anywhere!")
+            }
+        }
     }
 
     // ============================================================
@@ -433,21 +472,87 @@ class ContainerManager(private val context: Context) {
     // ============================================================
 
     /**
-     * Setup Vortek Vulkan passthrough in the FEX rootfs.
+     * Setup Vortek Vulkan passthrough — both guest-side (rootfs) and host-side (ICD bridge).
+     *
+     * The Vulkan thunk chain works like this:
+     *   1. Guest x86-64 app calls libvulkan.so.1 → intercepted by FEX thunk overlay
+     *   2. Guest thunk (libvulkan-guest.so, x86-64) forwards to host thunk
+     *   3. Host thunk (libvulkan-host.so, ARM64) calls dlopen("libvulkan.so.1")
+     *   4. ARM64 Vulkan ICD loader (libvulkan_loader.so) reads VK_ICD_FILENAMES
+     *   5. ICD JSON points to libvulkan_vortek.so (Vortek client, ARM64 glibc)
+     *   6. Vortek client → Unix socket → VortekRenderer → Mali GPU
      */
     private fun setupVortek() {
-        // Write Vortek ICD JSON into FEX rootfs
+        // Guest-side: Write Vortek ICD JSON into FEX rootfs (for non-thunk fallback)
         VulkanBridge.setupVortekIcd(fexRootfsDir.absolutePath)
 
-        // Install Vortek client library into FEX rootfs
+        // Guest-side: Install Vortek client library into FEX rootfs (for non-thunk fallback)
         val libDir = File(fexRootfsDir, "lib")
         libDir.mkdirs()
         installVortekClient(libDir)
 
+        // Host-side: Setup Vulkan ICD bridge for thunks
+        setupVortekHostBridge()
+
         // Install Vulkan test tools
         installVulkanTools()
 
-        Log.i(TAG, "Vortek passthrough configured in FEX rootfs")
+        Log.i(TAG, "Vortek passthrough configured (guest + host)")
+    }
+
+    /**
+     * Setup the host-side Vulkan ICD bridge for FEX thunks.
+     *
+     * When the host thunk (libvulkan-host.so) calls dlopen("libvulkan.so.1"),
+     * it needs to find an ARM64 glibc-linked Vulkan ICD loader. We create:
+     *   1. Symlink: $fexDir/lib/libvulkan.so.1 → $nativeLibDir/libvulkan_loader.so
+     *   2. Host ICD JSON pointing to $nativeLibDir/libvulkan_vortek.so
+     *
+     * The symlink goes in $fexDir/lib/ which is already in LD_LIBRARY_PATH.
+     * The ICD JSON is referenced by VK_ICD_FILENAMES env var (set in FexExecutor).
+     */
+    private fun setupVortekHostBridge() {
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+        val configDir = File(fexHomeDir, ".fex-emu")
+        configDir.mkdirs()
+
+        // 1. Create symlink: $fexDir/lib/libvulkan.so.1 → nativeLibDir/libvulkan_loader.so
+        //    This is what the host thunk's dlopen("libvulkan.so.1") will find
+        val fexLibDir = File(fexDir, "lib")
+        fexLibDir.mkdirs()
+        val vulkanSymlink = File(fexLibDir, "libvulkan.so.1")
+        val vulkanLoaderSrc = File(nativeLibDir, "libvulkan_loader.so")
+
+        if (vulkanLoaderSrc.exists()) {
+            try {
+                vulkanSymlink.delete()
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", vulkanLoaderSrc.absolutePath, vulkanSymlink.absolutePath)
+                ).waitFor()
+                Log.i(TAG, "Host Vulkan ICD loader symlink: ${vulkanSymlink.absolutePath} → ${vulkanLoaderSrc.absolutePath}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create Vulkan loader symlink", e)
+            }
+        } else {
+            Log.w(TAG, "libvulkan_loader.so not found in nativeLibDir")
+        }
+
+        // 2. Create host ICD JSON pointing to Vortek ICD wrapper in nativeLibDir
+        //    The Vulkan ICD loader reads VK_ICD_FILENAMES to find this JSON,
+        //    then loads the library_path from it.
+        //    We use libvortek_icd_wrapper.so (not libvulkan_vortek.so directly) because
+        //    the Vortek library's vk_icdGetInstanceProcAddr returns NULL without
+        //    calling vortekInitOnce first. The wrapper handles this initialization.
+        val wrapperLibPath = "$nativeLibDir/libvortek_icd_wrapper.so"
+        val hostIcdJson = File(configDir, "vortek_host_icd.json")
+        hostIcdJson.writeText("""{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "$wrapperLibPath",
+        "api_version": "1.1.128"
+    }
+}""")
+        Log.i(TAG, "Host Vortek ICD JSON: ${hostIcdJson.absolutePath} → $wrapperLibPath")
     }
 
     /**
@@ -499,7 +604,7 @@ class ContainerManager(private val context: Context) {
                     FileOutputStream(targetFile).use { output ->
                         input.copyTo(output)
                     }
-                    targetFile.setExecutable(true)
+                    targetFile.setExecutable(true, false)
                     targetFile.setReadable(true, false)
                     Log.i(TAG, "$tool installed: ${targetFile.length()} bytes")
                 }
