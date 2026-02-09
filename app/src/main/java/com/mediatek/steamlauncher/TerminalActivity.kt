@@ -5,6 +5,9 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
@@ -28,6 +31,8 @@ class TerminalActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private lateinit var etCommand: EditText
     private lateinit var btnSend: Button
+    private lateinit var vulkanSurface: SurfaceView
+    private lateinit var btnDisplay: Button
 
     private val app: SteamLauncherApp by lazy { application as SteamLauncherApp }
     private val handler = Handler(Looper.getMainLooper())
@@ -39,6 +44,8 @@ class TerminalActivity : AppCompatActivity() {
     private var currentJob: Job? = null
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
     private var frameSocketServer: FrameSocketServer? = null
+    private var isDisplayMode = false
+    private var surfaceReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,6 +55,8 @@ class TerminalActivity : AppCompatActivity() {
         scrollView = findViewById(R.id.scrollView)
         etCommand = findViewById(R.id.etCommand)
         btnSend = findViewById(R.id.btnSend)
+        vulkanSurface = findViewById(R.id.vulkanSurface)
+        btnDisplay = findViewById(R.id.btnDisplay)
 
         currentDir = app.getFexHomeDir()
 
@@ -56,6 +65,30 @@ class TerminalActivity : AppCompatActivity() {
 
         // Start frame socket server for vkcube frame capture
         startFrameSocketServer()
+
+        // Wire up SurfaceView for real-time Vulkan display
+        vulkanSurface.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                surfaceReady = true
+                if (isDisplayMode) {
+                    frameSocketServer?.setOutputSurface(holder.surface)
+                    Log.i(TAG, "Vulkan display surface created and connected")
+                }
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                if (isDisplayMode) {
+                    frameSocketServer?.setOutputSurface(holder.surface)
+                    Log.i(TAG, "Vulkan display surface changed: ${width}x${height}")
+                }
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                surfaceReady = false
+                frameSocketServer?.setOutputSurface(null)
+                Log.i(TAG, "Vulkan display surface destroyed")
+            }
+        })
 
         setupUI()
         showWelcome()
@@ -76,6 +109,11 @@ class TerminalActivity : AppCompatActivity() {
             } else {
                 false
             }
+        }
+
+        // Display toggle button
+        btnDisplay.setOnClickListener {
+            toggleDisplayMode()
         }
 
         // Clear button
@@ -156,6 +194,30 @@ class TerminalActivity : AppCompatActivity() {
                 "HOME" to fexHomeDir,
                 "TMPDIR" to tmpDir
             ))
+        }
+    }
+
+    private fun toggleDisplayMode() {
+        isDisplayMode = !isDisplayMode
+
+        if (isDisplayMode) {
+            scrollView.visibility = View.GONE
+            vulkanSurface.visibility = View.VISIBLE
+            btnDisplay.text = "Terminal"
+
+            // Connect surface if already ready
+            if (surfaceReady) {
+                frameSocketServer?.setOutputSurface(vulkanSurface.holder.surface)
+            }
+            Log.i(TAG, "Switched to Vulkan display mode")
+        } else {
+            vulkanSurface.visibility = View.GONE
+            scrollView.visibility = View.VISIBLE
+            btnDisplay.text = "Display"
+
+            // Disconnect surface
+            frameSocketServer?.setOutputSurface(null)
+            Log.i(TAG, "Switched to terminal mode")
         }
     }
 
@@ -500,6 +562,7 @@ class TerminalActivity : AppCompatActivity() {
     override fun onDestroy() {
         currentJob?.cancel()
         scope.cancel()
+        frameSocketServer?.setOutputSurface(null)
         frameSocketServer?.stop()
         frameSocketServer = null
         VortekRenderer.stop()

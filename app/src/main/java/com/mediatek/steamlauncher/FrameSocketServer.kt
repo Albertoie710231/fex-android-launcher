@@ -183,9 +183,9 @@ class FrameSocketServer(private val port: Int = 19850) {
     private fun receiveFrames(socket: Socket) {
         Log.i(TAG, "Receiving frames from ${socket.inetAddress}")
 
-        // Start choreographer for display
+        // Ensure choreographer is running if surface is available
         if (outputSurface != null) {
-            startChoreographer()
+            handler.post { startChoreographer() }
         }
 
         val inputStream = socket.getInputStream()
@@ -260,7 +260,8 @@ class FrameSocketServer(private val port: Int = 19850) {
             }
         }
 
-        stopChoreographer()
+        // Note: don't stop choreographer here — its lifecycle is managed by setOutputSurface().
+        // Stopping it here races with new receiver threads and kills the choreographer prematurely.
         Log.i(TAG, "Frame receiver ended")
     }
 
