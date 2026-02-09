@@ -591,25 +591,16 @@ class ContainerManager(private val context: Context) {
     }
 
     /**
-     * Install Vulkan test tools (vkcube, vulkaninfo) into FEX rootfs.
+     * Clean up any stale ARM64 Vulkan tools that shadow the x86-64 rootfs versions.
+     * The rootfs already has x86-64 vulkaninfo/vkcube at /usr/bin/ from Ubuntu packages.
      */
     private fun installVulkanTools() {
         val binDir = File(fexRootfsDir, "usr/local/bin")
-        binDir.mkdirs()
-
         for (tool in listOf("vkcube", "vulkaninfo")) {
-            try {
-                context.assets.open(tool).use { input ->
-                    val targetFile = File(binDir, tool)
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output)
-                    }
-                    targetFile.setExecutable(true, false)
-                    targetFile.setReadable(true, false)
-                    Log.i(TAG, "$tool installed: ${targetFile.length()} bytes")
-                }
-            } catch (e: IOException) {
-                Log.d(TAG, "$tool not in assets: ${e.message}")
+            val stale = File(binDir, tool)
+            if (stale.exists()) {
+                stale.delete()
+                Log.i(TAG, "Removed stale ARM64 $tool from /usr/local/bin (rootfs has x86-64 version)")
             }
         }
     }
