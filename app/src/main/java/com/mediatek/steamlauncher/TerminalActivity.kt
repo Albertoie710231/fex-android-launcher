@@ -60,6 +60,9 @@ class TerminalActivity : AppCompatActivity() {
 
         currentDir = app.getFexHomeDir()
 
+        // Refresh paths that go stale after APK reinstall (nativeLibDir changes)
+        app.containerManager.refreshNativeLibPaths()
+
         // Start VortekRenderer for Vulkan passthrough (doesn't need a surface)
         startVortekRenderer()
 

@@ -89,6 +89,62 @@ class ContainerManager(private val context: Context) {
     }
 
     // ============================================================
+    // Path Refresh (after APK reinstall)
+    // ============================================================
+
+    /**
+     * Update Config.json, libvulkan.so.1 symlink, and vortek_host_icd.json
+     * with the current nativeLibDir. Must be called on every activity launch
+     * because nativeLibDir changes with each APK install.
+     */
+    fun refreshNativeLibPaths() {
+        val configFile = File(fexHomeDir, ".fex-emu/Config.json")
+        if (!configFile.exists()) return  // setup hasn't run yet
+
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+
+        // 1. Update Config.json ThunkHostLibs
+        val configDir = File(fexHomeDir, ".fex-emu")
+        val thunkGuestLibsPath = "${fexRootfsDir.absolutePath}/opt/fex/share/fex-emu/GuestThunks"
+        configFile.writeText("""{
+  "Config": {
+    "RootFS": "${SteamLauncherApp.FEX_ROOTFS_NAME}",
+    "ThunkConfig": "${configDir.absolutePath}/thunks.json",
+    "ThunkHostLibs": "$nativeLibDir",
+    "ThunkGuestLibs": "$thunkGuestLibsPath",
+    "X87ReducedPrecision": "1"
+  }
+}""")
+
+        // 2. Update libvulkan.so.1 symlink → nativeLibDir/libvulkan_loader.so
+        val vulkanSymlink = File(fexDir, "lib/libvulkan.so.1")
+        val vulkanLoaderSrc = File(nativeLibDir, "libvulkan_loader.so")
+        if (vulkanLoaderSrc.exists()) {
+            try {
+                vulkanSymlink.delete()
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", vulkanLoaderSrc.absolutePath, vulkanSymlink.absolutePath)
+                ).waitFor()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to update Vulkan loader symlink", e)
+            }
+        }
+
+        // 3. Update vortek_host_icd.json → nativeLibDir/libvortek_icd_wrapper.so
+        val hostIcdJson = File(configDir, "vortek_host_icd.json")
+        val wrapperLibPath = "$nativeLibDir/libvortek_icd_wrapper.so"
+        hostIcdJson.writeText("""{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "$wrapperLibPath",
+        "api_version": "1.1.128"
+    }
+}""")
+
+        Log.i(TAG, "Refreshed nativeLibDir paths: $nativeLibDir")
+    }
+
+    // ============================================================
     // Container Setup
     // ============================================================
 
