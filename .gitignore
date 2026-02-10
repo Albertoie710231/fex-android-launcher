@@ -45,3 +45,6 @@ fex-emu/*.deb
 
 # Pre-patch backup
 app/src/main/jniLibs/arm64-v8a/*.orig
+
+# SteamCMD extracted binaries (regenerate from Docker)
+steamcmd_out/
