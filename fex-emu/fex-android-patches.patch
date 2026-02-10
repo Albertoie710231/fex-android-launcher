@@ -1,0 +1,1748 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 59f976b..3e6b940 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,9 +68,10 @@ elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+ endif()
+ 
+ ## Compiler Checks ##
+-# GCC and MSVC are unsupported
++# GCC check relaxed for QEMU ARM64 builds (clang segfaults under QEMU emulation)
+ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+-  message(FATAL_ERROR "FEX doesn't support GCC! Use Clang instead.")
++  message(WARNING "FEX officially requires Clang, but allowing GCC for QEMU cross-build.")
++  message(STATUS "GCC version ${CMAKE_CXX_COMPILER_VERSION}")
+ elseif (MSVC)
+   message(FATAL_ERROR "FEX doesn't support MSVC! Use Clang on MinGW instead.")
+ elseif (MINGW)
+@@ -593,13 +594,24 @@ endif()
+ 
+ if (BUILD_THUNKS)
+   set(FEX_PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
+-  add_subdirectory(ThunkLibs/Generator)
++
++  if (THUNKGEN_PATH)
++    # Import pre-built thunkgen for cross-compilation scenarios where
++    # thunkgen must run on the build host but cmake targets a different arch.
++    add_executable(thunkgen IMPORTED GLOBAL)
++    set_target_properties(thunkgen PROPERTIES IMPORTED_LOCATION "${THUNKGEN_PATH}")
++  else()
++    add_subdirectory(ThunkLibs/Generator)
++  endif()
+ 
+   # Thunk targets for both host libraries and IDE integration
+   add_subdirectory(ThunkLibs/HostLibs)
+ 
+   # Thunk targets for IDE integration of guest code, only
+-  add_subdirectory(ThunkLibs/GuestLibs)
++  # Skip when cross-compiling (headers for guest arch won't be in host sysroot)
++  if (NOT THUNKGEN_PATH)
++    add_subdirectory(ThunkLibs/GuestLibs)
++  endif()
+ 
+   # Thunk targets for guest libraries
+   include(ExternalProject)
+@@ -621,23 +633,25 @@ if (BUILD_THUNKS)
+     BUILD_ALWAYS ON
+     DEPENDS thunkgen)
+ 
+-  ExternalProject_Add(guest-libs-32
+-    PREFIX guest-libs-32
+-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
+-    BINARY_DIR "Guest_32"
+-    CMAKE_ARGS
+-      "-DBITNESS=32"
+-      "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+-      "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
+-      "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
+-      "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
+-      "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
+-      "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
+-      "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
+-      "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
+-    INSTALL_COMMAND ""
+-    BUILD_ALWAYS ON
+-    DEPENDS thunkgen)
++  if (NOT SKIP_THUNKS_32)
++    ExternalProject_Add(guest-libs-32
++      PREFIX guest-libs-32
++      SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
++      BINARY_DIR "Guest_32"
++      CMAKE_ARGS
++        "-DBITNESS=32"
++        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
++        "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
++        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
++        "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
++        "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
++        "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
++        "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
++        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
++      INSTALL_COMMAND ""
++      BUILD_ALWAYS ON
++      DEPENDS thunkgen)
++  endif()
+ 
+   install(
+     CODE "message(\"-- Installing: guest-libs\")"
+@@ -647,24 +661,30 @@ if (BUILD_THUNKS)
+     DEPENDS guest-libs
+     COMPONENT Runtime)
+ 
+-  install(
+-    CODE "message(\"-- Installing: guest-libs-32\")"
+-    CODE "
+-      execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
+-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
+-    DEPENDS guest-libs-32
+-    COMPONENT Runtime)
++  if (NOT SKIP_THUNKS_32)
++    install(
++      CODE "message(\"-- Installing: guest-libs-32\")"
++      CODE "
++        execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
++          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
++      DEPENDS guest-libs-32
++      COMPONENT Runtime)
++  endif()
+ 
+   add_custom_target(uninstall_guest-libs
+     COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)
+ 
+-  add_custom_target(uninstall_guest-libs-32
+-    COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
+-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
++  if (NOT SKIP_THUNKS_32)
++    add_custom_target(uninstall_guest-libs-32
++      COMMAND ${CMAKE_COMMAND} "--build" "." "--target" "uninstall"
++      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)
++  endif()
+ 
+   add_dependencies(uninstall uninstall_guest-libs)
+-  add_dependencies(uninstall uninstall_guest-libs-32)
++  if (NOT SKIP_THUNKS_32 AND TARGET uninstall_guest-libs-32)
++    add_dependencies(uninstall uninstall_guest-libs-32)
++  endif()
+ endif()
+ 
+ if (BUILD_STEAM_SUPPORT)
+diff --git a/FEXCore/Source/Utils/LogManager.cpp b/FEXCore/Source/Utils/LogManager.cpp
+index 002bb62..e9cdfcc 100644
+--- a/FEXCore/Source/Utils/LogManager.cpp
++++ b/FEXCore/Source/Utils/LogManager.cpp
+@@ -9,6 +9,85 @@ $end_info$
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/fextl/fmt.h>
+ 
++// Android seccomp workaround: Install SIGSYS handler as early as possible.
++// Android's zygote-inherited seccomp filter kills processes that make
++// non-whitelisted syscalls. This handler catches SIGSYS (SECCOMP_RET_TRAP)
++// and returns -ENOSYS instead of letting the process die.
++// Placed in libFEXCore.so so it runs before the main FEX binary's constructors.
++#if defined(__linux__) && defined(__aarch64__)
++#include <signal.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <ucontext.h>
++#include <stdio.h>
++#include <sys/socket.h>
++#include <sys/syscall.h>
++
++static void fexcore_sigsys_handler(int sig, siginfo_t *info, void *ucontext) {
++  ucontext_t *ctx = (ucontext_t *)ucontext;
++
++  switch (info->si_syscall) {
++  case 202: { // __NR_accept → __NR_accept4 with flags=0
++    long result = syscall(242 /* __NR_accept4 */,
++      (int)ctx->uc_mcontext.regs[0],
++      (struct sockaddr *)ctx->uc_mcontext.regs[1],
++      (socklen_t *)ctx->uc_mcontext.regs[2],
++      0);
++    ctx->uc_mcontext.regs[0] = (result == -1)
++      ? (uint64_t)(-(long)errno)
++      : (uint64_t)result;
++    return;
++  }
++  case 99: // __NR_set_robust_list — silently return success
++    ctx->uc_mcontext.regs[0] = 0;
++    return;
++  case 439: { // __NR_faccessat2 → __NR_faccessat (drop flags arg)
++    long result = syscall(48 /* __NR_faccessat */,
++      (int)ctx->uc_mcontext.regs[0],           // dirfd
++      (const char *)ctx->uc_mcontext.regs[1],   // pathname
++      (int)ctx->uc_mcontext.regs[2]);            // mode
++    ctx->uc_mcontext.regs[0] = (result == -1)
++      ? (uint64_t)(-(long)errno)
++      : (uint64_t)result;
++    return;
++  }
++  case 437: { // __NR_openat2 → __NR_openat (fallback without resolve flags)
++    // openat2(dirfd, pathname, open_how*, size) → openat(dirfd, pathname, flags, mode)
++    // struct open_how { u64 flags; u64 mode; u64 resolve; } at regs[2]
++    int dirfd = (int)ctx->uc_mcontext.regs[0];
++    const char *pathname = (const char *)ctx->uc_mcontext.regs[1];
++    uint64_t *how = (uint64_t *)ctx->uc_mcontext.regs[2];
++    int flags = (int)how[0];      // open_how.flags
++    unsigned mode = (unsigned)how[1]; // open_how.mode
++    long result = syscall(56 /* __NR_openat */, dirfd, pathname, flags, mode);
++    ctx->uc_mcontext.regs[0] = (result == -1)
++      ? (uint64_t)(-(long)errno)
++      : (uint64_t)result;
++    return;
++  }
++  default: {
++    char buf[256];
++    int len = snprintf(buf, sizeof(buf),
++      "FEX SECCOMP: unhandled blocked syscall %d (arch=0x%x)\n",
++      info->si_syscall, info->si_arch);
++    write(STDERR_FILENO, buf, len);
++    ctx->uc_mcontext.regs[0] = (uint64_t)(-ENOSYS);
++    return;
++  }
++  }
++}
++
++__attribute__((constructor(101)))
++static void fexcore_install_sigsys_handler() {
++  struct sigaction sa;
++  memset(&sa, 0, sizeof(sa));
++  sa.sa_sigaction = fexcore_sigsys_handler;
++  sa.sa_flags = SA_SIGINFO;
++  sigaction(SIGSYS, &sa, NULL);
++}
++#endif
++
+ namespace LogMan {
+ 
+ namespace Throw {
+diff --git a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
+index 71bd915..2d69cc0 100644
+--- a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
++++ b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
+@@ -53,11 +53,41 @@ $end_info$
+ #include <mutex>
+ #include <queue>
+ #include <set>
++#include <signal.h>
+ #include <sys/auxv.h>
+ #include <sys/prctl.h>
+ #include <sys/resource.h>
+ #include <sys/select.h>
+ #include <system_error>
++
++// Android seccomp SIGSYS handler: catches blocked syscalls and logs them
++// instead of silently killing the process.
++static void android_sigsys_handler(int sig, siginfo_t *info, void *ucontext) {
++  // si_syscall = the blocked syscall number, si_arch = architecture
++  char buf[256];
++  int len = snprintf(buf, sizeof(buf),
++    "FEX SECCOMP: blocked syscall %d (arch=0x%x, code=%d, errno=%d)\n",
++    info->si_syscall, info->si_arch, info->si_code, info->si_errno);
++  write(STDERR_FILENO, buf, len);
++  // Return ENOSYS to the caller instead of dying
++  // This only works with SECCOMP_RET_TRAP (not SECCOMP_RET_KILL)
++  // Set the return value register to -ENOSYS
++#if defined(__aarch64__)
++  ucontext_t *ctx = (ucontext_t *)ucontext;
++  ctx->uc_mcontext.regs[0] = (uint64_t)(-ENOSYS);  // x0 = return value
++#endif
++}
++
++// Use constructor attribute to install BEFORE main() — the blocked syscall
++// may happen during static initialization or library constructors.
++__attribute__((constructor(101)))
++static void install_android_sigsys_handler() {
++  struct sigaction sa;
++  memset(&sa, 0, sizeof(sa));
++  sa.sa_sigaction = android_sigsys_handler;
++  sa.sa_flags = SA_SIGINFO;
++  sigaction(SIGSYS, &sa, NULL);
++}
+ #include <thread>
+ #include <unistd.h>
+ #include <utility>
+@@ -367,6 +397,8 @@ static int StealFEXFDFromEnv(const char* Env) {
+ }
+ 
+ int main(int argc, char** argv, char** const envp) {
++  // SIGSYS handler already installed via __attribute__((constructor))
++
+   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
+   FEXCore::Allocator::GLIBCScopedFault GLIBFaultScope;
+ 
+diff --git a/Source/Tools/FEXServer/Main.cpp b/Source/Tools/FEXServer/Main.cpp
+index c089dc4..fd99b71 100644
+--- a/Source/Tools/FEXServer/Main.cpp
++++ b/Source/Tools/FEXServer/Main.cpp
+@@ -29,8 +29,52 @@
+ #include <sys/wait.h>
+ #include <termios.h>
+ #include <thread>
++#include <errno.h>
++#include <signal.h>
++#include <sys/syscall.h>
+ #include <unistd.h>
+ 
++// Android seccomp SIGSYS handler for FEXServer
++// Redirects blocked syscalls to allowed equivalents where possible.
++// Android seccomp (from zygote) blocks accept(202) but allows accept4(242).
++static void android_sigsys_handler(int sig, siginfo_t *info, void *ucontext) {
++#if defined(__aarch64__)
++  ucontext_t *ctx = (ucontext_t *)ucontext;
++
++  switch (info->si_syscall) {
++  case 202: { // __NR_accept (blocked) → __NR_accept4 (allowed) with flags=0
++    // Kernel's syscall_rollback() restored original args in registers
++    int sockfd = (int)ctx->uc_mcontext.regs[0];
++    struct sockaddr *addr = (struct sockaddr *)ctx->uc_mcontext.regs[1];
++    socklen_t *addrlen = (socklen_t *)ctx->uc_mcontext.regs[2];
++    long result = syscall(242 /* __NR_accept4 */, sockfd, addr, addrlen, 0);
++    ctx->uc_mcontext.regs[0] = (result == -1)
++      ? (uint64_t)(-(long)errno)
++      : (uint64_t)result;
++    return;
++  }
++  default: {
++    char buf[256];
++    int len = snprintf(buf, sizeof(buf),
++      "FEXServer SECCOMP: unhandled blocked syscall %d (arch=0x%x)\n",
++      info->si_syscall, info->si_arch);
++    write(STDERR_FILENO, buf, len);
++    ctx->uc_mcontext.regs[0] = (uint64_t)(-ENOSYS);
++    return;
++  }
++  }
++#endif
++}
++
++__attribute__((constructor(101)))
++static void install_android_sigsys_handler() {
++  struct sigaction sa;
++  memset(&sa, 0, sizeof(sa));
++  sa.sa_sigaction = android_sigsys_handler;
++  sa.sa_flags = SA_SIGINFO;
++  sigaction(SIGSYS, &sa, NULL);
++}
++
+ static timespec StartTime {};
+ 
+ // Set an empty style to disable coloring when FEXServer output is e.g. piped to a file
+@@ -122,6 +166,8 @@ void DeparentSelf() {
+ } // namespace
+ 
+ int main(int argc, char** argv, char** const envp) {
++  // SIGSYS handler already installed via __attribute__((constructor))
++
+   auto Options = FEXServer::Config::Load(argc, argv);
+ 
+   SetupSignals();
+diff --git a/Source/Tools/LinuxEmulation/CMakeLists.txt b/Source/Tools/LinuxEmulation/CMakeLists.txt
+index 715a8f1..ad1e572 100644
+--- a/Source/Tools/LinuxEmulation/CMakeLists.txt
++++ b/Source/Tools/LinuxEmulation/CMakeLists.txt
+@@ -53,6 +53,7 @@ add_library(LinuxEmulation STATIC
+   LinuxSyscalls/Syscalls/FD.cpp
+   LinuxSyscalls/Syscalls/FS.cpp
+   LinuxSyscalls/Syscalls/Passthrough.cpp
++  LinuxSyscalls/Syscalls/SysVIPC.cpp
+   LinuxSyscalls/Syscalls/Info.cpp
+   LinuxSyscalls/Syscalls/IO.cpp
+   LinuxSyscalls/Syscalls/Memory.cpp
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp
+index 8cc6ce4..16cf238 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp
+@@ -34,6 +34,7 @@ $end_info$
+ #include <filesystem>
+ #include <optional>
+ #include <stdio.h>
++#include <sys/sendfile.h>
+ #include <sys/stat.h>
+ #include <sys/statfs.h>
+ #include <sys/xattr.h>
+@@ -605,21 +606,13 @@ std::optional<std::string_view> FileManager::GetSelf(const char* Pathname) const
+ }
+ 
+ static bool ShouldSkipOpenInEmu(int flags) {
+-  if (flags & O_CREAT) {
+-    // If trying to create a file then skip checking in emufd
+-    return true;
+-  }
+-
+-  if (flags & O_WRONLY) {
+-    // If the file is trying to be open with write permissions then skip.
+-    return true;
+-  }
+-
+-  if (flags & O_APPEND) {
+-    // If the file is trying to be open with append options then skip.
+-    return true;
+-  }
+-
++  // On Android, the rootfs is an extracted writable directory (not squashfs).
++  // Allow write operations to go through the rootfs overlay first — the openat2
++  // call will fail gracefully if the rootfs is actually read-only, and we fall
++  // back to the host path anyway.
++  // Original FEX skips writes because squashfs is read-only, but that causes
++  // all writes to go to Android's root filesystem (also read-only), breaking
++  // apt-get, package installation, and any guest-side file creation.
+   return false;
+ }
+ 
+@@ -1010,6 +1003,180 @@ uint64_t FileManager::Mknod(const char* pathname, mode_t mode, dev_t dev) {
+   return ::mknod(SelfPath, mode, dev);
+ }
+ 
++// Android rootfs overlay: when a path resolves through the overlay, the overlay
++// result is authoritative. We must NOT fall through to the raw host path, because
++// the raw path (e.g. /var/lib/dpkg/) doesn't exist on Android's filesystem.
++// Falling through would return wrong errno values (ENOENT instead of EEXIST etc.)
++// which breaks tools like dpkg that rely on correct error codes.
++
++uint64_t FileManager::Mkdir(const char* pathname, mode_t mode) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(AT_FDCWD, pathname, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::mkdirat(Path.FD, Path.Path, mode);
++  }
++  return ::mkdir(pathname, mode);
++}
++
++uint64_t FileManager::Mkdirat(int dirfd, const char* pathname, mode_t mode) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(dirfd, pathname, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::mkdirat(Path.FD, Path.Path, mode);
++  }
++  return ::mkdirat(dirfd, pathname, mode);
++}
++
++uint64_t FileManager::Rmdir(const char* pathname) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(AT_FDCWD, pathname, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::unlinkat(Path.FD, Path.Path, AT_REMOVEDIR);
++  }
++  return ::rmdir(pathname);
++}
++
++uint64_t FileManager::Unlink(const char* pathname) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(AT_FDCWD, pathname, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::unlinkat(Path.FD, Path.Path, 0);
++  }
++  return ::unlink(pathname);
++}
++
++uint64_t FileManager::Unlinkat(int dirfd, const char* pathname, int flags) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(dirfd, pathname, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::unlinkat(Path.FD, Path.Path, flags);
++  }
++  return ::unlinkat(dirfd, pathname, flags);
++}
++
++uint64_t FileManager::Symlink(const char* target, const char* linkpath) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(AT_FDCWD, linkpath, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::symlinkat(target, Path.FD, Path.Path);
++  }
++  return ::symlink(target, linkpath);
++}
++
++uint64_t FileManager::Symlinkat(const char* target, int newdirfd, const char* linkpath) {
++  FDPathTmpData TmpFilename;
++  auto Path = GetEmulatedFDPath(newdirfd, linkpath, false, TmpFilename);
++  if (Path.FD != -1) {
++    return ::symlinkat(target, Path.FD, Path.Path);
++  }
++  return ::symlinkat(target, newdirfd, linkpath);
++}
++
++// Android: hard links may be blocked by SELinux in app data directories.
++// When linkat fails with EPERM or EACCES, fall back to copy semantics so that
++// dpkg backup links work. If copy also fails, silently succeed — dpkg
++// backup links are not critical for correctness, only for crash recovery.
++static uint64_t LinkatWithCopyFallback(int old_fd, const char* old_p,
++                                        int new_fd, const char* new_p, int flags) {
++  uint64_t Result = ::linkat(old_fd, old_p, new_fd, new_p, flags);
++  if (Result == 0 || (errno != EPERM && errno != EACCES)) {
++    return Result;
++  }
++  // EPERM/EACCES: try to copy the file instead of hard linking
++  int src = ::openat(old_fd, old_p, O_RDONLY | O_CLOEXEC);
++  if (src < 0) return 0; // Can't open source — silently succeed
++  struct stat st;
++  if (::fstat(src, &st) != 0) { ::close(src); return 0; }
++  int dst = ::openat(new_fd, new_p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode);
++  if (dst < 0) { ::close(src); return 0; }
++  // Use sendfile for efficient kernel-space copy
++  off_t offset = 0;
++  ssize_t remaining = st.st_size;
++  while (remaining > 0) {
++    ssize_t copied = ::sendfile(dst, src, &offset, remaining);
++    if (copied <= 0) break;
++    remaining -= copied;
++  }
++  ::close(dst);
++  ::close(src);
++  return 0;
++}
++
++uint64_t FileManager::Link(const char* oldpath, const char* newpath) {
++  FDPathTmpData TmpFilename;
++  auto OldPath = GetEmulatedFDPath(AT_FDCWD, oldpath, true, TmpFilename);
++
++  FDPathTmpData TmpFilename2;
++  auto NewPath = GetEmulatedFDPath(AT_FDCWD, newpath, false, TmpFilename2);
++
++  int old_fd = (OldPath.FD != -1) ? OldPath.FD : AT_FDCWD;
++  const char* old_p = (OldPath.FD != -1) ? OldPath.Path : oldpath;
++  int new_fd = (NewPath.FD != -1) ? NewPath.FD : AT_FDCWD;
++  const char* new_p = (NewPath.FD != -1) ? NewPath.Path : newpath;
++
++  return LinkatWithCopyFallback(old_fd, old_p, new_fd, new_p, 0);
++}
++
++uint64_t FileManager::Linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
++  FDPathTmpData TmpFilename;
++  auto OldPath = GetEmulatedFDPath(olddirfd, oldpath, (flags & AT_SYMLINK_FOLLOW) != 0, TmpFilename);
++
++  FDPathTmpData TmpFilename2;
++  auto NewPath = GetEmulatedFDPath(newdirfd, newpath, false, TmpFilename2);
++
++  int old_fd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
++  const char* old_p = (OldPath.FD != -1) ? OldPath.Path : oldpath;
++  int new_fd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
++  const char* new_p = (NewPath.FD != -1) ? NewPath.Path : newpath;
++
++  return LinkatWithCopyFallback(old_fd, old_p, new_fd, new_p, flags);
++}
++
++uint64_t FileManager::Rename(const char* oldpath, const char* newpath) {
++  FDPathTmpData TmpFilename;
++  auto OldPath = GetEmulatedFDPath(AT_FDCWD, oldpath, false, TmpFilename);
++
++  FDPathTmpData TmpFilename2;
++  auto NewPath = GetEmulatedFDPath(AT_FDCWD, newpath, false, TmpFilename2);
++
++  int old_fd = (OldPath.FD != -1) ? OldPath.FD : AT_FDCWD;
++  const char* old_p = (OldPath.FD != -1) ? OldPath.Path : oldpath;
++  int new_fd = (NewPath.FD != -1) ? NewPath.FD : AT_FDCWD;
++  const char* new_p = (NewPath.FD != -1) ? NewPath.Path : newpath;
++
++  return ::syscall(SYSCALL_DEF(renameat2), old_fd, old_p, new_fd, new_p, 0);
++}
++
++uint64_t FileManager::Renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
++  FDPathTmpData TmpFilename;
++  auto OldPath = GetEmulatedFDPath(olddirfd, oldpath, false, TmpFilename);
++
++  FDPathTmpData TmpFilename2;
++  auto NewPath = GetEmulatedFDPath(newdirfd, newpath, false, TmpFilename2);
++
++  int old_fd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
++  const char* old_p = (OldPath.FD != -1) ? OldPath.Path : oldpath;
++  int new_fd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
++  const char* new_p = (NewPath.FD != -1) ? NewPath.Path : newpath;
++
++  return ::syscall(SYSCALL_DEF(renameat), old_fd, old_p, new_fd, new_p);
++}
++
++uint64_t FileManager::Renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags) {
++  FDPathTmpData TmpFilename;
++  auto OldPath = GetEmulatedFDPath(olddirfd, oldpath, false, TmpFilename);
++
++  FDPathTmpData TmpFilename2;
++  auto NewPath = GetEmulatedFDPath(newdirfd, newpath, false, TmpFilename2);
++
++  int old_fd = (OldPath.FD != -1) ? OldPath.FD : olddirfd;
++  const char* old_p = (OldPath.FD != -1) ? OldPath.Path : oldpath;
++  int new_fd = (NewPath.FD != -1) ? NewPath.FD : newdirfd;
++  const char* new_p = (NewPath.FD != -1) ? NewPath.Path : newpath;
++
++  return ::syscall(SYSCALL_DEF(renameat2), old_fd, old_p, new_fd, new_p, flags);
++}
++
+ uint64_t FileManager::Statfs(const char* path, void* buf) {
+   auto Path = GetEmulatedPath(path);
+   if (!Path.empty()) {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.h b/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.h
+index b11f096..1e9911e 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.h
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.h
+@@ -69,6 +69,18 @@ public:
+   uint64_t Openat2(int dirfs, const char* pathname, FEX::HLE::open_how* how, size_t usize);
+   uint64_t Statx(int dirfd, const char* pathname, int flags, uint32_t mask, struct statx* statxbuf);
+   uint64_t Mknod(const char* pathname, mode_t mode, dev_t dev);
++  uint64_t Mkdir(const char* pathname, mode_t mode);
++  uint64_t Mkdirat(int dirfd, const char* pathname, mode_t mode);
++  uint64_t Rmdir(const char* pathname);
++  uint64_t Unlink(const char* pathname);
++  uint64_t Unlinkat(int dirfd, const char* pathname, int flags);
++  uint64_t Symlink(const char* target, const char* linkpath);
++  uint64_t Symlinkat(const char* target, int newdirfd, const char* linkpath);
++  uint64_t Link(const char* oldpath, const char* newpath);
++  uint64_t Linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags);
++  uint64_t Rename(const char* oldpath, const char* newpath);
++  uint64_t Renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath);
++  uint64_t Renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags);
+   uint64_t NewFSStatAt(int dirfd, const char* pathname, struct stat* buf, int flag);
+   uint64_t NewFSStatAt64(int dirfd, const char* pathname, struct stat64* buf, int flag);
+   uint64_t Setxattr(const char* path, const char* name, const void* value, size_t size, int flags);
+@@ -101,6 +113,7 @@ public:
+ 
+   fextl::string GetEmulatedPath(const char* pathname, bool FollowSymlink = false) const;
+   fextl::string GetHostPath(fextl::string& Path, bool AliasedOnly) const;
++  ssize_t StripRootFSPrefix(char* pathname, ssize_t len, bool leaky) const;
+ 
+   bool ReplaceEmuFd(int fd, int flags, uint32_t mode);
+ 
+@@ -167,7 +180,6 @@ private:
+ 
+   bool RootFSPathExists(const char* Filepath) const;
+   size_t GetRootFSPrefixLen(const char* pathname, size_t len, bool AliasedOnly) const;
+-  ssize_t StripRootFSPrefix(char* pathname, ssize_t len, bool leaky) const;
+ 
+   struct ThunkDBObject {
+     fextl::string LibraryName;
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.cpp
+index bf6a5a0..3064dce 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.cpp
+@@ -439,7 +439,27 @@ uint64_t ExecveHandler(FEXCore::Core::CpuStateFrame* Frame, const char* pathname
+     ExecveArgs.emplace_back(nullptr);
+   }
+ 
+-  Result = ::syscall(SYS_execveat, Args.dirfd, "/proc/self/exe", const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
++  // On Android, FEX binaries live in nativeLibraryDir (for SELinux exec permission)
++  // but have PT_INTERP=/lib/ld-linux-aarch64.so.1 which doesn't exist. We must
++  // re-exec through the ld.so wrapper. FEX_SELF_LDSO and FEX_SELF_LIBPATH tell us
++  // how to invoke ld.so; without them, fall back to /proc/self/exe (standard Linux).
++  const char* ldso_path = getenv("FEX_SELF_LDSO");
++  const char* ldso_libpath = getenv("FEX_SELF_LIBPATH");
++
++  if (ldso_path && ldso_libpath) {
++    // Re-exec via: ld.so --library-path <path> <ExecveArgs...>
++    // ExecveArgs already contains [FEX_binary, guest_binary, args..., nullptr]
++    fextl::vector<const char*> WrapArgs;
++    WrapArgs.emplace_back(ldso_path);
++    WrapArgs.emplace_back("--library-path");
++    WrapArgs.emplace_back(ldso_libpath);
++    for (size_t i = 0; i < ExecveArgs.size(); ++i) {
++      WrapArgs.emplace_back(ExecveArgs[i]);
++    }
++    Result = ::syscall(SYS_execveat, Args.dirfd, ldso_path, const_cast<char* const*>(WrapArgs.data()), EnvpPtr, Args.flags);
++  } else {
++    Result = ::syscall(SYS_execveat, Args.dirfd, "/proc/self/exe", const_cast<char* const*>(ExecveArgs.data()), EnvpPtr, Args.flags);
++  }
+   CloseSeccompFD();
+   CloseFDExecFD();
+ 
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h
+index 0e3f3ae..d1be6c3 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls.h
+@@ -653,7 +653,15 @@ inline static uint64_t futimesat_compat(int dirfd, const char* pathname, const T
+     tv_ptr = tvs;
+   }
+ 
+-  uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, tv_ptr, 0);
++  // Android rootfs overlay: resolve pathname through rootfs
++  const char* resolved = pathname;
++  int resolved_dirfd = dirfd;
++  auto EmulatedPath = pathname ? FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true) : fextl::string{};
++  if (!EmulatedPath.empty()) {
++    resolved = EmulatedPath.c_str();
++    resolved_dirfd = AT_FDCWD;
++  }
++  uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), resolved_dirfd, resolved, tv_ptr, 0);
+   SYSCALL_ERRNO();
+ }
+ 
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FD.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FD.cpp
+index a137c43..358afe0 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FD.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FD.cpp
+@@ -51,14 +51,13 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     SYSCALL_ERRNO();
+   });
+ 
++  // Android fake root: chown/lchown silently succeed (app can't change ownership)
+   REGISTER_SYSCALL_IMPL(chown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
+-    uint64_t Result = ::chown(pathname, owner, group);
+-    SYSCALL_ERRNO();
++    return 0;
+   });
+ 
+   REGISTER_SYSCALL_IMPL(lchown, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
+-    uint64_t Result = ::lchown(pathname, owner, group);
+-    SYSCALL_ERRNO();
++    return 0;
+   });
+ 
+   REGISTER_SYSCALL_IMPL(access, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, int mode) -> uint64_t {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FS.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FS.cpp
+index 98fe3d3..1e868f1 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FS.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/FS.cpp
+@@ -26,32 +26,32 @@ void RegisterFS(FEX::HLE::SyscallHandler* Handler) {
+   using namespace FEXCore::IR;
+ 
+   REGISTER_SYSCALL_IMPL(rename, [](FEXCore::Core::CpuStateFrame* Frame, const char* oldpath, const char* newpath) -> uint64_t {
+-    uint64_t Result = ::rename(oldpath, newpath);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Rename(oldpath, newpath);
+     SYSCALL_ERRNO();
+   });
+ 
+   REGISTER_SYSCALL_IMPL(mkdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, mode_t mode) -> uint64_t {
+-    uint64_t Result = ::mkdir(pathname, mode);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Mkdir(pathname, mode);
+     SYSCALL_ERRNO();
+   });
+ 
+   REGISTER_SYSCALL_IMPL(rmdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname) -> uint64_t {
+-    uint64_t Result = ::rmdir(pathname);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Rmdir(pathname);
+     SYSCALL_ERRNO();
+   });
+ 
+   REGISTER_SYSCALL_IMPL(link, [](FEXCore::Core::CpuStateFrame* Frame, const char* oldpath, const char* newpath) -> uint64_t {
+-    uint64_t Result = ::link(oldpath, newpath);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Link(oldpath, newpath);
+     SYSCALL_ERRNO();
+   });
+ 
+   REGISTER_SYSCALL_IMPL(unlink, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname) -> uint64_t {
+-    uint64_t Result = ::unlink(pathname);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Unlink(pathname);
+     SYSCALL_ERRNO();
+   });
+ 
+   REGISTER_SYSCALL_IMPL(symlink, [](FEXCore::Core::CpuStateFrame* Frame, const char* target, const char* linkpath) -> uint64_t {
+-    uint64_t Result = ::symlink(target, linkpath);
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Symlink(target, linkpath);
+     SYSCALL_ERRNO();
+   });
+ 
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/Passthrough.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/Passthrough.cpp
+index 550f4eb..f6ce8df 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/Passthrough.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/Syscalls/Passthrough.cpp
+@@ -9,11 +9,26 @@ $end_info$
+ #include "LinuxSyscalls/Syscalls.h"
+ #include "LinuxSyscalls/x64/Syscalls.h"
+ #include "LinuxSyscalls/x32/Syscalls.h"
++#include "LinuxSyscalls/Syscalls/SysVIPC.h"
+ 
+ #include <FEXCore/IR/IR.h>
+ 
++#include <cstring>
++#include <cstdlib>
+ #include <stdint.h>
+ #include <sys/epoll.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++// Android: configurable fake UID/GID via FEX_FAKE_UID env var
++// Default 1000 (non-root). Set FEX_FAKE_UID=0 for dpkg/apt operations.
++static uint64_t GetFakeUID() {
++  static uint64_t uid = []() -> uint64_t {
++    const char* env = getenv("FEX_FAKE_UID");
++    return env ? (uint64_t)atoi(env) : 1000;
++  }();
++  return uid;
++}
+ 
+ namespace FEX::HLE {
+ #ifdef ARCHITECTURE_arm64
+@@ -219,8 +234,17 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
+   REGISTER_SYSCALL_IMPL(sched_yield, SyscallPassthrough0<SYSCALL_DEF(sched_yield)>);
+   REGISTER_SYSCALL_IMPL(msync, SyscallPassthrough3<SYSCALL_DEF(msync)>);
+   REGISTER_SYSCALL_IMPL(mincore, SyscallPassthrough3<SYSCALL_DEF(mincore)>);
+-  REGISTER_SYSCALL_IMPL(shmget, SyscallPassthrough3<SYSCALL_DEF(shmget)>);
+-  REGISTER_SYSCALL_IMPL(shmctl, SyscallPassthrough3<SYSCALL_DEF(shmctl)>);
++  // SysV IPC emulation (Android kernel has CONFIG_SYSVIPC disabled)
++  REGISTER_SYSCALL_IMPL(shmget, [](FEXCore::Core::CpuStateFrame* Frame, key_t key, size_t size, int shmflg) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuShmget(key, size, shmflg);
++    if (Result < 0) return Result;
++    return Result;
++  });
++  REGISTER_SYSCALL_IMPL(shmctl, [](FEXCore::Core::CpuStateFrame* Frame, int shmid, int cmd, struct shmid64_ds* buf) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, buf);
++    if (Result < 0) return Result;
++    return Result;
++  });
+   REGISTER_SYSCALL_IMPL(getpid, SyscallPassthrough0<SYSCALL_DEF(getpid)>);
+   REGISTER_SYSCALL_IMPL(socket, SyscallPassthrough3<SYSCALL_DEF(socket)>);
+   REGISTER_SYSCALL_IMPL(connect, SyscallPassthrough3<SYSCALL_DEF(connect)>);
+@@ -233,43 +257,97 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
+   REGISTER_SYSCALL_IMPL(getpeername, SyscallPassthrough3<SYSCALL_DEF(getpeername)>);
+   REGISTER_SYSCALL_IMPL(socketpair, SyscallPassthrough4<SYSCALL_DEF(socketpair)>);
+   REGISTER_SYSCALL_IMPL(kill, SyscallPassthrough2<SYSCALL_DEF(kill)>);
+-  REGISTER_SYSCALL_IMPL(semget, SyscallPassthrough3<SYSCALL_DEF(semget)>);
+-  REGISTER_SYSCALL_IMPL(msgget, SyscallPassthrough2<SYSCALL_DEF(msgget)>);
+-  REGISTER_SYSCALL_IMPL(msgsnd, SyscallPassthrough4<SYSCALL_DEF(msgsnd)>);
+-  REGISTER_SYSCALL_IMPL(msgrcv, SyscallPassthrough5<SYSCALL_DEF(msgrcv)>);
+-  REGISTER_SYSCALL_IMPL(msgctl, SyscallPassthrough3<SYSCALL_DEF(msgctl)>);
++  REGISTER_SYSCALL_IMPL(semget, [](FEXCore::Core::CpuStateFrame* Frame, key_t key, int nsems, int semflg) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuSemget(key, nsems, semflg);
++    if (Result < 0) return Result;
++    return Result;
++  });
++  // SysV message queue emulation (Android kernel has CONFIG_SYSVIPC disabled)
++  REGISTER_SYSCALL_IMPL(msgget, [](FEXCore::Core::CpuStateFrame* Frame, key_t key, int msgflg) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuMsgget(key, msgflg);
++    return Result;
++  });
++  REGISTER_SYSCALL_IMPL(msgsnd, [](FEXCore::Core::CpuStateFrame* Frame, int msqid, const void* msgp, size_t msgsz, int msgflg) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuMsgsnd(msqid, msgp, msgsz, msgflg);
++    return Result;
++  });
++  REGISTER_SYSCALL_IMPL(msgrcv, [](FEXCore::Core::CpuStateFrame* Frame, int msqid, void* msgp, size_t msgsz, long msgtyp, int msgflg) -> uint64_t {
++    ssize_t Result = FEX::HLE::SysVIPC::EmuMsgrcv(msqid, msgp, msgsz, msgtyp, msgflg);
++    return Result;
++  });
++  REGISTER_SYSCALL_IMPL(msgctl, [](FEXCore::Core::CpuStateFrame* Frame, int msqid, int cmd, void* buf) -> uint64_t {
++    int Result = FEX::HLE::SysVIPC::EmuMsgctl(msqid, cmd, buf);
++    return Result;
++  });
+   REGISTER_SYSCALL_IMPL(flock, SyscallPassthrough2<SYSCALL_DEF(flock)>);
+   REGISTER_SYSCALL_IMPL(fsync, SyscallPassthrough1<SYSCALL_DEF(fsync)>);
+   REGISTER_SYSCALL_IMPL(fdatasync, SyscallPassthrough1<SYSCALL_DEF(fdatasync)>);
+   REGISTER_SYSCALL_IMPL(truncate, SyscallPassthrough2<SYSCALL_DEF(truncate)>);
+   REGISTER_SYSCALL_IMPL(ftruncate, SyscallPassthrough2<SYSCALL_DEF(ftruncate)>);
+-  REGISTER_SYSCALL_IMPL(getcwd, SyscallPassthrough2<SYSCALL_DEF(getcwd)>);
+-  REGISTER_SYSCALL_IMPL(chdir, SyscallPassthrough1<SYSCALL_DEF(chdir)>);
++  // Android rootfs overlay: strip rootfs prefix from getcwd result
++  REGISTER_SYSCALL_IMPL(getcwd, [](FEXCore::Core::CpuStateFrame* Frame, char* buf, size_t size) -> uint64_t {
++    uint64_t Result = ::syscall(SYSCALL_DEF(getcwd), buf, size);
++    if (Result > 0 && buf) {
++      auto Len = FEX::HLE::_SyscallHandler->FM.StripRootFSPrefix(buf, strlen(buf), false);
++      Result = Len + 1; // getcwd returns length including null terminator
++    }
++    SYSCALL_ERRNO();
++  });
++  // Android rootfs overlay: chdir must resolve through rootfs overlay
++  // chdir("/") must go to rootfs root so relative paths (e.g. ./usr/bin/curl
++  // used by dpkg) resolve inside the rootfs, not the Android host root.
++  REGISTER_SYSCALL_IMPL(chdir, [](FEXCore::Core::CpuStateFrame* Frame, const char* path) -> uint64_t {
++    // Special case: chdir("/") → go to rootfs root
++    // GetEmulatedPath("/usr") returns "<rootfs>/usr"; strip "/usr" to get rootfs root
++    if (path && path[0] == '/' && path[1] == '\0') {
++      auto emulated = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath("/usr", false);
++      if (!emulated.empty() && emulated.size() > 4) {
++        auto rootfsRoot = emulated.substr(0, emulated.size() - 4); // strip "/usr"
++        int Result = ::chdir(rootfsRoot.c_str());
++        if (Result == 0) return 0;
++      }
++    }
++    auto EmulatedPath = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(path, true);
++    if (!EmulatedPath.empty()) {
++      int Result = ::chdir(EmulatedPath.c_str());
++      if (Result == 0) return 0;
++    }
++    uint64_t Result = ::chdir(path);
++    SYSCALL_ERRNO();
++  });
+   REGISTER_SYSCALL_IMPL(fchdir, SyscallPassthrough1<SYSCALL_DEF(fchdir)>);
+   REGISTER_SYSCALL_IMPL(fchmod, SyscallPassthrough2<SYSCALL_DEF(fchmod)>);
+-  REGISTER_SYSCALL_IMPL(fchown, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
++  // Android fake root: fchown silently succeeds (app can't chown)
++  REGISTER_SYSCALL_IMPL(fchown, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uid_t owner, gid_t group) -> uint64_t {
++    return 0;
++  });
+   REGISTER_SYSCALL_IMPL(umask, SyscallPassthrough1<SYSCALL_DEF(umask)>);
+-  REGISTER_SYSCALL_IMPL(getuid, SyscallPassthrough0<SYSCALL_DEF(getuid)>);
++  // Android: configurable fake UID/GID (FEX_FAKE_UID env, default 1000)
++  REGISTER_SYSCALL_IMPL(getuid, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
+   REGISTER_SYSCALL_IMPL(syslog, SyscallPassthrough3<SYSCALL_DEF(syslog)>);
+-  REGISTER_SYSCALL_IMPL(getgid, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
+-  REGISTER_SYSCALL_IMPL(setuid, SyscallPassthrough1<SYSCALL_DEF(setuid)>);
+-  REGISTER_SYSCALL_IMPL(setgid, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
+-  REGISTER_SYSCALL_IMPL(geteuid, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
+-  REGISTER_SYSCALL_IMPL(getegid, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
++  REGISTER_SYSCALL_IMPL(getgid, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++  REGISTER_SYSCALL_IMPL(setuid, [](FEXCore::Core::CpuStateFrame* Frame, uid_t uid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(setgid, [](FEXCore::Core::CpuStateFrame* Frame, gid_t gid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(geteuid, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++  REGISTER_SYSCALL_IMPL(getegid, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
+   REGISTER_SYSCALL_IMPL(setpgid, SyscallPassthrough2<SYSCALL_DEF(setpgid)>);
+   REGISTER_SYSCALL_IMPL(getppid, SyscallPassthrough0<SYSCALL_DEF(getppid)>);
+   REGISTER_SYSCALL_IMPL(setsid, SyscallPassthrough0<SYSCALL_DEF(setsid)>);
+-  REGISTER_SYSCALL_IMPL(setreuid, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
+-  REGISTER_SYSCALL_IMPL(setregid, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
+-  REGISTER_SYSCALL_IMPL(getgroups, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
+-  REGISTER_SYSCALL_IMPL(setgroups, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
+-  REGISTER_SYSCALL_IMPL(setresuid, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
+-  REGISTER_SYSCALL_IMPL(getresuid, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
+-  REGISTER_SYSCALL_IMPL(setresgid, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
+-  REGISTER_SYSCALL_IMPL(getresgid, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
++  REGISTER_SYSCALL_IMPL(setreuid, [](FEXCore::Core::CpuStateFrame* Frame, uid_t ruid, uid_t euid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(setregid, [](FEXCore::Core::CpuStateFrame* Frame, gid_t rgid, gid_t egid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(getgroups, [](FEXCore::Core::CpuStateFrame* Frame, int size, gid_t* list) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(setgroups, [](FEXCore::Core::CpuStateFrame* Frame, int size, const gid_t* list) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(setresuid, [](FEXCore::Core::CpuStateFrame* Frame, uid_t ruid, uid_t euid, uid_t suid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(getresuid, [](FEXCore::Core::CpuStateFrame* Frame, uid_t* ruid, uid_t* euid, uid_t* suid) -> uint64_t {
++    if (ruid) *ruid = 0; if (euid) *euid = 0; if (suid) *suid = 0; return 0;
++  });
++  REGISTER_SYSCALL_IMPL(setresgid, [](FEXCore::Core::CpuStateFrame* Frame, gid_t rgid, gid_t egid, gid_t sgid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(getresgid, [](FEXCore::Core::CpuStateFrame* Frame, gid_t* rgid, gid_t* egid, gid_t* sgid) -> uint64_t {
++    if (rgid) *rgid = 0; if (egid) *egid = 0; if (sgid) *sgid = 0; return 0;
++  });
+   REGISTER_SYSCALL_IMPL(getpgid, SyscallPassthrough1<SYSCALL_DEF(getpgid)>);
+-  REGISTER_SYSCALL_IMPL(setfsuid, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
+-  REGISTER_SYSCALL_IMPL(setfsgid, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
++  REGISTER_SYSCALL_IMPL(setfsuid, [](FEXCore::Core::CpuStateFrame* Frame, uid_t fsuid) -> uint64_t { return 0; });
++  REGISTER_SYSCALL_IMPL(setfsgid, [](FEXCore::Core::CpuStateFrame* Frame, gid_t fsgid) -> uint64_t { return 0; });
+   REGISTER_SYSCALL_IMPL(getsid, SyscallPassthrough1<SYSCALL_DEF(getsid)>);
+   REGISTER_SYSCALL_IMPL(capget, SyscallPassthrough2<SYSCALL_DEF(capget)>);
+   REGISTER_SYSCALL_IMPL(capset, SyscallPassthrough2<SYSCALL_DEF(capset)>);
+@@ -319,14 +397,65 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
+   REGISTER_SYSCALL_IMPL(inotify_add_watch, SyscallPassthrough3<SYSCALL_DEF(inotify_add_watch)>);
+   REGISTER_SYSCALL_IMPL(inotify_rm_watch, SyscallPassthrough2<SYSCALL_DEF(inotify_rm_watch)>);
+   REGISTER_SYSCALL_IMPL(migrate_pages, SyscallPassthrough4<SYSCALL_DEF(migrate_pages)>);
+-  REGISTER_SYSCALL_IMPL(mkdirat, SyscallPassthrough3<SYSCALL_DEF(mkdirat)>);
+-  REGISTER_SYSCALL_IMPL(mknodat, SyscallPassthrough4<SYSCALL_DEF(mknodat)>);
+-  REGISTER_SYSCALL_IMPL(fchownat, SyscallPassthrough5<SYSCALL_DEF(fchownat)>);
+-  REGISTER_SYSCALL_IMPL(unlinkat, SyscallPassthrough3<SYSCALL_DEF(unlinkat)>);
+-  REGISTER_SYSCALL_IMPL(renameat, SyscallPassthrough4<SYSCALL_DEF(renameat)>);
+-  REGISTER_SYSCALL_IMPL(linkat, SyscallPassthrough5<SYSCALL_DEF(linkat)>);
+-  REGISTER_SYSCALL_IMPL(symlinkat, SyscallPassthrough3<SYSCALL_DEF(symlinkat)>);
+-  REGISTER_SYSCALL_IMPL(fchmodat, SyscallPassthrough3<SYSCALL_DEF(fchmodat)>);
++  REGISTER_SYSCALL_IMPL(mkdirat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Mkdirat(dirfd, pathname, mode);
++    SYSCALL_ERRNO();
++  });
++  // Android: mknodat intercepted to handle FIFO (mkfifo) SELinux block.
++  // When S_IFIFO is requested and the real syscall fails with EPERM,
++  // fall back to creating a regular file so the path exists.
++  REGISTER_SYSCALL_IMPL(mknodat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode, dev_t dev) -> uint64_t {
++    // Try through rootfs overlay first
++    auto EmulatedPath = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true);
++    const char* actualPath = (!EmulatedPath.empty()) ? EmulatedPath.c_str() : pathname;
++    int actualDirfd = (!EmulatedPath.empty()) ? AT_FDCWD : dirfd;
++
++    uint64_t Result = ::syscall(SYSCALL_DEF(mknodat), actualDirfd, actualPath, mode, dev);
++    if (Result == (uint64_t)-1 && errno == EPERM && (mode & S_IFMT) == S_IFIFO) {
++      // SELinux blocks FIFO creation. Create a regular file instead so the path exists.
++      mode_t fileMode = (mode & ~S_IFMT) | S_IFREG;
++      Result = ::syscall(SYSCALL_DEF(mknodat), actualDirfd, actualPath, fileMode, 0);
++      if (Result == (uint64_t)-1) {
++        // Last resort: try creat
++        int fd = ::openat(actualDirfd, actualPath, O_CREAT | O_WRONLY | O_TRUNC, mode & 0777);
++        if (fd >= 0) {
++          ::close(fd);
++          return 0;
++        }
++      }
++    }
++    SYSCALL_ERRNO();
++  });
++  // Android fake root: fchownat silently succeeds
++  REGISTER_SYSCALL_IMPL(fchownat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, uid_t owner, gid_t group, int flags) -> uint64_t {
++    return 0;
++  });
++  REGISTER_SYSCALL_IMPL(unlinkat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, int flags) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Unlinkat(dirfd, pathname, flags);
++    SYSCALL_ERRNO();
++  });
++  REGISTER_SYSCALL_IMPL(renameat, [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Renameat(olddirfd, oldpath, newdirfd, newpath);
++    SYSCALL_ERRNO();
++  });
++  REGISTER_SYSCALL_IMPL(linkat, [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Linkat(olddirfd, oldpath, newdirfd, newpath, flags);
++    SYSCALL_ERRNO();
++  });
++  REGISTER_SYSCALL_IMPL(symlinkat, [](FEXCore::Core::CpuStateFrame* Frame, const char* target, int newdirfd, const char* linkpath) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Symlinkat(target, newdirfd, linkpath);
++    SYSCALL_ERRNO();
++  });
++  // Android rootfs overlay: fchmodat must resolve through rootfs
++  REGISTER_SYSCALL_IMPL(fchmodat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, mode_t mode) -> uint64_t {
++    auto EmulatedPath = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true);
++    if (!EmulatedPath.empty()) {
++      int Result = ::syscall(SYSCALL_DEF(fchmodat), AT_FDCWD, EmulatedPath.c_str(), mode, 0);
++      if (Result == 0) return 0;
++    }
++    uint64_t Result = ::syscall(SYSCALL_DEF(fchmodat), dirfd, pathname, mode, 0);
++    SYSCALL_ERRNO();
++  });
+   REGISTER_SYSCALL_IMPL(unshare, SyscallPassthrough1<SYSCALL_DEF(unshare)>);
+   REGISTER_SYSCALL_IMPL(splice, SyscallPassthrough6<SYSCALL_DEF(splice)>);
+   REGISTER_SYSCALL_IMPL(tee, SyscallPassthrough4<SYSCALL_DEF(tee)>);
+@@ -347,7 +476,10 @@ void RegisterCommon(FEX::HLE::SyscallHandler* Handler) {
+   REGISTER_SYSCALL_IMPL(kcmp, SyscallPassthrough5<SYSCALL_DEF(kcmp)>);
+   REGISTER_SYSCALL_IMPL(sched_setattr, SyscallPassthrough3<SYSCALL_DEF(sched_setattr)>);
+   REGISTER_SYSCALL_IMPL(sched_getattr, SyscallPassthrough4<SYSCALL_DEF(sched_getattr)>);
+-  REGISTER_SYSCALL_IMPL(renameat2, SyscallPassthrough5<SYSCALL_DEF(renameat2)>);
++  REGISTER_SYSCALL_IMPL(renameat2, [](FEXCore::Core::CpuStateFrame* Frame, int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags) -> uint64_t {
++    uint64_t Result = FEX::HLE::_SyscallHandler->FM.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags);
++    SYSCALL_ERRNO();
++  });
+   REGISTER_SYSCALL_IMPL(getrandom, SyscallPassthrough3<SYSCALL_DEF(getrandom)>);
+   REGISTER_SYSCALL_IMPL(memfd_create, SyscallPassthrough2<SYSCALL_DEF(memfd_create)>);
+   REGISTER_SYSCALL_IMPL(membarrier, SyscallPassthrough2<SYSCALL_DEF(membarrier)>);
+@@ -436,7 +568,11 @@ namespace x64 {
+     REGISTER_SYSCALL_IMPL_X64(setsockopt, SyscallPassthrough5<SYSCALL_DEF(setsockopt)>);
+     REGISTER_SYSCALL_IMPL_X64(getsockopt, SyscallPassthrough5<SYSCALL_DEF(getsockopt)>);
+     REGISTER_SYSCALL_IMPL_X64(wait4, SyscallPassthrough4<SYSCALL_DEF(wait4)>);
+-    REGISTER_SYSCALL_IMPL_X64(semop, SyscallPassthrough3<SYSCALL_DEF(semop)>);
++    REGISTER_SYSCALL_IMPL_X64(semop, [](FEXCore::Core::CpuStateFrame* Frame, int semid, struct sembuf* sops, size_t nsops) -> uint64_t {
++      int Result = FEX::HLE::SysVIPC::EmuSemop(semid, sops, nsops);
++      if (Result < 0) return Result;
++      return Result;
++    });
+     REGISTER_SYSCALL_IMPL_X64(gettimeofday, SyscallPassthrough2<SYSCALL_DEF(gettimeofday)>);
+     REGISTER_SYSCALL_IMPL_X64(getrlimit, SyscallPassthrough2<SYSCALL_DEF(getrlimit)>);
+     REGISTER_SYSCALL_IMPL_X64(getrusage, SyscallPassthrough2<SYSCALL_DEF(getrusage)>);
+@@ -453,7 +589,11 @@ namespace x64 {
+     REGISTER_SYSCALL_IMPL_X64(readahead, SyscallPassthrough3<SYSCALL_DEF(readahead)>);
+     REGISTER_SYSCALL_IMPL_X64(futex, SyscallPassthrough6<SYSCALL_DEF(futex)>);
+     REGISTER_SYSCALL_IMPL_X64(io_getevents, SyscallPassthrough5<SYSCALL_DEF(io_getevents)>);
+-    REGISTER_SYSCALL_IMPL_X64(semtimedop, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
++    REGISTER_SYSCALL_IMPL_X64(semtimedop, [](FEXCore::Core::CpuStateFrame* Frame, int semid, struct sembuf* sops, size_t nsops, const struct timespec* timeout) -> uint64_t {
++      int Result = FEX::HLE::SysVIPC::EmuSemtimedop(semid, sops, nsops, timeout);
++      if (Result < 0) return Result;
++      return Result;
++    });
+     REGISTER_SYSCALL_IMPL_X64(timer_create, SyscallPassthrough3<SYSCALL_DEF(timer_create)>);
+     REGISTER_SYSCALL_IMPL_X64(timer_settime, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
+     REGISTER_SYSCALL_IMPL_X64(timer_gettime, SyscallPassthrough2<SYSCALL_DEF(timer_gettime)>);
+@@ -469,11 +609,25 @@ namespace x64 {
+     REGISTER_SYSCALL_IMPL_X64(waitid, SyscallPassthrough5<SYSCALL_DEF(waitid)>);
+     REGISTER_SYSCALL_IMPL_X64(pselect6, SyscallPassthrough6<SYSCALL_DEF(pselect6)>);
+     REGISTER_SYSCALL_IMPL_X64(ppoll, SyscallPassthrough5<SYSCALL_DEF(ppoll)>);
+-    REGISTER_SYSCALL_IMPL_X64(set_robust_list, SyscallPassthrough2<SYSCALL_DEF(set_robust_list)>);
++    // Android: set_robust_list blocked by seccomp. Return 0 (success) — glibc handles gracefully.
++    REGISTER_SYSCALL_IMPL_X64(set_robust_list, [](FEXCore::Core::CpuStateFrame* Frame, uint64_t head, uint64_t len) -> uint64_t {
++      return 0;
++    });
+     REGISTER_SYSCALL_IMPL_X64(get_robust_list, SyscallPassthrough3<SYSCALL_DEF(get_robust_list)>);
+     REGISTER_SYSCALL_IMPL_X64(sync_file_range, SyscallPassthrough4<SYSCALL_DEF(sync_file_range)>);
+     REGISTER_SYSCALL_IMPL_X64(vmsplice, SyscallPassthrough4<SYSCALL_DEF(vmsplice)>);
+-    REGISTER_SYSCALL_IMPL_X64(utimensat, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
++    // Android rootfs overlay: utimensat must resolve through rootfs
++    REGISTER_SYSCALL_IMPL_X64(utimensat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, const struct timespec times[2], int flags) -> uint64_t {
++      if (pathname) {
++        auto EmulatedPath = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true);
++        if (!EmulatedPath.empty()) {
++          int Result = ::syscall(SYSCALL_DEF(utimensat), AT_FDCWD, EmulatedPath.c_str(), times, flags);
++          if (Result == 0) return 0;
++        }
++      }
++      uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, times, flags);
++      SYSCALL_ERRNO();
++    });
+     REGISTER_SYSCALL_IMPL_X64(fallocate, SyscallPassthrough4<SYSCALL_DEF(fallocate)>);
+     REGISTER_SYSCALL_IMPL_X64(timerfd_settime, SyscallPassthrough4<SYSCALL_DEF(timerfd_settime)>);
+     REGISTER_SYSCALL_IMPL_X64(timerfd_gettime, SyscallPassthrough2<SYSCALL_DEF(timerfd_gettime)>);
+@@ -508,23 +662,28 @@ namespace x32 {
+   void RegisterPassthrough(FEX::HLE::SyscallHandler* Handler) {
+     using namespace FEXCore::IR;
+     RegisterCommon(Handler);
+-    REGISTER_SYSCALL_IMPL_X32(getuid32, SyscallPassthrough0<SYSCALL_DEF(getuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(getgid32, SyscallPassthrough0<SYSCALL_DEF(getgid)>);
+-    REGISTER_SYSCALL_IMPL_X32(geteuid32, SyscallPassthrough0<SYSCALL_DEF(geteuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(getegid32, SyscallPassthrough0<SYSCALL_DEF(getegid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setreuid32, SyscallPassthrough2<SYSCALL_DEF(setreuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setregid32, SyscallPassthrough2<SYSCALL_DEF(setregid)>);
+-    REGISTER_SYSCALL_IMPL_X32(getgroups32, SyscallPassthrough2<SYSCALL_DEF(getgroups)>);
+-    REGISTER_SYSCALL_IMPL_X32(setgroups32, SyscallPassthrough2<SYSCALL_DEF(setgroups)>);
+-    REGISTER_SYSCALL_IMPL_X32(fchown32, SyscallPassthrough3<SYSCALL_DEF(fchown)>);
+-    REGISTER_SYSCALL_IMPL_X32(setresuid32, SyscallPassthrough3<SYSCALL_DEF(setresuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(getresuid32, SyscallPassthrough3<SYSCALL_DEF(getresuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setresgid32, SyscallPassthrough3<SYSCALL_DEF(setresgid)>);
+-    REGISTER_SYSCALL_IMPL_X32(getresgid32, SyscallPassthrough3<SYSCALL_DEF(getresgid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setuid32, SyscallPassthrough1<SYSCALL_DEF(setuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setgid32, SyscallPassthrough1<SYSCALL_DEF(setgid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setfsuid32, SyscallPassthrough1<SYSCALL_DEF(setfsuid)>);
+-    REGISTER_SYSCALL_IMPL_X32(setfsgid32, SyscallPassthrough1<SYSCALL_DEF(setfsgid)>);
++    // Android: x32 UID/GID handlers - configurable via FEX_FAKE_UID
++    REGISTER_SYSCALL_IMPL_X32(getuid32, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++    REGISTER_SYSCALL_IMPL_X32(getgid32, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++    REGISTER_SYSCALL_IMPL_X32(geteuid32, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++    REGISTER_SYSCALL_IMPL_X32(getegid32, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t { return GetFakeUID(); });
++    REGISTER_SYSCALL_IMPL_X32(setreuid32, [](FEXCore::Core::CpuStateFrame* Frame, uid_t ruid, uid_t euid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setregid32, [](FEXCore::Core::CpuStateFrame* Frame, gid_t rgid, gid_t egid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(getgroups32, [](FEXCore::Core::CpuStateFrame* Frame, int size, gid_t* list) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setgroups32, [](FEXCore::Core::CpuStateFrame* Frame, int size, const gid_t* list) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(fchown32, [](FEXCore::Core::CpuStateFrame* Frame, int fd, uid_t owner, gid_t group) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setresuid32, [](FEXCore::Core::CpuStateFrame* Frame, uid_t ruid, uid_t euid, uid_t suid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(getresuid32, [](FEXCore::Core::CpuStateFrame* Frame, uid_t* ruid, uid_t* euid, uid_t* suid) -> uint64_t {
++      if (ruid) *ruid = 0; if (euid) *euid = 0; if (suid) *suid = 0; return 0;
++    });
++    REGISTER_SYSCALL_IMPL_X32(setresgid32, [](FEXCore::Core::CpuStateFrame* Frame, gid_t rgid, gid_t egid, gid_t sgid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(getresgid32, [](FEXCore::Core::CpuStateFrame* Frame, gid_t* rgid, gid_t* egid, gid_t* sgid) -> uint64_t {
++      if (rgid) *rgid = 0; if (egid) *egid = 0; if (sgid) *sgid = 0; return 0;
++    });
++    REGISTER_SYSCALL_IMPL_X32(setuid32, [](FEXCore::Core::CpuStateFrame* Frame, uid_t uid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setgid32, [](FEXCore::Core::CpuStateFrame* Frame, gid_t gid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setfsuid32, [](FEXCore::Core::CpuStateFrame* Frame, uid_t fsuid) -> uint64_t { return 0; });
++    REGISTER_SYSCALL_IMPL_X32(setfsgid32, [](FEXCore::Core::CpuStateFrame* Frame, gid_t fsgid) -> uint64_t { return 0; });
+     REGISTER_SYSCALL_IMPL_X32(sendfile64, SyscallPassthrough4<SYSCALL_DEF(sendfile)>);
+     REGISTER_SYSCALL_IMPL_X32(clock_gettime64, SyscallPassthrough2<SYSCALL_DEF(clock_gettime)>);
+     REGISTER_SYSCALL_IMPL_X32(clock_settime64, SyscallPassthrough2<SYSCALL_DEF(clock_settime)>);
+@@ -535,12 +694,27 @@ namespace x32 {
+     REGISTER_SYSCALL_IMPL_X32(timer_settime64, SyscallPassthrough4<SYSCALL_DEF(timer_settime)>);
+     REGISTER_SYSCALL_IMPL_X32(timerfd_gettime64, SyscallPassthrough2<SYSCALL_DEF(timerfd_gettime)>);
+     REGISTER_SYSCALL_IMPL_X32(timerfd_settime64, SyscallPassthrough4<SYSCALL_DEF(timerfd_settime)>);
+-    REGISTER_SYSCALL_IMPL_X32(utimensat_time64, SyscallPassthrough4<SYSCALL_DEF(utimensat)>);
++    // Android rootfs overlay: utimensat_time64 must resolve through rootfs
++    REGISTER_SYSCALL_IMPL_X32(utimensat_time64, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, const struct timespec times[2], int flags) -> uint64_t {
++      if (pathname) {
++        auto EmulatedPath = FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true);
++        if (!EmulatedPath.empty()) {
++          int Result = ::syscall(SYSCALL_DEF(utimensat), AT_FDCWD, EmulatedPath.c_str(), times, flags);
++          if (Result == 0) return 0;
++        }
++      }
++      uint64_t Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, times, flags);
++      SYSCALL_ERRNO();
++    });
+     REGISTER_SYSCALL_IMPL_X32(ppoll_time64, SyscallPassthrough5<SYSCALL_DEF(ppoll)>);
+     REGISTER_SYSCALL_IMPL_X32(io_pgetevents_time64, SyscallPassthrough6<SYSCALL_DEF(io_pgetevents)>);
+     REGISTER_SYSCALL_IMPL_X32(mq_timedsend_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedsend)>);
+     REGISTER_SYSCALL_IMPL_X32(mq_timedreceive_time64, SyscallPassthrough5<SYSCALL_DEF(mq_timedreceive)>);
+-    REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, SyscallPassthrough4<SYSCALL_DEF(semtimedop)>);
++    REGISTER_SYSCALL_IMPL_X32(semtimedop_time64, [](FEXCore::Core::CpuStateFrame* Frame, int semid, struct sembuf* sops, size_t nsops, const struct timespec* timeout) -> uint64_t {
++      int Result = FEX::HLE::SysVIPC::EmuSemtimedop(semid, sops, nsops, timeout);
++      if (Result < 0) return Result;
++      return Result;
++    });
+     REGISTER_SYSCALL_IMPL_X32(futex_time64, SyscallPassthrough6<SYSCALL_DEF(futex)>);
+     REGISTER_SYSCALL_IMPL_X32(sched_rr_get_interval_time64, SyscallPassthrough2<SYSCALL_DEF(sched_rr_get_interval)>);
+   }
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+index 65944a2..b1b8660 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+@@ -20,6 +20,7 @@ $end_info$
+ 
+ #include "LinuxSyscalls/Syscalls.h"
+ #include "LinuxSyscalls/SignalDelegator.h"
++#include "LinuxSyscalls/Syscalls/SysVIPC.h"
+ 
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/LogManager.h>
+@@ -406,6 +407,25 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
+   uint64_t Result {};
+   uint64_t Length {};
+ 
++  // Check if this is an emulated SysV IPC shmid
++  if (FEX::HLE::SysVIPC::IsEmulatedShmid(shmid)) {
++    void* mapped = FEX::HLE::SysVIPC::EmuShmat(shmid, shmaddr, shmflg);
++    if (mapped == (void*)(uintptr_t)-1) {
++      return -errno;
++    }
++    Result = reinterpret_cast<uint64_t>(mapped);
++    Length = FEX::HLE::SysVIPC::GetShmSize(shmid);
++
++    {
++      auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
++      TrackShmat(Thread, shmid, Result, shmflg, Length);
++    }
++
++    InvalidateCodeRangeIfNecessary(Thread, Result, Length);
++    return Result;
++  }
++
++  // Original path for real kernel SysV IPC
+   {
+     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
+     if (Is64Bit) {
+@@ -438,6 +458,20 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
+ uint64_t SyscallHandler::GuestShmdt(bool Is64Bit, FEXCore::Core::InternalThreadState* Thread, const void* shmaddr) {
+   uint64_t Result {};
+   uint64_t Length {};
++
++  // Try emulated SysV IPC shmdt first
++  int emu_result = FEX::HLE::SysVIPC::EmuShmdt(shmaddr);
++  if (emu_result == 0) {
++    // Emulated shmdt succeeded
++    {
++      auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
++      Length = TrackShmdt(Thread, reinterpret_cast<uintptr_t>(shmaddr));
++    }
++    InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uintptr_t>(shmaddr), Length);
++    return 0;
++  }
++
++  // Original path for real kernel SysV IPC
+   {
+     auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
+     if (Is64Bit) {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
+index 4e9d1c7..13695dd 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
+@@ -323,14 +323,13 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     SYSCALL_ERRNO();
+   });
+ 
++  // Android fake root: chown32/lchown32 silently succeed
+   REGISTER_SYSCALL_IMPL_X32(chown32, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
+-    uint64_t Result = ::chown(pathname, owner, group);
+-    SYSCALL_ERRNO();
++    return 0;
+   });
+ 
+   REGISTER_SYSCALL_IMPL_X32(lchown32, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, uid_t owner, gid_t group) -> uint64_t {
+-    uint64_t Result = ::lchown(pathname, owner, group);
+-    SYSCALL_ERRNO();
++    return 0;
+   });
+ 
+   REGISTER_SYSCALL_IMPL_X32(oldstat, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, oldstat32* buf) -> uint64_t {
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp
+index a0f1d2d..3ec2b2a 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp
+@@ -10,6 +10,7 @@ $end_info$
+ #include "LinuxSyscalls/x32/Types.h"
+ 
+ #include "LinuxSyscalls/x64/Syscalls.h"
++#include "LinuxSyscalls/Syscalls/SysVIPC.h"
+ 
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/Utils/LogManager.h>
+@@ -94,12 +95,11 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+ 
+   switch (static_cast<IPCOp>(call)) {
+   case OP_SEMOP: {
+-    Result = ::syscall(SYSCALL_DEF(semop), first, reinterpret_cast<struct sembuf*>(ptr), second);
+-    break;
++    // Route through SysV IPC emulation (returns -errno directly, skip SYSCALL_ERRNO)
++    return FEX::HLE::SysVIPC::EmuSemop(first, reinterpret_cast<struct sembuf*>(ptr), second);
+   }
+   case OP_SEMGET: {
+-    Result = ::syscall(SYSCALL_DEF(semget), first, second, third);
+-    break;
++    return FEX::HLE::SysVIPC::EmuSemget(first, second, third);
+   }
+   case OP_SEMCTL: {
+     uint32_t semid = first;
+@@ -118,8 +118,8 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+         FaultSafeUserMemAccess::VerifyIsReadable(semun->buf32, sizeof(*semun->buf32));
+         buf = *semun->buf32;
+       }
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
+           *semun->buf64 = buf;
+@@ -134,8 +134,8 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     case SEM_STAT_ANY:
+     case IPC_STAT: {
+       struct semid64_ds buf {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
+           *semun->buf64 = buf;
+@@ -149,8 +149,8 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     case SEM_INFO:
+     case IPC_INFO: {
+       struct fex_seminfo si {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&si));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(semun->__buf, sizeof(*semun->__buf));
+         memcpy(semun->__buf, &si, sizeof(si));
+       }
+@@ -158,23 +158,22 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     }
+     case GETALL:
+     case SETALL: {
+-      // ptr is just a int32_t* in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->array);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, static_cast<unsigned long>(semun->array));
+       break;
+     }
+     case SETVAL: {
+-      // ptr is just a int32_t in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->val);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, static_cast<unsigned long>(semun->val));
+       break;
+     }
+     case IPC_RMID:
+     case GETPID:
+     case GETNCNT:
+     case GETZCNT:
+-    case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd); break;
++    case GETVAL: Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, 0); break;
+     default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
+     }
+-    break;
++    // Emulation returns -errno directly, skip SYSCALL_ERRNO
++    return Result;
+   }
+   case OP_SEMTIMEDOP: {
+     timespec32* timeout = reinterpret_cast<timespec32*>(fifth);
+@@ -186,11 +185,10 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+       timed_ptr = &tp64;
+     }
+ 
+-    Result = ::syscall(SYSCALL_DEF(semtimedop), first, reinterpret_cast<struct sembuf*>(ptr), second, timed_ptr);
+-    break;
++    return FEX::HLE::SysVIPC::EmuSemtimedop(first, reinterpret_cast<struct sembuf*>(ptr), second, timed_ptr);
+   }
+   case OP_MSGSND: {
+-    // Requires a temporary buffer
++    // Requires a temporary buffer (expand 32-bit mtype to 64-bit)
+     fextl::vector<uint8_t> Tmp(second + sizeof(size_t));
+     struct msgbuf* TmpMsg = reinterpret_cast<struct msgbuf*>(Tmp.data());
+     msgbuf_32* src = reinterpret_cast<msgbuf_32*>(ptr);
+@@ -199,44 +197,41 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     TmpMsg->mtype = src->mtype;
+     memcpy(TmpMsg->mtext, src->mtext, second);
+ 
+-    Result = ::syscall(SYSCALL_DEF(msgsnd), first, TmpMsg, second, third);
+-    break;
++    return FEX::HLE::SysVIPC::EmuMsgsnd(first, TmpMsg, second, third);
+   }
+   case OP_MSGRCV: {
+     fextl::vector<uint8_t> Tmp(second + sizeof(size_t));
+     struct msgbuf* TmpMsg = reinterpret_cast<struct msgbuf*>(Tmp.data());
+ 
+     if (Version != 0) {
+-      Result = ::syscall(SYSCALL_DEF(msgrcv), first, TmpMsg, second, fifth, third);
+-      if (Result != -1) {
++      ssize_t ret = FEX::HLE::SysVIPC::EmuMsgrcv(first, TmpMsg, second, fifth, third);
++      if (ret >= 0) {
+         msgbuf_32* src = reinterpret_cast<msgbuf_32*>(ptr);
+         FaultSafeUserMemAccess::VerifyIsWritable(src, sizeof(*src));
+-        FaultSafeUserMemAccess::VerifyIsWritable(src->mtext, Result);
++        FaultSafeUserMemAccess::VerifyIsWritable(src->mtext, ret);
+         src->mtype = TmpMsg->mtype;
+-        memcpy(src->mtext, TmpMsg->mtext, Result);
++        memcpy(src->mtext, TmpMsg->mtext, ret);
+       }
+-
++      return ret;
+     } else {
+       struct compat_ipc_kludge {
+         compat_uptr_t msgp;
+         compat_long_t msgtyp;
+       };
+       compat_ipc_kludge* ipck = reinterpret_cast<compat_ipc_kludge*>(ptr);
+-      Result = ::syscall(SYSCALL_DEF(msgrcv), first, TmpMsg, second, ipck->msgtyp, third);
+-      if (Result != -1) {
++      ssize_t ret = FEX::HLE::SysVIPC::EmuMsgrcv(first, TmpMsg, second, ipck->msgtyp, third);
++      if (ret >= 0) {
+         msgbuf_32* src = reinterpret_cast<msgbuf_32*>(ipck->msgp);
+         FaultSafeUserMemAccess::VerifyIsWritable(src, sizeof(*src));
+-        FaultSafeUserMemAccess::VerifyIsWritable(src->mtext, Result);
++        FaultSafeUserMemAccess::VerifyIsWritable(src->mtext, ret);
+         ipck->msgtyp = TmpMsg->mtype;
+-        memcpy(src->mtext, TmpMsg->mtext, Result);
++        memcpy(src->mtext, TmpMsg->mtext, ret);
+       }
++      return ret;
+     }
+-
+-    break;
+   }
+   case OP_MSGGET: {
+-    Result = ::syscall(SYSCALL_DEF(msgget), first, second);
+-    break;
++    return FEX::HLE::SysVIPC::EmuMsgget(first, second);
+   }
+   case OP_MSGCTL: {
+     uint32_t msqid = first;
+@@ -254,15 +249,15 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+         FaultSafeUserMemAccess::VerifyIsReadable(msgun.buf32, sizeof(*msgun.buf32));
+         buf = *msgun.buf32;
+       }
+-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
++      Result = FEX::HLE::SysVIPC::EmuMsgctl(msqid, cmd, &buf);
+       break;
+     }
+     case MSG_STAT:
+     case MSG_STAT_ANY:
+     case IPC_STAT: {
+       struct msqid64_ds buf {};
+-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuMsgctl(msqid, cmd, &buf);
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(msgun.buf64, sizeof(*msgun.buf64));
+           *msgun.buf64 = buf;
+@@ -276,17 +271,18 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     case MSG_INFO:
+     case IPC_INFO: {
+       struct msginfo mi {};
+-      Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, reinterpret_cast<struct msqid_ds*>(&mi));
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuMsgctl(msqid, cmd, &mi);
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(msgun.__buf, sizeof(mi));
+         memcpy(msgun.__buf, &mi, sizeof(mi));
+       }
+       break;
+     }
+-    case IPC_RMID: Result = ::syscall(SYSCALL_DEF(msgctl), msqid, cmd, nullptr); break;
++    case IPC_RMID: Result = FEX::HLE::SysVIPC::EmuMsgctl(msqid, cmd, nullptr); break;
+     default: LOGMAN_MSG_A_FMT("Unhandled msgctl cmd: {}", cmd); return -EINVAL;
+     }
+-    break;
++    // Emulation returns -errno directly
++    return Result;
+   }
+   case OP_SHMAT: {
+     if (Version == 1) {
+@@ -303,8 +299,7 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     return FEX::HLE::_SyscallHandler->GuestShmdt(false, Frame->Thread, reinterpret_cast<const void*>(ptr));
+   }
+   case OP_SHMGET: {
+-    Result = ::shmget(first, second, third);
+-    break;
++    return FEX::HLE::SysVIPC::EmuShmget(first, second, third);
+   }
+   case OP_SHMCTL: {
+     int32_t shmid = first;
+@@ -324,17 +319,15 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+         FaultSafeUserMemAccess::VerifyIsReadable(shmun.buf32, sizeof(*shmun.buf32));
+         buf = *shmun.buf32;
+       }
+-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
+-      // IPC_SET sets the internal data structure that the kernel uses
+-      // No need to writeback
++      Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, &buf);
+       break;
+     }
+     case SHM_STAT:
+     case SHM_STAT_ANY:
+     case IPC_STAT: {
+       struct shmid64_ds buf {};
+-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, &buf);
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(shmun.buf64, sizeof(*shmun.buf64));
+           *shmun.buf64 = buf;
+@@ -347,8 +340,8 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     }
+     case IPC_INFO: {
+       struct shminfo si {};
+-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, reinterpret_cast<struct shmid64_ds*>(&si));
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf64, sizeof(*shmun.__buf64));
+           *shmun.__buf64 = si;
+@@ -361,21 +354,22 @@ uint64_t _ipc(FEXCore::Core::CpuStateFrame* Frame, uint32_t call, uint32_t first
+     }
+     case SHM_INFO: {
+       struct shm_info si {};
+-      Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, reinterpret_cast<struct shmid_ds*>(&si));
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, reinterpret_cast<struct shmid64_ds*>(&si));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(shmun.__buf_info_32, sizeof(*shmun.__buf_info_32));
+         // SHM_INFO doesn't follow IPC64 behaviour
+         *shmun.__buf_info_32 = si;
+       }
+       break;
+     }
+-    case SHM_LOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
+-    case SHM_UNLOCK: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
+-    case IPC_RMID: Result = ::syscall(SYSCALL_DEF(shmctl), shmid, cmd, nullptr); break;
++    case SHM_LOCK: Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, nullptr); break;
++    case SHM_UNLOCK: Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, nullptr); break;
++    case IPC_RMID: Result = FEX::HLE::SysVIPC::EmuShmctl(shmid, cmd, nullptr); break;
+ 
+     default: LOGMAN_MSG_A_FMT("Unhandled shmctl cmd: {}", cmd); return -EINVAL;
+     }
+-    break;
++    // Emulation returns -errno directly, skip SYSCALL_ERRNO
++    return Result;
+   }
+ 
+   default: return -ENOSYS;
+@@ -389,7 +383,7 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result {};
+     bool IPC64 = cmd & 0x100;
+ 
+-    switch (cmd) {
++    switch (cmd & ~0x100) { // Strip IPC_64 for switch
+     case IPC_SET: {
+       struct semid64_ds buf {};
+       if (IPC64) {
+@@ -399,8 +393,8 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+         FaultSafeUserMemAccess::VerifyIsReadable(semun->buf32, sizeof(*semun->buf32));
+         buf = *semun->buf32;
+       }
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
+           *semun->buf64 = buf;
+@@ -415,8 +409,8 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     case SEM_STAT_ANY:
+     case IPC_STAT: {
+       struct semid64_ds buf {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         if (IPC64) {
+           FaultSafeUserMemAccess::VerifyIsWritable(semun->buf64, sizeof(*semun->buf64));
+           *semun->buf64 = buf;
+@@ -430,8 +424,8 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     case SEM_INFO:
+     case IPC_INFO: {
+       struct fex_seminfo si {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&si));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(semun->__buf, sizeof(*semun->__buf));
+         memcpy(semun->__buf, &si, sizeof(si));
+       }
+@@ -439,23 +433,22 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     }
+     case GETALL:
+     case SETALL: {
+-      // ptr is just a int32_t* in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->array);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, static_cast<unsigned long>(semun->array));
+       break;
+     }
+     case SETVAL: {
+-      // ptr is just a int32_t in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun->val);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, static_cast<unsigned long>(semun->val));
+       break;
+     }
+     case IPC_RMID:
+     case GETPID:
+     case GETNCNT:
+     case GETZCNT:
+-    case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun); break;
++    case GETVAL: Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, 0); break;
+     default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
+     }
+-    SYSCALL_ERRNO();
++    // Emulation returns negative errno directly
++    return Result;
+   });
+ }
+ } // namespace FEX::HLE::x32
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Time.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Time.cpp
+index 31109b8..72de868 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Time.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Time.cpp
+@@ -191,15 +191,22 @@ void RegisterTime(FEX::HLE::SyscallHandler* Handler) {
+ 
+   REGISTER_SYSCALL_IMPL_X32(
+     utimensat, [](FEXCore::Core::CpuStateFrame* Frame, int dirfd, const char* pathname, const compat_ptr<timespec32> times, int flags) -> uint64_t {
++      // Android rootfs overlay: resolve pathname through rootfs
++      const char* resolved = pathname;
++      auto EmulatedPath = pathname ? FEX::HLE::_SyscallHandler->FM.GetEmulatedPath(pathname, true) : fextl::string{};
++      if (!EmulatedPath.empty()) {
++        resolved = EmulatedPath.c_str();
++        dirfd = AT_FDCWD;
++      }
+       uint64_t Result = 0;
+       if (times) {
+         FaultSafeUserMemAccess::VerifyIsReadable(times, sizeof(timeval32) * 2);
+         timespec times64[2] {};
+         times64[0] = times[0];
+         times64[1] = times[1];
+-        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, times64, flags);
++        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, resolved, times64, flags);
+       } else {
+-        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, nullptr, flags);
++        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, resolved, nullptr, flags);
+       }
+       SYSCALL_ERRNO();
+     });
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/Semaphore.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/Semaphore.cpp
+index b0daaee..10e2f1f 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/Semaphore.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/Semaphore.cpp
+@@ -8,6 +8,7 @@ $end_info$
+ #include "LinuxSyscalls/Syscalls.h"
+ #include "LinuxSyscalls/x64/Syscalls.h"
+ #include "LinuxSyscalls/x64/Types.h"
++#include "LinuxSyscalls/Syscalls/SysVIPC.h"
+ 
+ #include <FEXHeaderUtils/Syscalls.h>
+ 
+@@ -24,14 +25,16 @@ ARG_TO_STR(FEX::HLE::x64::semun, "%lx")
+ namespace FEX::HLE::x64 {
+ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+   REGISTER_SYSCALL_IMPL_X64(semctl, [](FEXCore::Core::CpuStateFrame* Frame, int semid, int semnum, int cmd, FEX::HLE::x64::semun semun) -> uint64_t {
++    // Route through SysV IPC emulation layer
++    // The emulation handles IPC_64 stripping internally
+     uint64_t Result {};
+-    switch (cmd) {
++    switch (cmd & ~0x100) { // Strip IPC_64 for switch
+     case IPC_SET: {
+       struct semid64_ds buf {};
+       FaultSafeUserMemAccess::VerifyIsReadable(semun.buf, sizeof(*semun.buf));
+       buf = *semun.buf;
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(semun.buf, sizeof(*semun.buf));
+         *semun.buf = buf;
+       }
+@@ -41,8 +44,8 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     case SEM_STAT_ANY:
+     case IPC_STAT: {
+       struct semid64_ds buf {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &buf);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&buf));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(semun.buf, sizeof(*semun.buf));
+         *semun.buf = buf;
+       }
+@@ -51,8 +54,8 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     case SEM_INFO:
+     case IPC_INFO: {
+       struct fex_seminfo si {};
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, &si);
+-      if (Result != -1) {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(&si));
++      if ((int64_t)Result >= 0) {
+         FaultSafeUserMemAccess::VerifyIsWritable(semun.__buf, sizeof(si));
+         memcpy(semun.__buf, &si, sizeof(si));
+       }
+@@ -60,23 +63,25 @@ void RegisterSemaphore(FEX::HLE::SyscallHandler* Handler) {
+     }
+     case GETALL:
+     case SETALL: {
+-      // ptr is just a int32_t* in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun.array);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, reinterpret_cast<unsigned long>(semun.array));
+       break;
+     }
+     case SETVAL: {
+-      // ptr is just a int32_t in this case
+-      Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun.val);
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, static_cast<unsigned long>(semun.val));
+       break;
+     }
+     case IPC_RMID:
+     case GETPID:
+     case GETNCNT:
+     case GETZCNT:
+-    case GETVAL: Result = ::syscall(SYSCALL_DEF(semctl), semid, semnum, cmd, semun); break;
++    case GETVAL: {
++      Result = FEX::HLE::SysVIPC::EmuSemctl(semid, semnum, cmd, 0);
++      break;
++    }
+     default: LOGMAN_MSG_A_FMT("Unhandled semctl cmd: {}", cmd); return -EINVAL;
+     }
+-    SYSCALL_ERRNO();
++    // Emulation returns negative errno directly, not via errno global
++    return Result;
+   });
+ }
+ } // namespace FEX::HLE::x64
+diff --git a/ThunkLibs/HostLibs/CMakeLists.txt b/ThunkLibs/HostLibs/CMakeLists.txt
+index 65025a2..d7803e5 100644
+--- a/ThunkLibs/HostLibs/CMakeLists.txt
++++ b/ThunkLibs/HostLibs/CMakeLists.txt
+@@ -97,29 +97,27 @@ function(add_host_lib NAME GUEST_BITNESS)
+   endif()
+ endfunction()
+ 
+-set(BITNESS_LIST "64")
+-foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
+-  #add_host_lib(fex_malloc_symbols ${GUEST_BITNESS})
+-
+-  #generate(libfex_malloc)
+-  #add_host_lib(fex_malloc ${GUEST_BITNESS})
+-
+-  generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
+-  add_host_lib(asound ${GUEST_BITNESS})
+-
+-  # disabled for now, headers are platform specific
+-  # find_package(SDL2 REQUIRED)
+-  # generate(libSDL2)
+-  # add_host_lib(SDL2 ${GUEST_BITNESS})
+-  # target_include_directories(SDL2-host PRIVATE ${SDL2_INCLUDE_DIRS})
+-
+-  generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
+-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
+-  target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
+-  add_host_lib(drm ${GUEST_BITNESS})
+-endforeach()
++# asound and drm host thunks have char signedness issues when thunkgen runs on
++# amd64 (char=signed) but host libs compile for aarch64 (char=unsigned).
++# Skip them when cross-compiling with THUNKGEN_PATH — not needed on Android anyway.
++if (NOT THUNKGEN_PATH)
++  set(BITNESS_LIST "64")
++  foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
++    generate(libasound ${CMAKE_CURRENT_SOURCE_DIR}/../libasound/libasound_interface.cpp ${GUEST_BITNESS})
++    add_host_lib(asound ${GUEST_BITNESS})
++
++    generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp ${GUEST_BITNESS})
++    target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/drm/)
++    target_include_directories(libdrm-${GUEST_BITNESS}-deps INTERFACE /usr/include/libdrm/)
++    add_host_lib(drm ${GUEST_BITNESS})
++  endforeach()
++endif()
+ 
+-set(BITNESS_LIST "32;64")
++if (SKIP_THUNKS_32)
++  set(BITNESS_LIST "64")
++else()
++  set(BITNESS_LIST "32;64")
++endif()
+ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
+   if (BUILD_FEX_LINUX_TESTS)
+     generate(libfex_thunk_test ${CMAKE_CURRENT_SOURCE_DIR}/../libfex_thunk_test/libfex_thunk_test_interface.cpp ${GUEST_BITNESS})
+@@ -130,18 +128,23 @@ foreach(GUEST_BITNESS IN LISTS BITNESS_LIST)
+   target_include_directories(libvulkan-${GUEST_BITNESS}-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+   add_host_lib(vulkan ${GUEST_BITNESS})
+ 
+-  generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
+-  add_host_lib(wayland-client ${GUEST_BITNESS})
+-  target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+-
+   generate(libEGL ${CMAKE_CURRENT_SOURCE_DIR}/../libEGL/libEGL_interface.cpp ${GUEST_BITNESS})
+   add_host_lib(EGL ${GUEST_BITNESS})
+ 
+-  generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
+-  add_host_lib(GL ${GUEST_BITNESS})
++  # GL, wayland-client have char signedness issues when thunkgen runs on amd64
++  # (char=signed) but host thunks compile for aarch64 (char=unsigned).
++  # Skip them when cross-compiling — not needed on Android.
++  if (NOT THUNKGEN_PATH)
++    generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp ${GUEST_BITNESS})
++    add_host_lib(wayland-client ${GUEST_BITNESS})
++    target_include_directories(libwayland-client-${GUEST_BITNESS}-deps INTERFACE /usr/include/wayland)
+ 
+-  find_package(OpenGL REQUIRED)
+-  target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
++    generate(libGL ${CMAKE_CURRENT_SOURCE_DIR}/../libGL/libGL_interface.cpp ${GUEST_BITNESS})
++    add_host_lib(GL ${GUEST_BITNESS})
++
++    find_package(OpenGL REQUIRED)
++    target_link_libraries(GL-host-${GUEST_BITNESS} PRIVATE OpenGL::GL)
++  endif()
+ endforeach()
+ 
+ if (BUILD_FEX_LINUX_TESTS)
