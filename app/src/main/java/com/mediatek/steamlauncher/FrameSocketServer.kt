@@ -257,7 +257,7 @@ class FrameSocketServer(private val port: Int = 19850) {
                 }
             } ?: return
 
-            // Scale to fit surface, centered, with horizontal flip (Vulkan image is mirrored)
+            // Scale to fit surface, centered
             val scaleX = canvas.width.toFloat() / width
             val scaleY = canvas.height.toFloat() / height
             val scale = minOf(scaleX, scaleY)
@@ -266,8 +266,8 @@ class FrameSocketServer(private val port: Int = 19850) {
 
             canvas.drawColor(Color.BLACK)
             canvas.save()
-            canvas.translate(offsetX + width * scale, offsetY)
-            canvas.scale(-scale, scale)
+            canvas.translate(offsetX, offsetY)
+            canvas.scale(scale, scale)
             canvas.drawBitmap(frameBitmap!!, 0f, 0f, paint)
             canvas.restore()
 
