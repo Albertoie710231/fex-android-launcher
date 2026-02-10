@@ -702,6 +702,12 @@ class ContainerManager(private val context: Context) {
         File(rootfsTmp, ".X11-unix").mkdirs()
         File(rootfsTmp, ".vortek").mkdirs()
         File(rootfsTmp, "shm").mkdirs()
+        File(rootfsTmp, "dumps").mkdirs()
+
+        // Create /dev/shm in rootfs for POSIX named semaphores (sem_open)
+        // glibc's sem_open creates files in /dev/shm/sem.NAME
+        val devShm = File(fexRootfsDir, "dev/shm")
+        devShm.mkdirs()
 
         // Create /etc/resolv.conf for DNS resolution inside FEX guest
         val resolvConf = File(fexRootfsDir, "etc/resolv.conf")
