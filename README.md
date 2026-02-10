@@ -1,149 +1,244 @@
-# MediaTek Steam Gaming App
+# FEX Android Launcher
 
-A Kotlin Android app that runs native Linux Steam with Proton on MediaTek Dimensity tablets using Vortek Vulkan IPC passthrough and FEX-Emu x86-64 emulation.
+Run x86-64 Linux applications on Android with Vulkan GPU passthrough at 120 FPS.
+
+An Android app that uses [FEX-Emu](https://github.com/FEX-Emu/FEX) for x86-64 emulation and [Vortek](https://github.com/brunodev85/winlator) for Vulkan IPC passthrough to the ARM Mali GPU. Tested on MediaTek Dimensity 9300+ with Mali-G720-Immortalis MC12.
+
+## What Works
+
+- **Full x86-64 emulation** via FEX-Emu (Ubuntu 22.04 rootfs)
+- **Vulkan GPU passthrough** — x86-64 Vulkan calls → FEX thunks → Vortek → Mali GPU
+- **Live display at 120 FPS** — 1:1 frame delivery via non-blocking TCP streaming
+- **vulkaninfo** detects Vortek (Mali-G720-Immortalis MC12), Vulkan 1.3.128
+- **vkcube** renders the LunarG spinning cube with correct colors at 118 FPS
+- **dpkg/apt** work inside the FEX rootfs (overlay filesystem fixes applied)
+- **Interactive terminal** with Display/Terminal toggle for Vulkan output
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Android App (Kotlin)                      │
-├─────────────────────────────────────────────────────────────┤
-│  MainActivity          │  SteamService (Foreground)         │
-│  - Game launcher UI    │  - Process management              │
-│  - Settings            │  - Session lifecycle               │
-│  - Container mgmt      │  - Phantom process workaround      │
-├─────────────────────────────────────────────────────────────┤
-│                 Vortek Renderer (Android)                    │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │ libvortekrenderer.so                                    ││
-│  │  - Receives Vulkan commands via Unix socket             ││
-│  │  - Executes on Mali GPU (/vendor/lib64/hw/vulkan.mali)  ││
-│  │  - Renders to HardwareBuffer                            ││
-│  └─────────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │ FramebufferBridge                                       ││
-│  │  - Blits HardwareBuffer → Android Surface               ││
-│  │  - Choreographer vsync (60 FPS)                         ││
-│  └─────────────────────────────────────────────────────────┘│
-├─────────────────────────────────────────────────────────────┤
-│              FEX-Emu (Direct, no PRoot)                      │
-│  ┌─────────────────────────────────────────────────────────┐│
-│  │ FEXLoader (ARM64 native)                                ││
-│  │  ├── x86-64 rootfs (Ubuntu 22.04 from fex-emu.gg)     ││
-│  │  ├── libvulkan_vortek.so (Vulkan ICD)                  ││
-│  │  │   └── Serializes Vulkan calls → sends via socket    ││
-│  │  ├── Steam Client                                       ││
-│  │  ├── DXVK (Direct3D → Vulkan)                          ││
-│  │  └── Proton (Wine-based Windows compat)                 ││
-│  └─────────────────────────────────────────────────────────┘│
-├─────────────────────────────────────────────────────────────┤
-│              Android GPU (Mali G710/G720)                    │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                   Android App (Kotlin)                        │
+├──────────────────────────────────────────────────────────────┤
+│  TerminalActivity              │  ContainerManager            │
+│  - Interactive FEX terminal    │  - Rootfs download & setup   │
+│  - Display/Terminal toggle     │  - Config.json, ICD JSON     │
+│  - SurfaceView (120Hz)         │  - Auto-refresh stale paths  │
+├──────────────────────────────────────────────────────────────┤
+│              Frame Display Pipeline (118 FPS)                 │
+│  ┌──────────────────────────────────────────────────────────┐│
+│  │ FrameSocketServer                                        ││
+│  │  - TCP 19850 receiver (non-blocking sender)              ││
+│  │  - Direct lockHardwareCanvas rendering (no Choreographer)││
+│  │  - R↔B color swizzle via GPU ColorMatrix                 ││
+│  │  - 1:1 frame delivery (recv = display = 118 FPS)         ││
+│  └──────────────────────────────────────────────────────────┘│
+├──────────────────────────────────────────────────────────────┤
+│              Vortek Renderer (Android-side)                   │
+│  ┌──────────────────────────────────────────────────────────┐│
+│  │ VortekRendererComponent (libvortekrenderer.so)           ││
+│  │  - Receives Vulkan commands via Unix socket              ││
+│  │  - Executes on Mali GPU (/vendor/lib64/hw/vulkan.mali)   ││
+│  └──────────────────────────────────────────────────────────┘│
+├──────────────────────────────────────────────────────────────┤
+│              FEX-Emu (x86-64 emulation, no PRoot)            │
+│  ┌──────────────────────────────────────────────────────────┐│
+│  │ FEXLoader (ARM64 native, invoked via ld.so wrapper)      ││
+│  │  ├── x86-64 rootfs (Ubuntu 22.04)                        ││
+│  │  ├── Vulkan ICD loader → vortek_icd_wrapper.so           ││
+│  │  │   └── Calls vortekInitOnce() + maps vk→vt_call_*     ││
+│  │  ├── FEX thunks (guest x86-64 ↔ host ARM64 Vulkan)      ││
+│  │  └── LD_PRELOAD headless wrapper (frame capture)         ││
+│  └──────────────────────────────────────────────────────────┘│
+├──────────────────────────────────────────────────────────────┤
+│              Mali-G720-Immortalis MC12 (Vulkan 1.3.128)      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Key Design: No PRoot
-
-FEX-Emu runs directly via `ProcessBuilder` — no PRoot, no ptrace overhead:
+### Vulkan Pipeline (Full Chain)
 
 ```
-App → ProcessBuilder → ld-linux-aarch64.so.1 → FEXLoader → x86-64 bash/Steam
+x86-64 app (vkcube)
+    │  LD_PRELOAD: libvulkan_headless.so (fake swapchain + frame capture)
+    ↓
+FEX thunks (x86-64 guest → ARM64 host Vulkan calls)
+    ↓
+Vulkan ICD loader (libvulkan.so.1 → libvulkan_loader.so)
+    ↓
+vortek_icd_wrapper.so (vortekInitOnce + vk→vt_call_ mapping)
+    ↓
+libvulkan_vortek.so (serializes Vulkan → Unix socket + ashmem)
+    ↓
+VortekRendererComponent (deserializes → Mali GPU)
+    ↓
+Mali-G720 GPU (renders frames)
+    ↓
+headless wrapper: vkMapMemory → TCP 19850 (non-blocking, frame dropping)
+    ↓
+FrameSocketServer → lockHardwareCanvas → SurfaceView (120Hz)
 ```
-
-FEX provides its own rootfs overlay that handles filesystem redirection:
-- `/bin`, `/usr/lib`, etc. → redirected to FEX's x86-64 rootfs
-- `/dev`, `/proc`, `/sys` → host devices directly (including GPU)
-- `/tmp` → redirected to rootfs `/tmp/` (symlinks for Vortek/X11 sockets)
-
-## Vortek: How Mali GPU Works
-
-The key innovation is **Vortek IPC passthrough** - bridging glibc (container) and Bionic (Android):
-
-```
-FEX Container (glibc)          Android (Bionic)
-┌─────────────────┐            ┌─────────────────┐
-│ Game/Steam      │            │                 │
-│      ↓          │            │                 │
-│ DXVK (D3D→VK)   │            │                 │
-│      ↓          │            │                 │
-│ libvulkan_vortek│───socket──→│ VortekRenderer  │
-│ (serialize API) │  + ashmem  │ (execute on GPU)│
-└─────────────────┘            └────────┬────────┘
-                                        ↓
-                               vulkan.mali.so
-                                        ↓
-                                   Mali GPU
-```
-
-This bypasses the glibc/Bionic binary incompatibility that prevents loading Android's Vulkan driver directly from the container.
 
 ## Requirements
 
 - Android device with:
-  - MediaTek Dimensity SoC (9000/9200/9300 series recommended)
-  - Mali G710 or newer GPU
+  - ARM64 SoC with Mali GPU (tested on MediaTek Dimensity 9300+)
   - Vulkan 1.1+ support
   - 8GB+ RAM recommended
   - Android 8.0+ (API 26+)
-- Android Studio with:
-  - Android SDK 34
-  - Android NDK (latest)
-  - CMake 3.22.1+
+- Build tools:
+  - Android Studio with SDK 34, NDK, CMake 3.22.1+
+  - Docker (for cross-compiling x86-64 headless wrapper)
 
 ## Building
 
-1. Download vendor sources for the NDK-built `unsquashfs` tool:
-   ```bash
-   bash scripts/fetch_unsquashfs_source.sh
-   ```
+```bash
+# Build the APK
+./gradlew assembleDebug
 
-2. Build the project:
-   ```bash
-   ./gradlew assembleDebug
-   ```
+# Install on device
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-3. Install on device:
-   ```bash
-   adb install -r app/build/outputs/apk/debug/app-debug.apk
-   ```
+### Cross-compile Scripts (Docker)
+
+```bash
+# Headless Vulkan wrapper (x86-64 .so, deployed to rootfs)
+fex-emu/build_vulkan_headless.sh
+
+# Vulkan ICD loader (ARM64 glibc)
+fex-emu/build_vulkan_loader.sh
+
+# Vortek ICD wrapper (ARM64 glibc)
+fex-emu/build_vortek_wrapper.sh
+
+# FEX-Emu with thunks
+fex-emu/build_fex_thunks.sh
+```
 
 ## First Run Setup
 
-1. Launch the app and grant storage permissions
+1. Launch the app and grant permissions
+2. Click **"Setup Container"** — downloads and extracts:
+   - FEX ARM64 binaries from bundled `fex-bin.tgz`
+   - x86-64 SquashFS rootfs (~995MB) from `rootfs.fex-emu.gg`
+   - Configures FEX (Config.json, thunks, Vortek ICD)
+3. Open **Terminal** and test:
+   ```
+   uname -a    # Should show x86_64
+   vulkaninfo --summary    # Should show Vortek (Mali-G720)
+   ```
+4. Run vkcube with display:
+   ```
+   export LD_PRELOAD=/usr/lib/libvulkan_headless.so DISPLAY=:0; vkcube
+   ```
+   Press **Display** button to see the live rendering
 
-2. Click **"Setup Container"** — this will:
-   - Extract FEX ARM64 binaries from bundled `fex-bin.tgz`
-   - Download x86-64 SquashFS rootfs (~995MB) from `rootfs.fex-emu.gg`
-   - Extract rootfs with NDK-built `unsquashfs` (~2GB extracted)
-   - Configure FEX (`Config.json`, thunks)
-   - Setup Vortek Vulkan ICD in the rootfs
-   - Download and extract Steam
+## Key Technical Challenges Solved
 
-3. Open Terminal and verify FEX works
+### Android Seccomp Blocking FEX Syscalls
+Android's seccomp filter kills processes using blocked syscalls. Two-layer fix:
+- **Layer 1**: Binary-patch glibc to replace `svc #0` with `movn x0, #37` for uncatchable `SECCOMP_RET_KILL`
+- **Layer 2**: SIGSYS handler in FEXCore redirects catchable syscalls (`accept→accept4`, `openat2→openat`)
 
-4. Click **"Launch Steam"** to start Steam via FEX
+### Vortek ICD Not Standard-Compliant
+Winlator's `libvulkan_vortek.so` returns NULL from `vk_icdGetInstanceProcAddr` because `vortekInitOnce()` is never called during standard ICD loader protocol. Fix: `vortek_icd_wrapper.so` — thin wrapper that calls `vortekInitOnce()` and maps `vk→vt_call_*`.
+
+### FEX Rootfs Overlay Fallback Bug
+FEX's FileManager tried raw host paths when overlay operations failed, returning wrong errno on Android (e.g., `ENOENT` instead of `EEXIST`). Fix: return overlay result directly when path resolves, don't fall through.
+
+### Hard Links Blocked by SELinux
+Android SELinux blocks `linkat` in app data dirs. dpkg needs backup links. Fix: `LinkatWithCopyFallback` — tries `linkat`, falls back to `sendfile` copy on `EPERM`.
+
+### Stale Paths After APK Reinstall
+Every `adb install` changes `nativeLibDir` (random hash), breaking 3 paths. Fix: `refreshNativeLibPaths()` auto-updates Config.json, libvulkan.so.1 symlink, and ICD JSON on every launch.
+
+### Frame Streaming Optimization
+Evolved through multiple iterations:
+1. **Choreographer + double-buffer** → 50 FPS display (missed vsync deadlines)
+2. **Blocking TCP** → throttled vkcube to 65-90 FPS (variable, caused visual "acceleration")
+3. **Non-blocking TCP + vsync emulation + direct rendering** → 118 FPS 1:1 delivery (current)
+
+## Android 12+ Phantom Process Fix
+
+```bash
+adb shell "settings put global settings_enable_monitor_phantom_procs false"
+adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent"
+adb shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647"
+```
+
+## Project Structure
+
+```
+app/src/main/
+├── java/com/mediatek/steamlauncher/
+│   ├── SteamLauncherApp.kt         # Application class, path helpers
+│   ├── MainActivity.kt             # Main launcher UI
+│   ├── TerminalActivity.kt         # Terminal + Display toggle, 120Hz, Vortek setup
+│   ├── GameActivity.kt             # Game launcher
+│   ├── SettingsActivity.kt         # Settings & diagnostics
+│   ├── SteamService.kt             # Foreground service (keeps FEX alive)
+│   ├── ContainerManager.kt         # Rootfs setup, Config.json, refreshNativeLibPaths()
+│   ├── FexExecutor.kt              # ld.so wrapper, FEXServer lifecycle, env setup
+│   ├── FrameSocketServer.kt        # TCP frame receiver, direct lockHardwareCanvas render
+│   ├── FramebufferBridge.kt        # HardwareBuffer → Surface blitting
+│   ├── VortekRenderer.kt           # Vortek component wrapper
+│   ├── VortekSurfaceView.kt        # Vortek rendering surface
+│   ├── VulkanBridge.kt             # Vulkan/Vortek ICD setup
+│   ├── X11Server.kt                # X11 server lifecycle
+│   ├── X11SocketHelper.kt          # Unix socket helper
+│   └── X11SocketServer.kt          # X11 socket server
+├── assets/
+│   ├── vulkan_headless.c           # x86-64 headless Vulkan wrapper (LD_PRELOAD)
+│   ├── libvulkan_headless.so       # Compiled headless wrapper
+│   ├── fex-bin.tgz                 # FEX ARM64 binaries + glibc 2.38
+│   └── libvulkan_vortek.so         # Container Vulkan ICD (from Winlator)
+├── jniLibs/arm64-v8a/
+│   ├── libFEX*.so                  # FEX binaries (in nativeLibDir for SELinux exec)
+│   ├── libvortekrenderer.so        # Android Vulkan executor
+│   ├── libvortek_icd_wrapper.so    # ICD wrapper (vortekInitOnce + vk→vt_call_)
+│   ├── libvulkan_loader.so         # Cross-compiled Vulkan ICD loader
+│   ├── libhook_impl.so             # Mali driver hook
+│   └── ...
+├── cpp/
+│   ├── CMakeLists.txt              # NDK build (includes unsquashfs)
+│   ├── steamlauncher.cpp           # JNI bridge
+│   ├── framebuffer_bridge.cpp      # HardwareBuffer JNI
+│   ├── x11_socket.cpp              # Unix socket JNI
+│   └── vendor/                     # squashfs-tools & xz-utils source
+└── res/layout/                     # UI layouts
+
+fex-emu/
+├── build_vulkan_headless.sh        # Cross-compile headless wrapper
+├── build_vulkan_loader.sh          # Cross-compile Vulkan ICD loader
+├── build_vortek_wrapper.sh         # Cross-compile vortek_icd_wrapper.so
+├── build_fex_thunks.sh             # Full FEX build with thunks
+├── vortek_icd_wrapper.c            # ICD wrapper source
+└── ...
+
+scripts/
+├── patch_glibc_seccomp.py          # Binary-patch glibc for seccomp bypass
+├── patch_vortek_socket_path.py     # Binary-patch Vortek socket path + RUNPATH
+└── fetch_unsquashfs_source.sh      # Downloads vendor source for NDK build
+```
+
+## Device Tested
+
+- Samsung tablet, MediaTek Dimensity 9300+ (MT6989)
+- GPU: Mali-G720-Immortalis MC12
+- Android 14
+- 120Hz display
 
 ## Testing FEX via ADB
 
-FEX binaries are **patched with patchelf** so `PT_INTERP` points to the device path
-(`/data/data/com.mediatek.steamlauncher/files/fex/lib/ld-linux-aarch64.so.1`).
-This means FEXLoader can be invoked **directly** — no `ld-linux-aarch64.so.1` wrapper needed.
-However, `LD_LIBRARY_PATH` must be set explicitly (RPATH alone isn't sufficient on Android).
-
-### Important: PATH inside FEX bash
-
-When running commands inside FEX bash from ADB, you **must set PATH explicitly**:
-
 ```bash
-export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# Quick version check
+adb shell run-as com.mediatek.steamlauncher env \
+  LD_LIBRARY_PATH=/data/data/com.mediatek.steamlauncher/files/fex/lib \
+  /data/data/com.mediatek.steamlauncher/files/fex/bin/FEXLoader --version
+# Expected: FEX-Emu (FEX-2506)
 ```
 
-Without this, bash inherits Android's PATH and resolves tools to `/system/bin/` (ARM64 Android
-binaries), which fail with "Operation not permitted" inside FEX. The app's `FexExecutor.kt`
-handles this automatically via `buildBaseEnvironment()`, but manual ADB tests need it.
-
-### Quick test (push a script)
-
-Multiline `sh -c` commands break over ADB. For reliable testing, push a script file:
+For detailed testing, push a script (multiline `sh -c` breaks over ADB):
 
 ```bash
 cat > /tmp/fex_test.sh << 'EOF'
@@ -156,260 +251,60 @@ export LD_LIBRARY_PATH=$FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu
 unset LD_PRELOAD BOOTCLASSPATH ANDROID_ART_ROOT ANDROID_I18N_ROOT
 unset ANDROID_TZDATA_ROOT COLORTERM DEX2OATBOOTCLASSPATH ANDROID_DATA
 
-# Start FEXServer (required before FEXLoader can run guest binaries)
 $FEXDIR/bin/FEXServer -f -p 300 &
 sleep 3
 
 echo "=== FEXLoader version ==="
 $FEXDIR/bin/FEXLoader --version
 
-echo "=== uname -a (direct) ==="
+echo "=== uname ==="
 $FEXDIR/bin/FEXLoader -- /bin/uname -a
 
 echo "=== os-release ==="
 $FEXDIR/bin/FEXLoader -- /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; head -4 /etc/os-release"
-
-echo "=== Child exec (arch, tools) ==="
-$FEXDIR/bin/FEXLoader -- /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; echo arch=\$(uname -m); echo ls=\$(which ls); echo bash=\$BASH_VERSION"
 EOF
 
 adb push /tmp/fex_test.sh /data/local/tmp/fex_test.sh
 adb shell run-as com.mediatek.steamlauncher sh /data/local/tmp/fex_test.sh
 ```
 
-Expected output:
-```
-=== FEXLoader version ===
-FEX-Emu (FEX-2506)
-=== uname -a (direct) ===
-Linux localhost 6.1.134 #FEX-2506 SMP ... x86_64 x86_64 x86_64 GNU/Linux
-=== os-release ===
-PRETTY_NAME="Ubuntu 22.04.5 LTS"
-NAME="Ubuntu"
-VERSION_ID="22.04"
-VERSION="22.04.5 LTS (Jammy Jellyfish)"
-=== Child exec (arch, tools) ===
-arch=x86_64
-ls=/usr/bin/ls
-bash=5.1.16(1)-release
-```
-
-### Verify FEXLoader runs (one-liner)
-
-```bash
-adb shell run-as com.mediatek.steamlauncher env \
-  LD_LIBRARY_PATH=/data/data/com.mediatek.steamlauncher/files/fex/lib \
-  /data/data/com.mediatek.steamlauncher/files/fex/bin/FEXLoader --version
-```
-
-Expected: `FEX-Emu (FEX-2506)`
-
-### Test unsquashfs binary
-
-```bash
-NATIVELIB=$(dirname $(adb shell pm path com.mediatek.steamlauncher | cut -d: -f2 | tr -d '\r\n'))/lib/arm64
-
-adb shell "run-as com.mediatek.steamlauncher $NATIVELIB/libunsquashfs.so -version"
-```
-
-Expected: `unsquashfs version 4.6.1`
-
-## Android 12+ Phantom Process Fix
-
-Android 12 aggressively kills background processes. Run these ADB commands to prevent this:
-
-```bash
-# Disable phantom process monitoring
-adb shell "settings put global settings_enable_monitor_phantom_procs false"
-
-# Or set max phantom processes to unlimited
-adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent"
-adb shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647"
-
-# Verify
-adb shell "/system/bin/dumpsys activity settings | grep max_phantom"
-```
-
-## Project Structure
-
-```
-app/
-├── src/main/
-│   ├── java/com/mediatek/steamlauncher/
-│   │   ├── SteamLauncherApp.kt     # Application class, path helpers
-│   │   ├── MainActivity.kt          # Main launcher UI
-│   │   ├── SteamService.kt          # Foreground service
-│   │   ├── ContainerManager.kt      # FEX rootfs setup & management
-│   │   ├── FexExecutor.kt           # FEXLoader process execution
-│   │   ├── TerminalActivity.kt      # Interactive FEX terminal
-│   │   ├── SettingsActivity.kt      # Settings & diagnostics
-│   │   ├── VulkanBridge.kt          # Vulkan/Vortek ICD setup
-│   │   ├── VortekRenderer.kt        # Vortek Vulkan wrapper
-│   │   ├── FramebufferBridge.kt     # HardwareBuffer → Surface
-│   │   ├── FrameSocketServer.kt     # TCP frame receiver
-│   │   ├── X11Server.kt             # X11 server lifecycle
-│   │   ├── X11SocketHelper.kt       # Unix socket helper
-│   │   └── ...
-│   ├── cpp/
-│   │   ├── CMakeLists.txt           # NDK build (includes unsquashfs)
-│   │   ├── steamlauncher.cpp        # JNI bridge
-│   │   ├── framebuffer_bridge.cpp   # HardwareBuffer JNI
-│   │   ├── x11_socket.cpp           # Unix socket JNI
-│   │   └── vendor/                  # squashfs-tools & xz-utils source
-│   ├── jniLibs/arm64-v8a/
-│   │   ├── libvortekrenderer.so     # Android Vulkan executor
-│   │   ├── libhook_impl.so         # Mali driver hook
-│   │   └── ...
-│   ├── assets/
-│   │   ├── fex-bin.tgz             # FEX ARM64 binaries + glibc 2.38
-│   │   ├── libvulkan_vortek.so      # Container Vulkan ICD
-│   │   ├── libvulkan_headless.so    # Headless surface wrapper
-│   │   └── vkcube, vulkaninfo       # Test binaries
-│   └── res/
-│       └── layout/                  # UI layouts
-├── build.gradle.kts
-└── scripts/
-    └── fetch_unsquashfs_source.sh   # Downloads vendor source for NDK build
-```
-
-## Key Components
-
-### FexExecutor
-Runs FEXLoader directly via `ProcessBuilder` (binaries patched with patchelf):
-- Invokes FEXLoader directly (PT_INTERP patched to device path, no ld.so wrapper)
-- Sets `LD_LIBRARY_PATH` for FEX native libraries (RPATH alone isn't sufficient on Android)
-- Clears Android env pollution (LD_PRELOAD, ANDROID_*, etc.)
-- Sets PATH to `/usr/local/bin:/usr/bin:/bin` so guest bash finds rootfs tools (not `/system/bin/`)
-- Sets `USE_HEAP=1` to avoid SBRK allocation issues
-- Manages FEXServer lifecycle (must be running before FEXLoader can execute guest binaries)
-- Creates symlinks in FEX rootfs `/tmp/` for Vortek and X11 sockets
-
-### ContainerManager
-Manages the FEX environment lifecycle:
-- Extracts FEX ARM64 binaries from bundled `fex-bin.tgz`
-- Downloads and extracts x86-64 SquashFS rootfs via NDK-built `unsquashfs`
-- Writes FEX Config.json and thunks.json
-- Sets up Vortek ICD and Steam
-
-### SteamService
-Foreground service that keeps the FEX container alive. Required for Android 12+ to prevent the system from killing background processes.
-
-### VortekRenderer
-Android-side Vulkan execution:
-- `libvortekrenderer.so` - receives serialized Vulkan commands
-- Executes on Mali GPU via `/vendor/lib64/hw/vulkan.mali.so`
-- Renders to HardwareBuffer (GPU memory)
-
-### FramebufferBridge
-Zero-copy GPU frame display:
-1. VortekRenderer renders to AHardwareBuffer (GPU memory)
-2. FramebufferBridge wraps as Bitmap (GPU-backed)
-3. Blits to Android Surface via Canvas
-4. Choreographer syncs to 60 FPS vsync
-
-### libvulkan_vortek.so (Container ICD)
-Container-side Vulkan serialization:
-- Implements full Vulkan API for container apps
-- Serializes all Vulkan commands
-- Sends via Unix socket to VortekRenderer
-
-### X11Server / LorieView
-Provides X11 display server functionality:
-- Renders X11 content to Android Surface
-- Translates Android touch events to X11 mouse events
-- Handles keyboard input
-
-## Troubleshooting
-
-### FEXLoader: "Couldn't execute: FEXServer"
-FEXServer must be started before FEXLoader can execute guest binaries. The app handles this automatically via `FexExecutor`, but for manual ADB testing, start FEXServer first (see testing section above).
-
-### Vulkan/vkcube not rendering
-1. Check Vortek ICD is configured:
-   ```bash
-   cat /usr/share/vulkan/icd.d/vortek_icd.json
-   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
-   ```
-2. Check VortekRenderer is running (Android logs)
-3. Run `vulkaninfo --summary` - should show Mali GPU
-
-### Black screen / no rendering
-- For Vulkan apps: Check FramebufferBridge is receiving frames
-- For X11 apps: Verify X11 socket exists `/tmp/.X11-unix/X0`
-- Check DISPLAY is set: `echo $DISPLAY` should show `:0`
-
-### App killed by Android
-- Run the phantom process fix commands via ADB
-- Ensure the foreground service notification is showing
-- Check Settings > Battery > Steam Launcher is unrestricted
-
-## License
-
-MIT License
-
-## Credits
-
-- [Winlator](https://github.com/brunodev85/winlator) - Vortek Vulkan IPC passthrough
-- [FEX-Emu](https://github.com/FEX-Emu/FEX) - x86-64 emulation with glibc emulation (FEX-2506)
-- [Termux:X11](https://github.com/termux/termux-x11) - X11 server inspiration
-
 ## Technical Notes
 
 ### FEXLoader Invocation on Android
 
-FEX binaries originally have `PT_INTERP=/opt/fex/lib/ld-linux-aarch64.so.1` hardcoded. On Android, `/opt/fex/` doesn't exist. We solve this with **patchelf** at build time:
+FEX binaries are stored in `jniLibs/arm64-v8a/` (installed to `nativeLibDir`) for SELinux exec permission. They are invoked via the bundled `ld-linux-aarch64.so.1`:
 
 ```bash
-# Applied to all FEX binaries (FEXLoader, FEXServer, FEXInterpreter, etc.)
-patchelf --set-interpreter /data/data/com.mediatek.steamlauncher/files/fex/lib/ld-linux-aarch64.so.1 FEXLoader
-patchelf --set-rpath /data/data/com.mediatek.steamlauncher/files/fex/lib FEXLoader
+ld.so --library-path <nativeLibDir>:<fexDir>/lib libFEX.so /bin/bash -c "command"
 ```
 
-This allows **direct invocation** without the ld.so wrapper:
-
-```bash
-export LD_LIBRARY_PATH=${fexDir}/lib:${fexDir}/lib/aarch64-linux-gnu
-${fexDir}/bin/FEXLoader -- /bin/bash -c "command"
-```
-
-Direct invocation is critical because it makes `/proc/self/exe` point to FEXLoader (not ld.so),
-which is required for child process exec to work (FEX re-executes via `/proc/self/exe`).
-
-**LD_LIBRARY_PATH is required** — RPATH alone isn't sufficient on Android's dynamic linker.
-
-Where `fexDir = ${context.filesDir}/fex` (extracted from `fex-bin.tgz`).
+`LD_LIBRARY_PATH` must be set explicitly — RPATH alone isn't sufficient on Android's dynamic linker.
 
 ### Vortek IPC Architecture
-Vortek solves the fundamental problem that Android's Vulkan driver (vulkan.mali.so) uses Bionic libc, but container apps use glibc. You cannot load a Bionic library from glibc code.
 
-**Solution:** Serialize Vulkan API calls in the container, send via Unix socket + ashmem ring buffers (4MB commands, 256KB results), deserialize and execute in Android process.
+Vortek solves the fundamental problem that Android's Vulkan driver (`vulkan.mali.so`) uses Bionic libc, but container apps use glibc. You cannot load a Bionic library from glibc code.
 
-**Components:**
-- `libvulkan_vortek.so` (glibc, container) - Vulkan ICD that serializes API calls
-- `libvortekrenderer.so` (Bionic, Android) - Executes on real Mali GPU
-- `libhook_impl.so` - Intercepts vulkan.mali.so loading
+**Solution:** Serialize Vulkan API calls in the container, send via Unix socket + ashmem ring buffers (4MB commands, 256KB results), deserialize and execute in the Android process.
 
 ### Socket Access in FEX
 
-FEX redirects `/tmp` to rootfs `/tmp/`. To make Vortek and X11 sockets accessible from the FEX environment, symlinks are created in the rootfs:
+FEX redirects `/tmp` to rootfs `/tmp/`. Symlinks bridge Vortek and X11 sockets:
 
 ```
 ${fexRootfsDir}/tmp/.vortek/V0 → ${actualTmpDir}/.vortek/V0
 ${fexRootfsDir}/tmp/.X11-unix/X0 → ${actualX11SocketDir}/X0
 ```
 
-### FEX-Emu Build Notes
-
-- FEX binaries are bundled as `fex-bin.tgz` in assets (`.tgz` extension prevents AAPT decompression)
-- Binaries are **patched with patchelf**: PT_INTERP and RPATH point to device paths
-- `LD_LIBRARY_PATH` must be set at runtime (RPATH alone isn't sufficient on Android)
-- `FEXInterpreter` is a binfmt handler — do NOT pass `--help`/`--version` to it
-- Use `FEXLoader --version` for testing, `FEXLoader -- /path/to/x86/binary` for running x86 programs
-- FEXServer must be running before FEXLoader can execute guest binaries (start with `-f -p 300`)
-- SquashFS rootfs from `rootfs.fex-emu.gg` uses **zstd compression** — unsquashfs must be built with zstd support
-- SquashFS rootfs is extracted by NDK-built `unsquashfs` (packaged as `libunsquashfs.so`)
-- Android doesn't support hardlinks in app data dirs — unsquashfs is patched to copy files as fallback
-
 ### NDK-built unsquashfs
 
-`unsquashfs` is compiled from squashfs-tools 4.6.1 source via Android NDK as part of the normal APK build. This eliminates the need for an ARM64 Ubuntu rootfs just to run `apt-get install squashfs-tools`. Sources are downloaded by `scripts/fetch_unsquashfs_source.sh` into `app/src/main/cpp/vendor/`.
+`unsquashfs` is compiled from squashfs-tools 4.6.1 source via Android NDK as part of the APK build (packaged as `libunsquashfs.so`). Sources are downloaded by `scripts/fetch_unsquashfs_source.sh` into `app/src/main/cpp/vendor/`.
+
+## Credits
+
+- [FEX-Emu](https://github.com/FEX-Emu/FEX) — x86-64 emulation (custom FEX-2506 build)
+- [Winlator](https://github.com/brunodev85/winlator) — Vortek Vulkan IPC passthrough
+- [Termux:X11](https://github.com/termux/termux-x11) — X11 server inspiration
+
+## License
+
+MIT License
