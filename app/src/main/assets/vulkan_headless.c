@@ -706,16 +706,16 @@ static VkResult my_vkGetPhysicalDeviceSurfaceFormatsKHR(
 
     SurfaceEntry* entry = find_surface(surface);
     if (entry) {
+        // Only B8G8R8A8 — matches Android ARGB_8888 bitmap byte order (BGRA on LE)
         static const VkSurfaceFormatKHR formats[] = {
             { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
-            { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
         };
-        if (!pFormats) { *pCount = 2; return VK_SUCCESS; }
-        uint32_t copy = *pCount < 2 ? *pCount : 2;
+        if (!pFormats) { *pCount = 1; return VK_SUCCESS; }
+        uint32_t copy = *pCount < 1 ? *pCount : 1;
         memcpy(pFormats, formats, copy * sizeof(VkSurfaceFormatKHR));
         *pCount = copy;
-        fprintf(stderr, "[XCB-Bridge] Surface formats: returning %u formats\n", copy);
-        return copy < 2 ? VK_INCOMPLETE : VK_SUCCESS;
+        fprintf(stderr, "[XCB-Bridge] Surface formats: returning %u formats (B8G8R8A8 only)\n", copy);
+        return VK_SUCCESS;
     }
 
     // Forward unknown surfaces

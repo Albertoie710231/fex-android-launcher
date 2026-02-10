@@ -2,6 +2,8 @@ package com.mediatek.steamlauncher
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.util.Log
 import android.view.Surface
@@ -47,6 +49,13 @@ class FrameSocketServer(private val port: Int = 19850) {
     private val paint = Paint().apply {
         isFilterBitmap = false
         isAntiAlias = false
+        // Swizzle R↔B: GPU/Vortek outputs RGBA bytes but Android ARGB_8888 expects BGRA
+        colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+            0f, 0f, 1f, 0f, 0f,  // R ← B
+            0f, 1f, 0f, 0f, 0f,  // G ← G
+            1f, 0f, 0f, 0f, 0f,  // B ← R
+            0f, 0f, 0f, 1f, 0f   // A ← A
+        )))
     }
 
     // Frame stats
