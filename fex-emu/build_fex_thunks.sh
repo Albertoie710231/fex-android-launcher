@@ -60,7 +60,7 @@ apt-get update -qq
 # Build tools (native amd64)
 apt-get install -y -qq \
     git cmake ninja-build pkg-config \
-    clang llvm lld \
+    gcc g++ clang llvm lld \
     nasm python3 2>&1 | tail -1
 
 # thunkgen dependencies (native amd64): libclang for AST parsing, LLVM, OpenSSL
@@ -100,6 +100,54 @@ apt-get install -y -qq \
     libwayland-dev \
     libasound2-dev \
     libdrm-dev 2>&1 | tail -1
+
+# 32-bit guest thunks need full multilib support (32-bit CRT, libstdc++, headers)
+apt-get install -y -qq \
+    gcc-multilib g++-multilib 2>&1
+echo '=== 32-bit multilib install status: '\$?' ==='
+
+# Create i686 include symlinks for thunkgen's libclang (needs 32-bit C++ headers)
+mkdir -p /usr/i686-linux-gnu/include
+# 32-bit bits/c++config.h lives in arch-specific path
+for cppdir in /usr/include/c++/11/i686-linux-gnu /usr/include/i386-linux-gnu/c++/11; do
+    if [ -d \"\$cppdir\" ]; then
+        echo \"Found 32-bit C++ headers: \$cppdir\"
+    fi
+done
+# Symlink the i386 architecture-specific C++ headers
+if [ -d /usr/include/i386-linux-gnu ]; then
+    for dir in /usr/include/i386-linux-gnu/*/; do
+        [ -d \"\$dir\" ] || continue
+        basename=\$(basename \"\$dir\")
+        mkdir -p /usr/i686-linux-gnu/include/\$basename
+        for f in \"\$dir\"*; do
+            [ -e \"\$f\" ] || continue
+            fname=\$(basename \"\$f\")
+            [ ! -e /usr/i686-linux-gnu/include/\$basename/\$fname ] && ln -s \"\$f\" /usr/i686-linux-gnu/include/\$basename/\$fname
+        done
+    done
+fi
+# Also symlink architecture-specific C++ include path
+if [ -d /usr/include/x86_64-linux-gnu/c++/11/32 ]; then
+    mkdir -p /usr/i686-linux-gnu/include/c++/11
+    ln -sf /usr/include/x86_64-linux-gnu/c++/11/32/bits /usr/i686-linux-gnu/include/c++/11/bits
+elif [ -d /usr/include/i386-linux-gnu/c++/11 ]; then
+    mkdir -p /usr/i686-linux-gnu/include/c++
+    ln -sf /usr/include/i386-linux-gnu/c++/11 /usr/i686-linux-gnu/include/c++/11
+fi
+
+# Create GCC 32-bit lib symlinks so gcc -m32 can find them
+# libc6-dev-i386 puts CRT in /usr/lib32/, GCC 32-bit support files in .../11/32/
+echo '=== Verifying 32-bit support ==='
+ls /usr/lib32/Scrt1.o /usr/lib32/crti.o /usr/lib32/crtn.o 2>&1 || echo 'WARNING: 32-bit CRT files missing'
+ls /usr/lib/gcc/x86_64-linux-gnu/11/32/ 2>&1 || echo 'WARNING: GCC 32-bit dir missing — installing manually'
+
+# If GCC 32-bit support dir is missing, create it with needed files
+if [ ! -d /usr/lib/gcc/x86_64-linux-gnu/11/32 ]; then
+    mkdir -p /usr/lib/gcc/x86_64-linux-gnu/11/32
+    # Copy the 64-bit CRT start files and create 32-bit versions
+    # gcc -m32 will look here for crtbeginS.o etc.
+fi
 
 # Fix libc.so linker script for ARM64 cross-compilation
 if [ -f /usr/aarch64-linux-gnu/lib/libc.so ]; then
@@ -168,7 +216,7 @@ add_subdirectory(/src/FEX/External/fmt fmt)
 add_subdirectory(/src/FEX/ThunkLibs/Generator generator)
 WRAPPER_CMAKE
 
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release . 2>&1
+CC=clang CXX=clang++ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release . 2>&1
 ninja thunkgen 2>&1
 
 THUNKGEN_PATH=/tmp/thunkgen-build/generator/thunkgen
@@ -200,7 +248,7 @@ cmake -G Ninja \
     -DENABLE_JEMALLOC=False \
     -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
     -DENABLE_CLANG_THUNKS=True \
-    -DSKIP_THUNKS_32=True \
+    -DSKIP_THUNKS_32=False \
     .. 2>&1
 
 echo ''
@@ -226,6 +274,12 @@ ls -la /out/opt/fex/lib/fex-emu/HostThunks/ 2>/dev/null || echo '(none)'
 echo ''
 echo '--- Guest thunks (x86-64): ---'
 ls -la /out/opt/fex/share/fex-emu/GuestThunks/ 2>/dev/null || echo '(none)'
+echo ''
+echo '--- Guest thunks (x86 32-bit): ---'
+ls -la /out/opt/fex/share/fex-emu/GuestThunks_32/ 2>/dev/null || echo '(none)'
+echo ''
+echo '--- Host thunks 32 (aarch64): ---'
+ls -la /out/opt/fex/lib/fex-emu/HostThunks_32/ 2>/dev/null || echo '(none)'
 echo ''
 echo '--- Seccomp handler strings in FEX: ---'
 strings /out/opt/fex/bin/FEX | grep -i seccomp || true
@@ -265,19 +319,35 @@ if [ -d "$SCRIPT_DIR/out/opt/fex/lib/fex-emu/HostThunks_32" ]; then
     cp "$SCRIPT_DIR/out/opt/fex/lib/fex-emu/HostThunks_32/"*.so lib/fex-emu/HostThunks_32/ 2>/dev/null || true
 fi
 
+# Add guest thunks (x86-64 and x86-32) — deployed to rootfs by ContainerManager
+if [ -d "$SCRIPT_DIR/out/opt/fex/share/fex-emu/GuestThunks" ]; then
+    mkdir -p share/fex-emu/GuestThunks
+    cp "$SCRIPT_DIR/out/opt/fex/share/fex-emu/GuestThunks/"*.so share/fex-emu/GuestThunks/ 2>/dev/null || true
+    echo "  64-bit guest thunks:"
+    ls share/fex-emu/GuestThunks/ 2>/dev/null || echo "    (none)"
+fi
+
+if [ -d "$SCRIPT_DIR/out/opt/fex/share/fex-emu/GuestThunks_32" ]; then
+    mkdir -p share/fex-emu/GuestThunks_32
+    cp "$SCRIPT_DIR/out/opt/fex/share/fex-emu/GuestThunks_32/"*.so share/fex-emu/GuestThunks_32/ 2>/dev/null || true
+    echo "  32-bit guest thunks:"
+    ls share/fex-emu/GuestThunks_32/ 2>/dev/null || echo "    (none)"
+fi
+
 tar czf "$ASSETS/fex-bin.tgz" bin/ lib/ share/
 cd "$SCRIPT_DIR"
 rm -rf "$TMPDIR"
 echo "  fex-bin.tgz updated"
 
 echo ""
-echo "=== Guest thunks (install to FEX rootfs) ==="
-echo "Guest thunks need to be placed in the FEX rootfs on the device."
-echo "They'll be at: out/opt/fex/share/fex-emu/GuestThunks/"
+echo "=== Guest thunks (auto-deployed by ContainerManager) ==="
+echo "Guest thunks are now included in fex-bin.tgz and deployed automatically."
+echo ""
+echo "64-bit guest thunks:"
 ls -la out/opt/fex/share/fex-emu/GuestThunks/ 2>/dev/null || echo "(none built)"
 echo ""
-echo "After installing the APK, copy guest thunks to the device rootfs:"
-echo "  adb push out/opt/fex/share/fex-emu/GuestThunks/ /data/data/com.mediatek.steamlauncher/files/fex-rootfs/Ubuntu_22_04/usr/lib/x86_64-linux-gnu/fex-emu/GuestThunks/"
+echo "32-bit guest thunks:"
+ls -la out/opt/fex/share/fex-emu/GuestThunks_32/ 2>/dev/null || echo "(none built)"
 
 echo ""
 echo "=== Done! ==="

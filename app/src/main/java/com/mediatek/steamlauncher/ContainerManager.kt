@@ -103,20 +103,34 @@ class ContainerManager(private val context: Context) {
 
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
 
-        // 1. Update Config.json ThunkHostLibs
+        // 1. Update Config.json — ThunkHostLibs points to fexDir (not nativeLibDir)
+        //    so both 64-bit and _32 directories are accessible
         val configDir = File(fexHomeDir, ".fex-emu")
+        val thunkHostLibsPath = "${fexDir.absolutePath}/lib/fex-emu/HostThunks"
         val thunkGuestLibsPath = "${fexRootfsDir.absolutePath}/opt/fex/share/fex-emu/GuestThunks"
         configFile.writeText("""{
   "Config": {
     "RootFS": "${SteamLauncherApp.FEX_ROOTFS_NAME}",
     "ThunkConfig": "${configDir.absolutePath}/thunks.json",
-    "ThunkHostLibs": "$nativeLibDir",
+    "ThunkHostLibs": "$thunkHostLibsPath",
     "ThunkGuestLibs": "$thunkGuestLibsPath",
     "X87ReducedPrecision": "1"
   }
 }""")
 
-        // 2. Update libvulkan.so.1 symlink → nativeLibDir/libvulkan_loader.so
+        // 2. Refresh 64-bit host thunks from nativeLibDir (may have changed after APK install)
+        val hostDst64 = File(fexDir, "lib/fex-emu/HostThunks")
+        hostDst64.mkdirs()
+        File(nativeLibDir).listFiles()?.filter { it.name.endsWith("-host.so") }?.forEach { src ->
+            val dst = File(hostDst64, src.name)
+            if (!dst.exists() || dst.length() != src.length()) {
+                src.copyTo(dst, overwrite = true)
+                dst.setExecutable(true)
+                dst.setReadable(true, false)
+            }
+        }
+
+        // 3. Update libvulkan.so.1 symlink → nativeLibDir/libvulkan_loader.so
         val vulkanSymlink = File(fexDir, "lib/libvulkan.so.1")
         val vulkanLoaderSrc = File(nativeLibDir, "libvulkan_loader.so")
         if (vulkanLoaderSrc.exists()) {
@@ -130,7 +144,7 @@ class ContainerManager(private val context: Context) {
             }
         }
 
-        // 3. Update vortek_host_icd.json → nativeLibDir/libvortek_icd_wrapper.so
+        // 4. Update vortek_host_icd.json → nativeLibDir/libvortek_icd_wrapper.so
         val hostIcdJson = File(configDir, "vortek_host_icd.json")
         val wrapperLibPath = "$nativeLibDir/libvortek_icd_wrapper.so"
         hostIcdJson.writeText("""{
@@ -469,9 +483,14 @@ class ContainerManager(private val context: Context) {
             }
         }
 
-        // ThunkHostLibs: ARM64 host thunk .so files (in nativeLibDir for SELinux exec)
-        // ThunkGuestLibs: x86-64 guest thunk .so files (HOST filesystem path, not rootfs-relative)
-        // FEX checks FHU::Filesystem::Exists() on HOST, so must be absolute HOST path
+        // ThunkHostLibs: ARM64 host thunk .so files
+        //   Points to fexDir/lib/fex-emu/HostThunks/ — FEX appends "_32" for 32-bit guest.
+        //   64-bit host thunks are copied from nativeLibDir by deployThunks().
+        //   32-bit host thunks come from fex-bin.tgz at HostThunks_32/.
+        // ThunkGuestLibs: x86/x86-64 guest thunk .so files (HOST filesystem path)
+        //   Points to rootfs/opt/fex/share/fex-emu/GuestThunks/ — FEX appends "_32" for 32-bit.
+        //   Deployed by deployThunks() from fexDir/share/fex-emu/.
+        val thunkHostLibsPath = "${fexDir.absolutePath}/lib/fex-emu/HostThunks"
         val thunkGuestLibsPath = "${fexRootfsDir.absolutePath}/opt/fex/share/fex-emu/GuestThunks"
 
         File(configDir, "Config.json").writeText("""
@@ -479,7 +498,7 @@ class ContainerManager(private val context: Context) {
   "Config": {
     "RootFS": "${SteamLauncherApp.FEX_ROOTFS_NAME}",
     "ThunkConfig": "${configDir.absolutePath}/thunks.json",
-    "ThunkHostLibs": "$nativeLibDir",
+    "ThunkHostLibs": "$thunkHostLibsPath",
     "ThunkGuestLibs": "$thunkGuestLibsPath",
     "X87ReducedPrecision": "1"
   }
@@ -711,7 +730,8 @@ class ContainerManager(private val context: Context) {
 
         // Create /etc/resolv.conf for DNS resolution inside FEX guest
         val resolvConf = File(fexRootfsDir, "etc/resolv.conf")
-        if (!resolvConf.exists() || resolvConf.readText().isBlank()) {
+        if (!resolvConf.exists() || (resolvConf.exists() && resolvConf.readText().isBlank())) {
+            resolvConf.parentFile?.mkdirs()
             resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
             Log.i(TAG, "Created resolv.conf with Google DNS")
         }
@@ -724,6 +744,9 @@ class ContainerManager(private val context: Context) {
             Log.i(TAG, "Created apt insecure repositories config")
         }
 
+        // Deploy thunks (guest + host) to their expected locations
+        deployThunks()
+
         // Ensure FEX binaries have execute permission
         File(fexDir, "bin").listFiles()?.forEach { it.setExecutable(true) }
         File(fexDir, "lib").listFiles()?.forEach {
@@ -733,6 +756,72 @@ class ContainerManager(private val context: Context) {
         }
 
         Log.i(TAG, "Container setup finalized")
+    }
+
+    // Deploy FEX thunk libraries to their expected locations.
+    //
+    // Guest thunks (x86/x86-64, interpreted by FEX):
+    //   Source: fexDir/share/fex-emu/GuestThunks and GuestThunks_32 (from fex-bin.tgz)
+    //   Target: fexRootfsDir/opt/fex/share/fex-emu/GuestThunks and GuestThunks_32
+    //   Config: ThunkGuestLibs points to target path (FEX appends _32 for 32-bit)
+    //
+    // Host thunks (ARM64, loaded via dlopen by FEX host process):
+    //   Source 64-bit: nativeLibDir (jniLibs) — files matching *-host.so
+    //   Source 32-bit: fexDir/lib/fex-emu/HostThunks_32 (from fex-bin.tgz)
+    //   Target: fexDir/lib/fex-emu/HostThunks and HostThunks_32
+    //   Config: ThunkHostLibs points to HostThunks (FEX appends _32 for 32-bit)
+    private fun deployThunks() {
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+
+        // --- Guest thunks: copy from fexDir to rootfs ---
+        val guestSrc64 = File(fexDir, "share/fex-emu/GuestThunks")
+        val guestSrc32 = File(fexDir, "share/fex-emu/GuestThunks_32")
+        val guestDst64 = File(fexRootfsDir, "opt/fex/share/fex-emu/GuestThunks")
+        val guestDst32 = File(fexRootfsDir, "opt/fex/share/fex-emu/GuestThunks_32")
+
+        copyThunkDir(guestSrc64, guestDst64, "64-bit guest")
+        copyThunkDir(guestSrc32, guestDst32, "32-bit guest")
+
+        // --- Host thunks: ensure both 64-bit and 32-bit are in fexDir ---
+        // 64-bit host thunks: copy from nativeLibDir (jniLibs) to fexDir/lib/fex-emu/HostThunks/
+        val hostDst64 = File(fexDir, "lib/fex-emu/HostThunks")
+        hostDst64.mkdirs()
+        File(nativeLibDir).listFiles()?.filter { it.name.endsWith("-host.so") }?.forEach { src ->
+            val dst = File(hostDst64, src.name)
+            if (!dst.exists() || dst.length() != src.length()) {
+                src.copyTo(dst, overwrite = true)
+                dst.setExecutable(true)
+                dst.setReadable(true, false)
+                Log.i(TAG, "Deployed 64-bit host thunk: ${src.name}")
+            }
+        }
+
+        // 32-bit host thunks: already at fexDir/lib/fex-emu/HostThunks_32/ from fex-bin.tgz
+        val hostDir32 = File(fexDir, "lib/fex-emu/HostThunks_32")
+        if (hostDir32.exists()) {
+            hostDir32.listFiles()?.filter { it.name.endsWith(".so") }?.forEach { it.setExecutable(true) }
+            val count = hostDir32.listFiles()?.size ?: 0
+            Log.i(TAG, "32-bit host thunks ready: $count files in ${hostDir32.absolutePath}")
+        }
+    }
+
+    /** Copy all .so files from src to dst directory */
+    private fun copyThunkDir(src: File, dst: File, label: String) {
+        if (!src.exists() || !src.isDirectory) {
+            Log.w(TAG, "No $label thunks at ${src.absolutePath}")
+            return
+        }
+        dst.mkdirs()
+        var count = 0
+        src.listFiles()?.filter { it.name.endsWith(".so") }?.forEach { srcFile ->
+            val dstFile = File(dst, srcFile.name)
+            if (!dstFile.exists() || dstFile.length() != srcFile.length()) {
+                srcFile.copyTo(dstFile, overwrite = true)
+                dstFile.setReadable(true, false)
+                count++
+            }
+        }
+        Log.i(TAG, "Deployed $count $label thunks to ${dst.absolutePath}")
     }
 
     // ============================================================

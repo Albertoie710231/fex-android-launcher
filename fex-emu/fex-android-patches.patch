@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 59f976b..3e6b940 100644
+index 59f976b..17d75b3 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -68,9 +68,10 @@ elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
@@ -42,7 +42,7 @@ index 59f976b..3e6b940 100644
  
    # Thunk targets for guest libraries
    include(ExternalProject)
-@@ -621,23 +633,25 @@ if (BUILD_THUNKS)
+@@ -621,23 +633,27 @@ if (BUILD_THUNKS)
      BUILD_ALWAYS ON
      DEPENDS thunkgen)
  
@@ -72,12 +72,14 @@ index 59f976b..3e6b940 100644
 +        "-DBITNESS=32"
 +        "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
 +        "-DBUILD_FEX_LINUX_TESTS=${BUILD_FEX_LINUX_TESTS}"
-+        "-DENABLE_CLANG_THUNKS=${ENABLE_CLANG_THUNKS}"
++        "-DENABLE_CLANG_THUNKS=False"
 +        "-DCMAKE_TOOLCHAIN_FILE:FILEPATH=${X86_32_TOOLCHAIN_FILE}"
 +        "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}"
 +        "-DFEX_PROJECT_SOURCE_DIR=${FEX_PROJECT_SOURCE_DIR}"
 +        "-DGENERATOR_EXE=$<TARGET_FILE:thunkgen>"
 +        "-DX86_DEV_ROOTFS=${X86_DEV_ROOTFS}"
++        "-DCMAKE_C_COMPILER_WORKS=TRUE"
++        "-DCMAKE_CXX_COMPILER_WORKS=TRUE"
 +      INSTALL_COMMAND ""
 +      BUILD_ALWAYS ON
 +      DEPENDS thunkgen)
@@ -85,7 +87,7 @@ index 59f976b..3e6b940 100644
  
    install(
      CODE "message(\"-- Installing: guest-libs\")"
-@@ -647,24 +661,30 @@ if (BUILD_THUNKS)
+@@ -647,24 +663,30 @@ if (BUILD_THUNKS)
      DEPENDS guest-libs
      COMPONENT Runtime)
  
@@ -127,6 +129,24 @@ index 59f976b..3e6b940 100644
  endif()
  
  if (BUILD_STEAM_SUPPORT)
+diff --git a/Data/CMake/toolchain_x86_32.cmake b/Data/CMake/toolchain_x86_32.cmake
+index 89e3134..addb454 100644
+--- a/Data/CMake/toolchain_x86_32.cmake
++++ b/Data/CMake/toolchain_x86_32.cmake
+@@ -15,6 +15,11 @@ if (ENABLE_CLANG_THUNKS)
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CLANG_FLAGS}")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CLANG_FLAGS}")
+ else()
+-  set(CMAKE_C_COMPILER x86_64-linux-gnu-gcc -m32)
+-  set(CMAKE_CXX_COMPILER x86_64-linux-gnu-g++ -m32)
++  # Use native gcc/g++ with -m32 (works on amd64 Docker with libc6-dev-i386)
++  set(CMAKE_C_COMPILER gcc)
++  set(CMAKE_CXX_COMPILER g++)
++  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m32")
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m32")
++  set(CMAKE_SHARED_LINKER_FLAGS_INIT "-m32")
++  set(CMAKE_EXE_LINKER_FLAGS_INIT "-m32")
+ endif()
 diff --git a/FEXCore/Source/Utils/LogManager.cpp b/FEXCore/Source/Utils/LogManager.cpp
 index 002bb62..e9cdfcc 100644
 --- a/FEXCore/Source/Utils/LogManager.cpp
@@ -1660,6 +1680,33 @@ index b0daaee..10e2f1f 100644
    });
  }
  } // namespace FEX::HLE::x64
+diff --git a/ThunkLibs/GuestLibs/CMakeLists.txt b/ThunkLibs/GuestLibs/CMakeLists.txt
+index 05a784f..be70fd3 100644
+--- a/ThunkLibs/GuestLibs/CMakeLists.txt
++++ b/ThunkLibs/GuestLibs/CMakeLists.txt
+@@ -188,16 +188,18 @@ if (BITNESS EQUAL 64)
+   # target_link_libraries(SDL2-guest PRIVATE GL)
+   # target_link_libraries(SDL2-guest PRIVATE dl)
+ 
+-  generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
+-  target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
+-  add_guest_lib(vulkan "libvulkan.so.1")
+-
+   generate(libdrm ${CMAKE_CURRENT_SOURCE_DIR}/../libdrm/libdrm_interface.cpp)
+   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/drm/)
+   target_include_directories(libdrm-guest-deps INTERFACE /usr/include/libdrm/)
+   add_guest_lib(drm "libdrm.so.2")
+ endif()
+ 
++# Vulkan guest thunks support both 32-bit and 64-bit
++# (Host.cpp and libvulkan_interface.cpp have IS_32BIT_THUNK handling)
++generate(libvulkan ${CMAKE_CURRENT_SOURCE_DIR}/../libvulkan/libvulkan_interface.cpp)
++target_include_directories(libvulkan-guest-deps INTERFACE ${FEX_PROJECT_SOURCE_DIR}/External/Vulkan-Headers/include/)
++add_guest_lib(vulkan "libvulkan.so.1")
++
+ generate(libwayland-client ${CMAKE_CURRENT_SOURCE_DIR}/../libwayland-client/libwayland-client_interface.cpp)
+ add_guest_lib(wayland-client "libwayland-client.so.0.20.0")
+ target_include_directories(libwayland-client-guest-deps INTERFACE /usr/include/wayland)
 diff --git a/ThunkLibs/HostLibs/CMakeLists.txt b/ThunkLibs/HostLibs/CMakeLists.txt
 index 65025a2..d7803e5 100644
 --- a/ThunkLibs/HostLibs/CMakeLists.txt
