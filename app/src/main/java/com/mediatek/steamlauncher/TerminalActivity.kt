@@ -46,6 +46,7 @@ class TerminalActivity : AppCompatActivity() {
     private var currentProcess: Process? = null
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
     private var frameSocketServer: FrameSocketServer? = null
+    private var x11Server: X11Server? = null
     private var isDisplayMode = false
     private var surfaceReady = false
 
@@ -225,9 +226,32 @@ class TerminalActivity : AppCompatActivity() {
             executeCommand(protonManager.getDependencyCheckCommand())
         }
 
-        // Start Xvfb in TCP-only mode (required for Wine)
+        // Start libXlorie X11 server (native ARM64 — NOT inside FEX)
+        // Listens on TCP port 6000 (display :0). Wine connects via DISPLAY=localhost:0
         findViewById<Button>(R.id.btnStartXvfb).setOnClickListener {
-            executeCommand(protonManager.getXvfbStartCommand())
+            if (x11Server?.isRunning() == true) {
+                appendOutput("[X11 server already running on display :0 (TCP port 6000)]\n")
+                return@setOnClickListener
+            }
+            appendOutput("Starting libXlorie X11 server (native ARM64)...\n")
+            x11Server = X11Server(this).apply {
+                onServerStarted = {
+                    handler.post {
+                        appendOutput("[X11 server started on display :0 (TCP port 6000)]\n")
+                        appendOutput("Wine commands will use DISPLAY=localhost:0\n")
+                    }
+                }
+                onError = { msg ->
+                    handler.post {
+                        appendOutput("[X11 server error: $msg]\n")
+                    }
+                }
+                if (start()) {
+                    appendOutput("[X11 server initializing...]\n")
+                } else {
+                    appendOutput("[ERROR: Failed to start X11 server]\n")
+                }
+            }
         }
 
         // Initialize Wine prefix (wineboot -u)
@@ -651,6 +675,8 @@ class TerminalActivity : AppCompatActivity() {
         frameSocketServer?.setOutputSurface(null)
         frameSocketServer?.stop()
         frameSocketServer = null
+        x11Server?.stop()
+        x11Server = null
         VortekRenderer.stop()
         super.onDestroy()
     }

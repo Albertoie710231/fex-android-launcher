@@ -2,7 +2,7 @@
 # Launch a Windows game via Wine/Proton-GE inside FEX-Emu on Android.
 #
 # This script runs INSIDE the FEX x86-64 guest environment.
-# It handles Xvfb startup, environment configuration, and game launching.
+# It handles X server startup, environment configuration, and game launching.
 #
 # Usage:
 #   ./launch_wine.sh /path/to/game.exe
@@ -88,6 +88,19 @@ if [ ! -x "${PROTON_DIR}/files/bin/wine64" ]; then
     exit 1
 fi
 
+# ============================================================
+# Redirect system Wine paths to Proton-GE (RELATIVE symlinks — absolute ones escape FEX overlay!)
+# ============================================================
+if [ -d "/usr/lib/x86_64-linux-gnu/wine" ] && [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+    echo "Redirecting system Wine to Proton-GE..."
+    mv /usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine.system.bak 2>/dev/null || true
+fi
+[ ! -L "/usr/lib/x86_64-linux-gnu/wine" ] && ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine 2>/dev/null || true
+if [ -d "/usr/lib/wine" ] && [ ! -L "/usr/lib/wine" ]; then
+    mv /usr/lib/wine /usr/lib/wine.system.bak 2>/dev/null || true
+fi
+[ ! -L "/usr/lib/wine" ] && { rm -f /usr/lib/wine 2>/dev/null; ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine 2>/dev/null || true; }
+
 # Check exe (skip for built-in commands like notepad)
 if [ "$EXE_PATH" != "notepad" ] && [ ! -f "$EXE_PATH" ]; then
     echo "ERROR: Game not found: $EXE_PATH"
@@ -95,20 +108,15 @@ if [ "$EXE_PATH" != "notepad" ] && [ ! -f "$EXE_PATH" ]; then
 fi
 
 # ============================================================
-# Start Xvfb if needed
+# Check X11 server (libXlorie — runs natively on Android, NOT inside FEX)
 # ============================================================
-if ! pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
-    echo "Starting Xvfb..."
-    mkdir -p /tmp/.X11-unix
-    Xvfb :99 -screen 0 1280x720x24 -ac -nolisten local -nolisten unix -listen tcp &
-    sleep 1
-    if pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
-        echo "Xvfb started on :99 (TCP mode)"
-    else
-        echo "WARNING: Xvfb may have failed to start"
-    fi
+# libXlorie is started by the Android app (press 'Start X' button).
+# It listens on TCP port 6000 (display :0). Xvnc/Xvfb cannot work under FEX.
+if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
+    echo "X11 server: OK (libXlorie on TCP port 6000)"
 else
-    echo "Xvfb already running on :99"
+    echo "WARNING: X11 server not detected on TCP port 6000"
+    echo "Press 'Start X' button in the Android app first."
 fi
 
 # ============================================================
@@ -116,10 +124,11 @@ fi
 # ============================================================
 export WINEPREFIX
 export PATH="${PROTON_DIR}/files/bin:${PATH}"
-export WINEDLLPATH="${PROTON_DIR}/files/lib64/wine/x86_64-unix:${PROTON_DIR}/files/lib/wine/i386-unix"
-export WINELOADER="${PROTON_DIR}/files/bin/wine64"
+export WINEDLLPATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib/wine/x86_64-windows:${PROTON_DIR}/files/lib/wine/i386-unix:${PROTON_DIR}/files/lib/wine/i386-windows"
+export WINELOADER="${PROTON_DIR}/files/bin/wine"
 export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
-export DISPLAY=localhost:99
+export DISPLAY=localhost:0
+export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 
 # Proton compatibility (Android kernel limitations)
 export PROTON_NO_ESYNC=1
@@ -168,7 +177,7 @@ if [ ! -d "${WINEPREFIX}/drive_c" ]; then
     echo ""
     echo "Initializing Wine prefix at ${WINEPREFIX}..."
     mkdir -p "$WINEPREFIX"
-    wineboot -u 2>&1
+    wine64 wineboot -u 2>&1
     echo "Wine prefix created"
 fi
 

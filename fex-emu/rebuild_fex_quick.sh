@@ -63,7 +63,12 @@ apt-get install -y -qq \
     libwayland-dev:arm64 libasound2-dev:arm64 \
     libx11-dev:arm64 libx11-xcb-dev:arm64 \
     libxcb1-dev:arm64 libxrandr-dev:arm64 \
-    libgl-dev libegl-dev libwayland-dev libasound2-dev libdrm-dev 2>&1 | tail -1
+    libgl-dev libegl-dev libwayland-dev libasound2-dev libdrm-dev \
+    libc6-dev-i386 lib32stdc++-11-dev g++-11 2>&1 | tail -1
+
+# Ensure g++ exists for 32-bit guest thunks (but keep clang++ as default c++)
+if [ ! -f /usr/bin/g++ ]; then ln -s g++-11 /usr/bin/g++; fi
+update-alternatives --set c++ /usr/bin/clang++ 2>/dev/null || true
 
 # Create header symlinks in ARM64 sysroot for thunks cross-compilation
 mkdir -p /usr/aarch64-linux-gnu/include

@@ -2,13 +2,14 @@
 # Setup Proton-GE for running Windows games via Wine/DXVK inside FEX-Emu.
 #
 # This script runs INSIDE the FEX x86-64 guest environment.
-# It downloads and extracts GE-Proton10-30, sets up Xvfb, and initializes Wine.
+# It downloads and extracts GE-Proton10-30 and initializes Wine.
+# X11 server (libXlorie) is started by the Android app, NOT by this script.
 #
 # Usage:
 #   ./setup_proton.sh              # Full setup (download + extract + wine init)
 #   ./setup_proton.sh --extract    # Extract only (tarball already in /tmp/)
 #   ./setup_proton.sh --deps       # Check dependencies only
-#   ./setup_proton.sh --xvfb       # Start Xvfb only
+#   ./setup_proton.sh --x11        # Check X11 server status
 #   ./setup_proton.sh --wineboot   # Initialize Wine prefix only
 
 set -e
@@ -64,11 +65,11 @@ check_deps() {
         fi
     done
 
-    # Xvfb
-    if command -v Xvfb >/dev/null 2>&1; then
-        ok "Xvfb found"
+    # X11 server (libXlorie — runs on Android side, not inside FEX)
+    if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
+        ok "X11 server listening on TCP port 6000 (libXlorie)"
     else
-        warn "Xvfb MISSING (install: apt install xvfb)"
+        warn "X11 server not running (press 'Start X' in the app)"
         missing=$((missing + 1))
     fi
 
@@ -82,7 +83,7 @@ check_deps() {
     # Disk space
     echo ""
     echo "Disk space:"
-    df -h / 2>/dev/null | tail -1 || true
+    df -h /home 2>/dev/null | tail -1 || true
 
     # Memory
     echo ""
@@ -184,39 +185,51 @@ extract_proton() {
 }
 
 # ============================================================
-# Start Xvfb (TCP-only mode for Android)
+# Check X11 Server (libXlorie — native ARM64, started by Android app)
 # ============================================================
-start_xvfb() {
-    # Check if already running
-    if pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
-        ok "Xvfb already running on :99"
-        return 0
-    fi
-
-    if ! command -v Xvfb >/dev/null 2>&1; then
-        fail "Xvfb not found! Install: apt install xvfb"
-        return 1
-    fi
-
-    # Kill any stale instance
-    pkill -f 'Xvfb :99' 2>/dev/null || true
-    sleep 0.5
-
-    # Create required directory
-    mkdir -p /tmp/.X11-unix
-
-    # Start Xvfb in TCP-only mode (Android SELinux blocks Unix sockets)
-    Xvfb :99 -screen 0 1280x720x24 -ac -nolisten local -nolisten unix -listen tcp &
-    XVFB_PID=$!
-    sleep 1
-
-    if kill -0 $XVFB_PID 2>/dev/null; then
-        ok "Xvfb started (PID ${XVFB_PID}) on display :99 (TCP mode)"
-        echo "Use: export DISPLAY=localhost:99"
+check_xserver() {
+    echo "=== X11 Server Check ==="
+    echo "libXlorie runs natively on Android (ARM64), NOT inside FEX."
+    echo "Press 'Start X' button in the app to start it."
+    echo ""
+    if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
+        ok "X11 server listening on TCP port 6000 (display :0)"
     else
-        fail "Xvfb failed to start"
-        return 1
+        warn "X11 server not detected. Press 'Start X' button in the app."
     fi
+}
+
+# ============================================================
+# Remove System Wine 6.0.3 (interferes with Proton-GE)
+# ============================================================
+clean_system_wine() {
+    echo "=== Replacing System Wine with Proton-GE (relative symlinks) ==="
+    # CRITICAL: Symlinks MUST be relative — absolute ones escape FEX rootfs overlay!
+
+    if [ -d "/usr/lib/x86_64-linux-gnu/wine" ] && [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+        mv /usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine.system.bak
+        ok "Backed up system Wine modules"
+    fi
+    if [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+        ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine
+    fi
+    ok "Symlink: /usr/lib/x86_64-linux-gnu/wine -> ../../../opt/proton-ge/files/lib/wine"
+
+    if [ -d "/usr/lib/wine" ] && [ ! -L "/usr/lib/wine" ]; then
+        mv /usr/lib/wine /usr/lib/wine.system.bak
+    fi
+    rm -f /usr/lib/wine 2>/dev/null
+    ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine
+    ok "Symlink: /usr/lib/wine -> ../../opt/proton-ge/files/lib/wine"
+
+    # Verify symlinks resolve correctly
+    ls /usr/lib/x86_64-linux-gnu/wine/x86_64-windows/kernel32.dll >/dev/null 2>&1 && ok "kernel32.dll reachable via symlink" || warn "kernel32.dll NOT reachable via symlink"
+
+    # Remove system Wine binaries
+    for bin in wine wine64 wineserver wineboot winecfg msiexec regedit regsvr32; do
+        [ -f "/usr/bin/$bin" ] && rm -f "/usr/bin/$bin"
+    done
+    ok "System Wine binaries removed from /usr/bin/"
 }
 
 # ============================================================
@@ -230,24 +243,38 @@ init_wineboot() {
 
     export WINEPREFIX
     export PATH="${PROTON_DIR}/files/bin:${PATH}"
-    export DISPLAY=localhost:99
+    export WINEDLLPATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib/wine/x86_64-windows:${PROTON_DIR}/files/lib/wine/i386-unix:${PROTON_DIR}/files/lib/wine/i386-windows"
+    export WINELOADER="${PROTON_DIR}/files/bin/wine"
+    export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
+    export DISPLAY=localhost:0
     export PROTON_NO_ESYNC=1
     export PROTON_NO_FSYNC=1
+    export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 
     echo "=== Initializing Wine Prefix ==="
     echo "WINEPREFIX=${WINEPREFIX}"
     echo ""
 
+    # Remove stale prefix (may have been created with wrong Wine)
+    if [ -d "$WINEPREFIX" ]; then
+        echo "Removing stale Wine prefix..."
+        rm -rf "$WINEPREFIX"
+    fi
+
     mkdir -p "$WINEPREFIX"
 
     echo "Running wineboot -u (may take 1-2 minutes)..."
-    wineboot -u 2>&1
+    wine64 wineboot -u 2>&1
 
     if [ -d "${WINEPREFIX}/drive_c" ]; then
         ok "Wine prefix initialized"
         echo ""
         echo "drive_c contents:"
         ls "${WINEPREFIX}/drive_c/"
+        echo ""
+        echo "system32 DLLs:"
+        ls "${WINEPREFIX}/drive_c/windows/system32/" 2>/dev/null | wc -l
+        echo "files in system32"
     else
         fail "Wine prefix creation failed"
         return 1
@@ -264,12 +291,15 @@ case "${1:-}" in
     --extract)
         extract_proton
         ;;
-    --xvfb)
-        start_xvfb
+    --x11)
+        check_xserver
         ;;
     --wineboot)
-        start_xvfb
+        check_xserver
         init_wineboot
+        ;;
+    --clean-wine)
+        clean_system_wine
         ;;
     *)
         echo "============================================"
@@ -288,7 +318,10 @@ case "${1:-}" in
         extract_proton
         echo ""
 
-        start_xvfb
+        clean_system_wine
+        echo ""
+
+        check_xserver
         echo ""
 
         init_wineboot
@@ -299,7 +332,8 @@ case "${1:-}" in
         echo "============================================"
         echo ""
         echo "To launch a game:"
-        echo "  export DISPLAY=localhost:99"
+        echo "  1. Press 'Start X' button in the app (starts libXlorie)"
+        echo "  export DISPLAY=localhost:0"
         echo "  export WINEPREFIX=/home/user/.wine"
         echo "  export PATH=${PROTON_DIR}/files/bin:\$PATH"
         echo "  export LD_PRELOAD=/usr/lib/libvulkan_headless.so"

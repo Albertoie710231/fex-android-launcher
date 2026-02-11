@@ -131,6 +131,24 @@ class ProtonManager(private val context: Context) {
             # Clean up tarball to save space
             rm -f "${'$'}TARBALL"
             echo "Cleaned up tarball"
+
+            # Replace system Wine with RELATIVE symlinks to Proton-GE
+            # CRITICAL: Must be relative — absolute symlinks escape FEX rootfs overlay!
+            echo ""
+            echo "=== Redirecting system Wine paths to Proton-GE ==="
+            if [ -d "/usr/lib/x86_64-linux-gnu/wine" ] && [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                mv /usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine.system.bak
+            fi
+            [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ] && ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine
+            if [ -d "/usr/lib/wine" ] && [ ! -L "/usr/lib/wine" ]; then
+                mv /usr/lib/wine /usr/lib/wine.system.bak
+            fi
+            rm -f /usr/lib/wine 2>/dev/null; ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine
+            for bin in wine wine64 wineserver wineboot winecfg; do
+                [ -f "/usr/bin/${'$'}bin" ] && rm -f "/usr/bin/${'$'}bin"
+            done
+            echo "System Wine paths now point to Proton-GE"
+            echo ""
             echo "Done!"
         """.trimIndent()
     }
@@ -148,12 +166,13 @@ class ProtonManager(private val context: Context) {
             // Wine/Proton paths
             "WINEPREFIX" to winePrefix,
             "PATH" to "$PROTON_INSTALL_DIR/files/bin:/usr/local/bin:/usr/bin:/bin",
-            "WINEDLLPATH" to "$PROTON_INSTALL_DIR/files/lib64/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix",
-            "WINELOADER" to "$PROTON_INSTALL_DIR/files/bin/wine64",
+            "WINEDLLPATH" to "$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows",
+            "WINELOADER" to "$PROTON_INSTALL_DIR/files/bin/wine",
             "WINESERVER" to "$PROTON_INSTALL_DIR/files/bin/wineserver",
+            "LD_LIBRARY_PATH" to "$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib",
 
-            // Display (Xvfb in TCP mode)
-            "DISPLAY" to "localhost:99",
+            // X11 via libXlorie (native ARM64 X server, TCP port 6000)
+            "DISPLAY" to "localhost:0",
 
             // DXVK (DirectX 11 -> Vulkan translation)
             "DXVK_ASYNC" to "1",
@@ -188,54 +207,167 @@ class ProtonManager(private val context: Context) {
     }
 
     /**
-     * Command to start Xvfb in TCP-only mode (Android SELinux blocks Unix sockets).
-     * Must be run before any Wine/X11 commands.
+     * Command to check X11 server connectivity from FEX guest side.
+     * libXlorie runs natively on Android (ARM64), started by TerminalActivity.
+     * Wine connects via DISPLAY=localhost:0 (TCP port 6000).
      */
-    fun getXvfbStartCommand(): String {
+    fun getXServerStartCommand(): String {
         return """
-            # Kill any existing Xvfb
-            pkill -f 'Xvfb :99' 2>/dev/null || true
-            sleep 0.5
-
-            # Create X11 socket dir (Xvfb needs it even in TCP mode)
-            mkdir -p /tmp/.X11-unix
-
-            # Start Xvfb on display :99, TCP only (no Unix sockets — Android SELinux blocks them)
-            Xvfb :99 -screen 0 1280x720x24 -ac -nolisten local -nolisten unix -listen tcp &
-            XVFB_PID=${'$'}!
-            sleep 1
-
-            # Verify
-            if kill -0 ${'$'}XVFB_PID 2>/dev/null; then
-                echo "Xvfb started (PID ${'$'}XVFB_PID) on display :99 (TCP mode)"
+            echo "=== X11 Server Status ==="
+            echo "libXlorie (native ARM64) should be started from Android side."
+            echo "Press 'Start X' button in the app first."
+            echo ""
+            echo "Testing TCP connection to localhost:6000 (display :0)..."
+            if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
+                echo "OK: X11 server is listening on TCP port 6000"
+                echo "Use: export DISPLAY=localhost:0"
             else
-                echo "ERROR: Xvfb failed to start"
-                exit 1
+                echo "NOT RUNNING: X11 server not detected on TCP port 6000"
+                echo "Press the 'Start X' button in the app toolbar."
             fi
+        """.trimIndent()
+    }
+
+    /**
+     * Command to remove system Wine 6.0.3 from rootfs.
+     * System Wine's ntdll.so causes dladdr() to return wrong paths,
+     * making Wine derive data_dir with ".." components that fail under
+     * FEX's \\?\ NT path prefix. Removing it forces Wine to use Proton-GE's modules.
+     */
+    fun getCleanSystemWineCommand(): String {
+        return """
+            echo "=== Replacing System Wine with Proton-GE (relative symlinks) ==="
+
+            # CRITICAL: Use RELATIVE symlinks — absolute ones escape FEX rootfs overlay!
+            # /usr/lib/x86_64-linux-gnu/wine -> ../../../opt/proton-ge/files/lib/wine
+            if [ -d "/usr/lib/x86_64-linux-gnu/wine" ] && [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                echo "Backing up system Wine modules..."
+                mv /usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine.system.bak
+            fi
+            if [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine
+                echo "Created: /usr/lib/x86_64-linux-gnu/wine -> ../../../opt/proton-ge/files/lib/wine"
+            else
+                echo "Symlink already exists: /usr/lib/x86_64-linux-gnu/wine"
+                ls -la /usr/lib/x86_64-linux-gnu/wine
+            fi
+
+            # /usr/lib/wine -> ../../opt/proton-ge/files/lib/wine
+            if [ -d "/usr/lib/wine" ] && [ ! -L "/usr/lib/wine" ]; then
+                mv /usr/lib/wine /usr/lib/wine.system.bak
+            fi
+            if [ ! -L "/usr/lib/wine" ]; then
+                rm -f /usr/lib/wine
+                ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine
+                echo "Created: /usr/lib/wine -> ../../opt/proton-ge/files/lib/wine"
+            else
+                echo "Symlink already exists: /usr/lib/wine"
+                ls -la /usr/lib/wine
+            fi
+
+            # Verify symlinks work
+            echo ""
+            echo "Verification:"
+            ls /usr/lib/x86_64-linux-gnu/wine/x86_64-windows/kernel32.dll 2>/dev/null && echo "  kernel32.dll: OK" || echo "  kernel32.dll: NOT FOUND"
+
+            # Remove system Wine binaries
+            for bin in wine wine64 wineserver wineboot winecfg msiexec regedit regsvr32; do
+                [ -f "/usr/bin/${'$'}bin" ] && rm -f "/usr/bin/${'$'}bin"
+            done
+            echo "System Wine replaced with Proton-GE"
         """.trimIndent()
     }
 
     /**
      * Command to initialize a Wine prefix using Proton-GE's Wine.
      * Creates the drive_c directory structure, registry, and installs DXVK DLLs.
+     * Includes system Wine cleanup to prevent dladdr() path interference.
      */
     fun getWineBootCommand(winePrefix: String = "/home/user/.wine"): String {
         return """
             export WINEPREFIX="$winePrefix"
             export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
-            export DISPLAY=localhost:99
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
+            export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
+            export DISPLAY=localhost:0
             export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # ---- Replace system Wine with RELATIVE symlinks to Proton-GE ----
+            # CRITICAL: Symlinks MUST be relative — absolute symlinks escape FEX rootfs overlay!
+            if [ -d "/usr/lib/x86_64-linux-gnu/wine" ] && [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                echo "Replacing system Wine modules with relative symlink to Proton-GE..."
+                mv /usr/lib/x86_64-linux-gnu/wine /usr/lib/x86_64-linux-gnu/wine.system.bak
+            fi
+            if [ ! -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine
+            fi
+            if [ -d "/usr/lib/wine" ] && [ ! -L "/usr/lib/wine" ]; then
+                mv /usr/lib/wine /usr/lib/wine.system.bak
+            fi
+            if [ ! -L "/usr/lib/wine" ]; then
+                rm -f /usr/lib/wine
+                ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine
+            fi
+            for bin in wine wine64 wineserver wineboot winecfg; do
+                [ -f "/usr/bin/${'$'}bin" ] && rm -f "/usr/bin/${'$'}bin"
+            done
 
             echo "=== Initializing Wine Prefix ==="
             echo "WINEPREFIX=$winePrefix"
 
-            # Create prefix directory
-            mkdir -p "$winePrefix"
+            # Fix any existing absolute symlinks (must be relative for FEX overlay)
+            if [ -L "/usr/lib/x86_64-linux-gnu/wine" ]; then
+                TARGET=${'$'}(readlink /usr/lib/x86_64-linux-gnu/wine)
+                case "${'$'}TARGET" in /*)
+                    rm -f /usr/lib/x86_64-linux-gnu/wine
+                    ln -sf ../../../opt/proton-ge/files/lib/wine /usr/lib/x86_64-linux-gnu/wine
+                    echo "Fixed absolute symlink -> relative"
+                ;; esac
+            fi
+            if [ -L "/usr/lib/wine" ]; then
+                TARGET=${'$'}(readlink /usr/lib/wine)
+                case "${'$'}TARGET" in /*)
+                    rm -f /usr/lib/wine
+                    ln -sf ../../opt/proton-ge/files/lib/wine /usr/lib/wine
+                    echo "Fixed absolute symlink -> relative"
+                ;; esac
+            fi
+
+            # Remove stale prefix (may have been created with wrong Wine)
+            if [ -d "$winePrefix" ]; then
+                echo "Removing stale Wine prefix..."
+                rm -rf "$winePrefix"
+            fi
+
+            # Create prefix directory structure
+            mkdir -p "$winePrefix/drive_c/windows/system32"
+            mkdir -p "$winePrefix/drive_c/windows/syswow64"
+
+            # CRITICAL: Fix Z: drive to point to HOST rootfs path.
+            # Wine resolves dosdevices/z: symlink via kernel, which follows to the
+            # REAL filesystem root. Default z:->/ goes to Android root (wrong!).
+            # Must point to the actual FEX rootfs directory on the host.
+            mkdir -p "$winePrefix/dosdevices"
+            ln -sf ../drive_c "$winePrefix/dosdevices/c:"
+            ln -sf "$fexRootfsDir" "$winePrefix/dosdevices/z:"
+            echo "Z: drive -> $fexRootfsDir (host rootfs)"
+
+            # Pre-seed system32 with Proton-GE PE DLLs (Wine's builtin search
+            # may fail under FEX because dladdr() returns host paths).
+            echo "Pre-seeding system32 with Proton-GE DLLs..."
+            PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
+            PROTON_WIN32="$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            cp "${'$'}PROTON_WIN64"/*.dll "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
+            cp "${'$'}PROTON_WIN32"/*.dll "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
+            SYS32_COUNT=${'$'}(ls "$winePrefix/drive_c/windows/system32/"*.dll 2>/dev/null | wc -l)
+            echo "  system32: ${'$'}SYS32_COUNT DLLs"
 
             # Initialize the Wine prefix (creates drive_c, registry, etc.)
             echo "Running wineboot -u (this may take a minute)..."
-            wineboot -u 2>&1
+            wine64 wineboot -u 2>&1
 
             # Verify
             if [ -d "$winePrefix/drive_c" ]; then
@@ -244,8 +376,9 @@ class ProtonManager(private val context: Context) {
                 echo "drive_c contents:"
                 ls "$winePrefix/drive_c/"
                 echo ""
-                echo "DXVK DLLs (bundled in Proton):"
-                ls "$winePrefix/drive_c/windows/system32/d3d11.dll" 2>/dev/null && echo "  d3d11.dll OK" || echo "  d3d11.dll not found (will be installed on first run)"
+                echo "system32 DLLs:"
+                ls "$winePrefix/drive_c/windows/system32/" 2>/dev/null | wc -l
+                echo "files in system32"
             else
                 echo "ERROR: Wine prefix creation failed"
                 exit 1
@@ -270,10 +403,11 @@ class ProtonManager(private val context: Context) {
         return """
             export WINEPREFIX="$winePrefix"
             export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
-            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib64/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix"
-            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine64"
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=localhost:99
+            export DISPLAY=localhost:0
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
 
             # DXVK settings
             export DXVK_ASYNC=1
@@ -296,6 +430,12 @@ class ProtonManager(private val context: Context) {
             # Misc
             export XDG_RUNTIME_DIR=/tmp
             export TMPDIR=/tmp
+
+            # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
+            if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
+                rm -f "${'$'}WINEPREFIX/dosdevices/z:"
+                ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
+            fi
 
             echo "=== Launching: $exePath ==="
             echo "Working dir: $exeDir"
@@ -321,25 +461,36 @@ class ProtonManager(private val context: Context) {
             wineserver --version 2>&1 || echo "(wineserver --version not supported)"
             echo ""
             echo "Wine libraries:"
-            ls -la "$PROTON_INSTALL_DIR/files/lib64/wine/x86_64-unix/" 2>/dev/null | head -20
+            ls -la "$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix/" 2>/dev/null | head -20
         """.trimIndent()
     }
 
     /**
      * Command for incremental testing — Step 2: Run Notepad (basic Windows app).
-     * Requires Xvfb to be running.
+     * Requires libXlorie X11 server (press 'Start X' button first).
      */
     fun getNotepadTestCommand(): String {
         return """
             export WINEPREFIX="/home/user/.wine"
             export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
-            export DISPLAY=localhost:99
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
+            export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
+            export DISPLAY=localhost:0
             export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
+            if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
+                rm -f "${'$'}WINEPREFIX/dosdevices/z:"
+                ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
+            fi
 
             echo "=== Notepad Test ==="
-            echo "Starting Wine notepad (should open and close within timeout)..."
-            timeout 15 wine64 notepad 2>&1 || true
+            echo "DISPLAY=${'$'}DISPLAY (libXlorie via TCP port 6000)"
+            echo "Starting Wine notepad..."
+            timeout 30 wine64 notepad 2>&1 || true
             echo ""
             echo "Test complete"
         """.trimIndent()
@@ -377,8 +528,12 @@ class ProtonManager(private val context: Context) {
             done
             echo ""
 
-            echo "--- Xvfb ---"
-            which Xvfb 2>/dev/null && echo "OK: Xvfb found" || echo "MISSING: Xvfb (apt install xvfb)"
+            echo "--- X11 Server (libXlorie via TCP) ---"
+            if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
+                echo "OK: X11 server listening on TCP port 6000 (display :0)"
+            else
+                echo "NOT RUNNING: Press 'Start X' button in the app"
+            fi
             echo ""
 
             echo "--- Proton-GE ---"
@@ -391,7 +546,7 @@ class ProtonManager(private val context: Context) {
             echo ""
 
             echo "--- Disk Space ---"
-            df -h / 2>/dev/null | tail -1
+            df -h /home 2>/dev/null | tail -1
             echo ""
 
             echo "--- Memory ---"

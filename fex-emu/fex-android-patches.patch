@@ -1199,10 +1199,27 @@ index 65944a2..b1b8660 100644
      auto lk = FEXCore::GuardSignalDeferringSection(VMATracking.Mutex, Thread);
      if (Is64Bit) {
 diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
-index 4e9d1c7..13695dd 100644
+index 4e9d1c7..6b09cb1 100644
 --- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
 +++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/FD.cpp
-@@ -323,14 +323,13 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+@@ -38,6 +38,16 @@ $end_info$
+ #include <time.h>
+ #include <type_traits>
+ #include <unistd.h>
++#include <cstdlib>
++
++// Android: fake st_uid/st_gid in stat results to match GetFakeUID()
++static uint64_t GetFakeUID() {
++  static uint64_t uid = []() -> uint64_t {
++    const char* env = getenv("FEX_FAKE_UID");
++    return env ? (uint64_t)atoi(env) : 1000;
++  }();
++  return uid;
++}
+ 
+ ARG_TO_STR(FEX::HLE::x32::compat_ptr<FEX::HLE::x32::sigset_argpack32>, "%lx")
+ 
+@@ -323,14 +333,13 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
      SYSCALL_ERRNO();
    });
  
@@ -1220,6 +1237,99 @@ index 4e9d1c7..13695dd 100644
    });
  
    REGISTER_SYSCALL_IMPL_X32(oldstat, [](FEXCore::Core::CpuStateFrame* Frame, const char* pathname, oldstat32* buf) -> uint64_t {
+@@ -344,7 +353,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+         return -EOVERFLOW;
+       }
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
+-
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -361,7 +371,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+         return -EOVERFLOW;
+       }
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
+-
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -378,7 +389,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+         return -EOVERFLOW;
+       }
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
+-
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -389,6 +401,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -399,6 +413,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = ::fstat(fd, &host_stat);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -409,6 +425,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(path, &host_stat);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -419,6 +437,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -430,6 +450,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+ 
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -440,6 +462,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = ::fstat64(fd, &host_stat);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
+@@ -593,6 +617,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.NewFSStatAt64(dirfd, pathname, &host_stat, flag);
+     if (Result != -1) {
+       FaultSafeUserMemAccess::VerifyIsWritable(buf, sizeof(*buf));
++      host_stat.st_uid = GetFakeUID();
++      host_stat.st_gid = GetFakeUID();
+       *buf = host_stat;
+     }
+     SYSCALL_ERRNO();
 diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp
 index a0f1d2d..3ec2b2a 100644
 --- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x32/Semaphore.cpp
@@ -1591,6 +1701,63 @@ index 31109b8..72de868 100644
        } else {
 -        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, pathname, nullptr, flags);
 +        Result = ::syscall(SYSCALL_DEF(utimensat), dirfd, resolved, nullptr, flags);
+       }
+       SYSCALL_ERRNO();
+     });
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/FD.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/FD.cpp
+index 703c875..89af5d3 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/FD.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/FD.cpp
+@@ -26,6 +26,16 @@ $end_info$
+ #include <syscall.h>
+ #include <time.h>
+ #include <unistd.h>
++#include <cstdlib>
++
++// Android: fake st_uid/st_gid in stat results to match GetFakeUID()
++static uint64_t GetFakeUID() {
++  static uint64_t uid = []() -> uint64_t {
++    const char* env = getenv("FEX_FAKE_UID");
++    return env ? (uint64_t)atoi(env) : 1000;
++  }();
++  return uid;
++}
+ 
+ namespace FEX::HLE::x64 {
+ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+@@ -69,6 +79,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Stat(pathname, &host_stat);
+     if (Result != -1) {
+       *buf = host_stat;
++      buf->st_uid = GetFakeUID();
++      buf->st_gid = GetFakeUID();
+     }
+     SYSCALL_ERRNO();
+   });
+@@ -79,6 +91,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = ::fstat(fd, &host_stat);
+     if (Result != -1) {
+       *buf = host_stat;
++      buf->st_uid = GetFakeUID();
++      buf->st_gid = GetFakeUID();
+     }
+     SYSCALL_ERRNO();
+   });
+@@ -90,6 +104,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+     uint64_t Result = FEX::HLE::_SyscallHandler->FM.Lstat(path, &host_stat);
+     if (Result != -1) {
+       *buf = host_stat;
++      buf->st_uid = GetFakeUID();
++      buf->st_gid = GetFakeUID();
+     }
+     SYSCALL_ERRNO();
+   });
+@@ -102,6 +118,8 @@ void RegisterFD(FEX::HLE::SyscallHandler* Handler) {
+       uint64_t Result = FEX::HLE::_SyscallHandler->FM.NewFSStatAt(dirfd, pathname, &host_stat, flag);
+       if (Result != -1) {
+         *buf = host_stat;
++        buf->st_uid = GetFakeUID();
++        buf->st_gid = GetFakeUID();
        }
        SYSCALL_ERRNO();
      });
