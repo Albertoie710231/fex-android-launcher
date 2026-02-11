@@ -744,6 +744,9 @@ class ContainerManager(private val context: Context) {
             Log.i(TAG, "Created apt insecure repositories config")
         }
 
+        // Deploy Proton setup scripts into rootfs
+        deployProtonScripts()
+
         // Deploy thunks (guest + host) to their expected locations
         deployThunks()
 
@@ -756,6 +759,35 @@ class ContainerManager(private val context: Context) {
         }
 
         Log.i(TAG, "Container setup finalized")
+    }
+
+    /**
+     * Deploy Proton setup and launch scripts into the rootfs at /opt/scripts/.
+     * These are bundled as assets and run inside the FEX guest.
+     */
+    private fun deployProtonScripts() {
+        val scriptsDir = File(fexRootfsDir, "opt/scripts")
+        scriptsDir.mkdirs()
+
+        for (scriptName in listOf("setup_proton.sh", "launch_wine.sh")) {
+            val targetFile = File(scriptsDir, scriptName)
+            try {
+                context.assets.open(scriptName).use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
+                Log.i(TAG, "Deployed $scriptName to ${targetFile.absolutePath}")
+            } catch (e: IOException) {
+                Log.d(TAG, "$scriptName not in assets, skipping")
+            }
+        }
+
+        // Create games directory
+        val gamesDir = File(fexRootfsDir, "home/user/games")
+        gamesDir.mkdirs()
     }
 
     // Deploy FEX thunk libraries to their expected locations.

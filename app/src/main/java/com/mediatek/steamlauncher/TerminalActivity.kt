@@ -35,6 +35,7 @@ class TerminalActivity : AppCompatActivity() {
     private lateinit var btnDisplay: Button
 
     private val app: SteamLauncherApp by lazy { application as SteamLauncherApp }
+    private val protonManager: ProtonManager by lazy { ProtonManager(this) }
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -205,6 +206,38 @@ class TerminalActivity : AppCompatActivity() {
                 "HOME" to fexHomeDir,
                 "TMPDIR" to tmpDir
             ))
+        }
+
+        // --- Proton-GE / Wine buttons ---
+
+        // Setup Proton-GE: download, extract, init Wine prefix
+        findViewById<Button>(R.id.btnSetupProton).setOnClickListener {
+            executeCommand(protonManager.getSetupCommand())
+        }
+
+        // Wine version test: verify wine64 binary works under FEX
+        findViewById<Button>(R.id.btnWineTest).setOnClickListener {
+            executeCommand(protonManager.getWineVersionTestCommand())
+        }
+
+        // Check rootfs dependencies for Wine/Proton
+        findViewById<Button>(R.id.btnCheckDeps).setOnClickListener {
+            executeCommand(protonManager.getDependencyCheckCommand())
+        }
+
+        // Start Xvfb in TCP-only mode (required for Wine)
+        findViewById<Button>(R.id.btnStartXvfb).setOnClickListener {
+            executeCommand(protonManager.getXvfbStartCommand())
+        }
+
+        // Initialize Wine prefix (wineboot -u)
+        findViewById<Button>(R.id.btnWineBoot).setOnClickListener {
+            executeCommand(protonManager.getWineBootCommand())
+        }
+
+        // Quick test: run Wine notepad
+        findViewById<Button>(R.id.btnNotepad).setOnClickListener {
+            executeCommand(protonManager.getNotepadTestCommand())
         }
     }
 

@@ -156,6 +156,60 @@
                 android:padding="8dp"
                 android:layout_marginStart="4dp" />
 
+            <Button
+                android:id="@+id/btnSetupProton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Setup Proton"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnWineTest"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Wine Test"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnCheckDeps"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Check Deps"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnStartXvfb"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Start Xvfb"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnWineBoot"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Wine Boot"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnNotepad"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Notepad"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
         </LinearLayout>
 
     </HorizontalScrollView>

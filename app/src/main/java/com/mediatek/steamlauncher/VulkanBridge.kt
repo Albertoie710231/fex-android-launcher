@@ -298,8 +298,15 @@ object VulkanBridge {
      *
      * @param useVortek If true, configure for Vortek passthrough. If false, use direct Android ICD.
      * @param vortekSocketPath Path to the Vortek Unix socket (required if useVortek is true)
+     * @param enableHeadless If true, include LD_PRELOAD for headless frame capture
+     * @param enableDxvkHud If true, show DXVK FPS overlay
      */
-    fun getProtonVulkanEnv(useVortek: Boolean = false, vortekSocketPath: String? = null): Map<String, String> {
+    fun getProtonVulkanEnv(
+        useVortek: Boolean = false,
+        vortekSocketPath: String? = null,
+        enableHeadless: Boolean = true,
+        enableDxvkHud: Boolean = false
+    ): Map<String, String> {
         val baseEnv = mutableMapOf(
             // WSI
             "MESA_VK_WSI_PRESENT_MODE" to "fifo",
@@ -308,16 +315,19 @@ object VulkanBridge {
             // DXVK (DirectX to Vulkan)
             "DXVK_ASYNC" to "1",
             "DXVK_STATE_CACHE" to "1",
-            "DXVK_LOG_LEVEL" to "none",
+            "DXVK_LOG_LEVEL" to "info",
+            "DXVK_HUD" to if (enableDxvkHud) "fps,devinfo" else "",
 
             // VKD3D (DirectX 12 to Vulkan)
             "VKD3D_FEATURE_LEVEL" to "12_1",
             "VKD3D_DISABLE_EXTENSIONS" to "",
 
-            // Proton
+            // Proton — esync/fsync MUST be disabled on Android:
+            // Android kernel lacks eventfd semaphore support (esync) and
+            // futex_waitv syscall (fsync) that Proton Wine needs.
             "PROTON_USE_WINED3D" to "0",
-            "PROTON_NO_ESYNC" to "0",
-            "PROTON_NO_FSYNC" to "0",
+            "PROTON_NO_ESYNC" to "1",
+            "PROTON_NO_FSYNC" to "1",
             "PROTON_ENABLE_NVAPI" to "0",
             "PROTON_HIDE_NVIDIA_GPU" to "0",
 
@@ -339,6 +349,12 @@ object VulkanBridge {
         } else {
             // Direct Android ICD (won't work from glibc, but kept for reference)
             baseEnv["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/android_icd.json"
+        }
+
+        // Headless frame capture: intercepts Vulkan surface/swapchain creation
+        // and sends rendered frames via TCP 19850 to FrameSocketServer
+        if (enableHeadless) {
+            baseEnv["LD_PRELOAD"] = "/usr/lib/libvulkan_headless.so"
         }
 
         return baseEnv
