@@ -155,6 +155,8 @@ class FexExecutor(private val context: Context) {
                 append("unset ANDROID_I18N_ROOT ANDROID_TZDATA_ROOT COLORTERM DEX2OATBOOTCLASSPATH && ")
 
                 // Set FEX environment
+                // HOME must be the host path here so FEX can find Config.json at $HOME/.fex-emu/
+                // We'll override HOME for the guest later (to /home/user) inside the bash command
                 append("export HOME='${baseEnv["HOME"]}' && ")
                 append("export TMPDIR='$tmpDir' && ")
                 append("export USE_HEAP=1 && ")
@@ -174,7 +176,10 @@ class FexExecutor(private val context: Context) {
                 // Invoke via ld.so wrapper: ld.so --library-path <path> FEXLoader <guest>
                 // Note: no 'exec' - let shell survive to report errors
                 append("'$ldLinuxPath' --library-path '$fexLibPath' '$fexLoaderPath'")
-                append(" /bin/bash -c '${guestCommand.replace("'", "'\\''")}'")
+                // Override HOME inside the guest to the rootfs path (/home/user)
+                // so programs like SteamCMD write to $HOME/Steam/ through the overlay,
+                // not to the Android host path which bypasses the rootfs.
+                append(" /bin/bash -c 'export HOME=/home/user; ${guestCommand.replace("'", "'\\''")}'")
                 append(" ; echo \"[FEX exit code: \$?]\"")
             }
 

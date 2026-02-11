@@ -42,6 +42,7 @@ class TerminalActivity : AppCompatActivity() {
     private var lineCount = 0
     private var isRunning = false
     private var currentJob: Job? = null
+    private var currentProcess: Process? = null
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
     private var frameSocketServer: FrameSocketServer? = null
     private var isDisplayMode = false
@@ -243,15 +244,28 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun sendCommand() {
-        val command = etCommand.text.toString().trim()
-        if (command.isEmpty()) return
-        if (isRunning) {
-            appendOutput("[Busy - wait for current command to finish]\n")
+        val text = etCommand.text.toString()
+        if (text.isEmpty()) return
+
+        etCommand.text.clear()
+
+        if (isRunning && currentProcess != null) {
+            // Pipe input to running process's stdin
+            appendOutput("$text\n")
+            scope.launch(Dispatchers.IO) {
+                try {
+                    currentProcess?.outputStream?.let { stdin ->
+                        stdin.write((text + "\n").toByteArray())
+                        stdin.flush()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to write to stdin", e)
+                }
+            }
             return
         }
 
-        etCommand.text.clear()
-        executeCommand(command)
+        executeCommand(text.trim())
     }
 
     private fun executeCommand(command: String) {
@@ -285,8 +299,10 @@ class TerminalActivity : AppCompatActivity() {
                     command = wrappedCommand,
                     environment = env
                 )
+                currentProcess = process
 
                 if (process == null) {
+                    currentProcess = null
                     withContext(Dispatchers.Main) {
                         appendOutput("[ERROR: Failed to start process]\n")
                         setRunning(false)
@@ -365,17 +381,20 @@ class TerminalActivity : AppCompatActivity() {
                     }
                 }
 
+                currentProcess = null
                 withContext(Dispatchers.Main) {
                     appendOutput("\n")
                     setRunning(false)
                 }
 
             } catch (e: CancellationException) {
+                currentProcess = null
                 withContext(Dispatchers.Main) {
                     appendOutput("\n[Cancelled]\n")
                     setRunning(false)
                 }
             } catch (e: Exception) {
+                currentProcess = null
                 Log.e(TAG, "Command execution failed", e)
                 withContext(Dispatchers.Main) {
                     appendOutput("\n[ERROR: ${e.message}]\n")
@@ -447,8 +466,7 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun setRunning(running: Boolean) {
         isRunning = running
-        btnSend.isEnabled = !running
-        btnSend.text = if (running) "..." else "Run"
+        btnSend.text = if (running) "Send" else "Run"
     }
 
     private fun appendOutput(text: String) {
@@ -593,6 +611,8 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        currentProcess?.destroyForcibly()
+        currentProcess = null
         currentJob?.cancel()
         scope.cancel()
         frameSocketServer?.setOutputSurface(null)
