@@ -161,6 +161,7 @@ class FexExecutor(private val context: Context) {
                 append("export TMPDIR='$tmpDir' && ")
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=1 && ")
+                append("export FEX_HOSTFEATURES='disableavx' && ")
                 // LD_LIBRARY_PATH for FEX native libraries (RPATH alone isn't sufficient)
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD for thunks: host thunk → ICD loader → Vortek
@@ -290,6 +291,7 @@ class FexExecutor(private val context: Context) {
                 append("export TMPDIR='$tmpDir' && ")
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=1 && ")
+                append("export FEX_HOSTFEATURES='disableavx' && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD for thunks
                 append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
@@ -545,6 +547,7 @@ class FexExecutor(private val context: Context) {
             // FEX-specific
             "USE_HEAP" to "1",
             "FEX_DISABLETELEMETRY" to "1",
+            "FEX_HOSTFEATURES" to "disableavx",
 
             // Library path for FEX native binaries
             "LD_LIBRARY_PATH" to fexLibPath,

@@ -136,6 +136,10 @@ export PROTON_NO_FSYNC=1
 export PROTON_ENABLE_NVAPI=0
 export PROTON_HIDE_NVIDIA_GPU=0
 
+# DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
+export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n"
+export WINEDEBUG=err+all
+
 # DXVK or wined3d
 if [ "$USE_DXVK" -eq 1 ]; then
     export PROTON_USE_WINED3D=0
@@ -182,6 +186,21 @@ if [ ! -d "${WINEPREFIX}/drive_c" ]; then
 fi
 
 # ============================================================
+# Install standalone DXVK DLLs to system32 (from Proton's dxvk/ directory)
+# These use Vulkan directly — unlike Wine's builtins which need wined3d/VKD3D
+# ============================================================
+DXVK_DIR="${PROTON_DIR}/files/lib/wine/dxvk/x86_64-windows"
+SYS32="${WINEPREFIX}/drive_c/windows/system32"
+mkdir -p "$SYS32"
+for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
+    if [ -f "$DXVK_DIR/$dll" ]; then
+        cp "$DXVK_DIR/$dll" "$SYS32/$dll"
+    fi
+done
+[ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "$SYS32/d3dcompiler_47.dll"
+echo "DXVK standalone DLLs installed to system32"
+
+# ============================================================
 # Launch
 # ============================================================
 echo ""
@@ -200,6 +219,18 @@ echo ""
 if [ "$EXE_PATH" != "notepad" ]; then
     EXE_DIR="$(dirname "$EXE_PATH")"
     cd "$EXE_DIR"
+
+    # Deploy game-specific stub DLLs (backup originals if present)
+    for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
+        if [ -f "/opt/stubs/$stub" ]; then
+            if [ -f "$EXE_DIR/$stub" ] && [ ! -f "$EXE_DIR/${stub}.orig" ]; then
+                cp "$EXE_DIR/$stub" "$EXE_DIR/${stub}.orig"
+                echo "Backed up $stub -> ${stub}.orig"
+            fi
+            cp "/opt/stubs/$stub" "$EXE_DIR/$stub"
+            echo "Deployed stub: $stub"
+        fi
+    done
 fi
 
 # Launch via wine64

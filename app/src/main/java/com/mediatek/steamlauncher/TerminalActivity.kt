@@ -180,6 +180,22 @@ class TerminalActivity : AppCompatActivity() {
             executeCommand("VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json vulkaninfo --summary 2>&1 | head -50")
         }
 
+        // vkcube: start X11 for xcb_connect(), switch to display mode, run with LD_PRELOAD
+        // for guest-side xcb_surface injection + frame capture via TCP 19850
+        findViewById<Button>(R.id.btnVkcube).setOnClickListener {
+            // Start X11 if needed (vkcube calls xcb_connect())
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for vkcube]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            // Switch to display mode to show frames on SurfaceView
+            if (!isDisplayMode) toggleDisplayMode()
+            executeCommand("export LD_PRELOAD=/lib/libvulkan_headless.so; vkcube 2>&1")
+        }
+
         findViewById<Button>(R.id.btnLs).setOnClickListener {
             executeCommand("ls -la")
         }
@@ -262,6 +278,13 @@ class TerminalActivity : AppCompatActivity() {
         // Quick test: run Wine notepad
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             executeCommand(protonManager.getNotepadTestCommand())
+        }
+
+        // Launch Ys IX game
+        findViewById<Button>(R.id.btnLaunchGame).setOnClickListener {
+            executeCommand(protonManager.getLaunchCommand(
+                "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
+            ))
         }
     }
 

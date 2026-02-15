@@ -121,6 +121,15 @@
                 android:layout_marginStart="4dp" />
 
             <Button
+                android:id="@+id/btnVkcube"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="vkcube"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
                 android:id="@+id/btnLs"
                 android:layout_width="wrap_content"
                 android:layout_height="36dp"
@@ -206,6 +215,15 @@
                 android:layout_width="wrap_content"
                 android:layout_height="36dp"
                 android:text="Notepad"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
+                android:id="@+id/btnLaunchGame"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Ys IX"
                 android:textSize="11sp"
                 android:padding="8dp"
                 android:layout_marginStart="4dp" />

@@ -156,6 +156,13 @@ class ContainerManager(private val context: Context) {
 }""")
 
         Log.i(TAG, "Refreshed nativeLibDir paths: $nativeLibDir")
+
+        // Deploy stub DLLs and fix Mesa/GLVND on every launch
+        // (these are idempotent and fast — ensures rootfs is always patched)
+        if (fexRootfsDir.exists()) {
+            deployStubDlls()
+            fixupMesaAndGlvnd()
+        }
     }
 
     // ============================================================
@@ -747,6 +754,12 @@ class ContainerManager(private val context: Context) {
         // Deploy Proton setup scripts into rootfs
         deployProtonScripts()
 
+        // Deploy stub DLLs to rootfs (d3dcompiler_47, Galaxy64, GFSDK_SSAO)
+        deployStubDlls()
+
+        // Remove Mesa GLX (SIGILL from LLVM AVX2) and install GLVND dispatchers
+        fixupMesaAndGlvnd()
+
         // Deploy thunks (guest + host) to their expected locations
         deployThunks()
 
@@ -788,6 +801,95 @@ class ContainerManager(private val context: Context) {
         // Create games directory
         val gamesDir = File(fexRootfsDir, "home/user/games")
         gamesDir.mkdirs()
+    }
+
+    /**
+     * Deploy stub DLLs from assets into the rootfs.
+     *
+     * - d3dcompiler_47_stub.dll: replaces Wine's d3dcompiler_47 (which depends on
+     *   wined3d.so and causes SIGILL). Goes into Wine's native DLL path so
+     *   WINEDLLOVERRIDES=d3dcompiler_47=n picks it up.
+     * - Galaxy64.dll, GFSDK_SSAO: game-specific stubs copied to /opt/stubs/ for
+     *   deployment to game directories at launch time.
+     */
+    private fun deployStubDlls() {
+        // d3dcompiler_47 stub → Wine's native DLL search path
+        val wineWin64Dir = File(fexRootfsDir, "opt/proton-ge/files/lib/wine/x86_64-windows")
+        wineWin64Dir.mkdirs()
+        copyAssetToFile("d3dcompiler_47_stub.dll", File(wineWin64Dir, "d3dcompiler_47.dll"))
+
+        // All stubs → /opt/stubs/ for game-directory deployment
+        val stubsDir = File(fexRootfsDir, "opt/stubs")
+        stubsDir.mkdirs()
+        copyAssetToFile("d3dcompiler_47_stub.dll", File(stubsDir, "d3dcompiler_47.dll"))
+        copyAssetToFile("Galaxy64.dll", File(stubsDir, "Galaxy64.dll"))
+        copyAssetToFile("GFSDK_SSAO_D3D11.win64.dll", File(stubsDir, "GFSDK_SSAO_D3D11.win64.dll"))
+
+        Log.i(TAG, "Stub DLLs deployed to Wine path and /opt/stubs/")
+    }
+
+    /**
+     * Remove Mesa GLX backend and DRI drivers (contain LLVM with AVX2 → SIGILL),
+     * then install GLVND dispatchers that safely return "no GL vendor".
+     *
+     * Chain that causes SIGILL:
+     *   Wine opengl32.so → dlopen("libGL.so.1") → libGLX.so.0 → libGLX_mesa.so
+     *   → DRI drivers → LLVM → AVX2 instructions → SIGILL on ARM64/FEX
+     *
+     * GLVND dispatchers provide libGL/libGLX API without Mesa backend.
+     */
+    private fun fixupMesaAndGlvnd() {
+        val libDir = File(fexRootfsDir, "usr/lib/x86_64-linux-gnu")
+        if (!libDir.exists()) return
+
+        // Remove libGLX_mesa.so* (Mesa GLX backend with LLVM AVX2)
+        libDir.listFiles()?.filter { it.name.startsWith("libGLX_mesa.so") }?.forEach { file ->
+            file.delete()
+            Log.i(TAG, "Removed ${file.name} (Mesa GLX, SIGILL source)")
+        }
+
+        // Remove DRI drivers directory (contains LLVM with AVX2)
+        val driDir = File(libDir, "dri")
+        if (driDir.exists() && driDir.isDirectory) {
+            driDir.deleteRecursively()
+            Log.i(TAG, "Removed dri/ directory (DRI drivers with LLVM AVX2)")
+        }
+
+        // Install GLVND dispatchers from assets
+        copyAssetToFile("glvnd_libGL.so.1", File(libDir, "libGL.so.1"))
+        copyAssetToFile("glvnd_libGLX.so.0", File(libDir, "libGLX.so.0"))
+        copyAssetToFile("glvnd_libGLdispatch.so.0", File(libDir, "libGLdispatch.so.0"))
+
+        // Ensure libGL.so symlink exists → libGL.so.1
+        val glSymlink = File(libDir, "libGL.so")
+        if (!glSymlink.exists() || glSymlink.isFile) {
+            try {
+                glSymlink.delete()
+                Runtime.getRuntime().exec(
+                    arrayOf("ln", "-sf", "libGL.so.1", glSymlink.absolutePath)
+                ).waitFor()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to create libGL.so symlink", e)
+            }
+        }
+
+        Log.i(TAG, "Mesa GLX removed, GLVND dispatchers installed")
+    }
+
+    /** Copy an asset file to a target location, overwriting if exists. */
+    private fun copyAssetToFile(assetName: String, target: File) {
+        try {
+            context.assets.open(assetName).use { input ->
+                target.parentFile?.mkdirs()
+                FileOutputStream(target).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            target.setReadable(true, false)
+            target.setExecutable(true)
+        } catch (e: IOException) {
+            Log.w(TAG, "Asset $assetName not found, skipping: ${e.message}")
+        }
     }
 
     // Deploy FEX thunk libraries to their expected locations.
