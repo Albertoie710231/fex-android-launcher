@@ -289,6 +289,7 @@ static PFN_vkGetDeviceProcAddr g_next_gdpa = NULL;
 static VkInstance g_instance = NULL;
 static VkDevice g_device = NULL;
 static VkPhysicalDevice g_physical_device = NULL;
+static int g_instance_count = 0; /* tracks how many CreateInstance calls succeeded */
 
 /* Logging */
 #define LOG_TAG "[HeadlessLayer] "
@@ -583,9 +584,13 @@ static VkResult headless_CreateXcbSurfaceKHR(
     VkSurfaceKHR* pSurface)
 {
     (void)instance; (void)pCreateInfo; (void)pAllocator;
+    layer_marker("CreateXcbSurface_ENTER");
     SurfaceEntry* e = add_surface(1920, 1080);
     if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *pSurface = e->handle;
+    char sbuf[128];
+    snprintf(sbuf, sizeof(sbuf), "CreateXcbSurface_OK handle=0x%lx", (unsigned long)e->handle);
+    layer_marker(sbuf);
     LOG("vkCreateXcbSurfaceKHR -> headless surface 0x%lx (1920x1080)\n", (unsigned long)e->handle);
     return VK_SUCCESS;
 }
@@ -733,14 +738,23 @@ static VkResult headless_CreateSwapchainKHR(
     VkSwapchainKHR* pSwapchain)
 {
     /* Only handle our surfaces */
+    char scbuf[256];
+    snprintf(scbuf, sizeof(scbuf), "SC_ENTER surface=0x%lx dev=%p %ux%u fmt=%d",
+             (unsigned long)pCreateInfo->surface, device,
+             pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+             pCreateInfo->imageFormat);
+    layer_marker(scbuf);
+
     SurfaceEntry* surf = find_surface(pCreateInfo->surface);
     if (!surf) {
+        layer_marker("SC_NOT_OUR_SURFACE_forwarding");
         typedef VkResult (*PFN)(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*);
         PFN fn = (PFN)next_device_proc("vkCreateSwapchainKHR");
         if (fn) return fn(device, pCreateInfo, pAllocator, pSwapchain);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
+    layer_marker("SC_OUR_SURFACE");
     LOG("CreateSwapchainKHR: %ux%u, %u images, format=%d\n",
         pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
         pCreateInfo->minImageCount, pCreateInfo->imageFormat);
@@ -841,6 +855,9 @@ static VkResult headless_CreateSwapchainKHR(
     pthread_mutex_unlock(&g_mutex);
 
     *pSwapchain = sc->handle;
+    snprintf(scbuf, sizeof(scbuf), "SC_OK handle=0x%lx images=%u",
+             (unsigned long)sc->handle, sc->image_count);
+    layer_marker(scbuf);
     LOG("Created swapchain 0x%lx with %u images\n", (unsigned long)sc->handle, sc->image_count);
     return VK_SUCCESS;
 }
@@ -922,8 +939,17 @@ static VkResult headless_AcquireNextImageKHR(
     return VK_SUCCESS;
 }
 
+static int g_present_count = 0;
+
 static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
+    if (g_present_count < 3) {
+        char pbuf[128];
+        snprintf(pbuf, sizeof(pbuf), "QueuePresent #%d swapchains=%u", g_present_count, pPresentInfo->swapchainCount);
+        layer_marker(pbuf);
+    }
+    g_present_count++;
+
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         SwapchainEntry* sc = find_swapchain(pPresentInfo->pSwapchains[i]);
         if (!sc) {
@@ -1012,9 +1038,18 @@ static VkResult headless_EnumerateInstanceExtensionProperties(
 static VkResult headless_EnumerateDeviceExtensionProperties(
     VkPhysicalDevice pd, const char* pLayerName, uint32_t* pCount, VkExtensionProperties* pProps)
 {
+    char mbuf[256];
+    snprintf(mbuf, sizeof(mbuf), "EDEP_ENTER pd=%p layer=%s pProps=%p g_inst=%p",
+             pd, pLayerName ? pLayerName : "(null)", (void*)pProps, g_instance);
+    layer_marker(mbuf);
+    LOG("EnumDevExtProps: pd=%p layer=%s pProps=%p\n", pd, pLayerName ? pLayerName : "(null)", (void*)pProps);
+
     typedef VkResult (*PFN)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
     PFN fn = (PFN)next_instance_proc("vkEnumerateDeviceExtensionProperties");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) {
+        layer_marker("EDEP_NO_FN");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
 
     /* Get real count */
     uint32_t real_count = 0;
@@ -1049,9 +1084,12 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
         pProps[real_count].specVersion = 70;
         *pCount = real_count + 1;
         LOG("Injected VK_KHR_swapchain device extension\n");
+        layer_marker("EDEP_INJECTED_SWAPCHAIN");
     } else {
         *pCount = get;
     }
+    snprintf(mbuf, sizeof(mbuf), "EDEP_DONE total=%u has_swp=%d", *pCount, has_swapchain);
+    layer_marker(mbuf);
     return VK_SUCCESS;
 }
 
@@ -1153,12 +1191,17 @@ static VkResult headless_CreateInstance(
     layer_marker(buf2);
 
     if (result == VK_SUCCESS) {
+        g_instance_count++;
         g_next_gipa = next_gipa;
         g_instance = *pInstance;
-        LOG("Instance created: %p\n", *pInstance);
+        LOG("Instance created: %p (instance #%d)\n", *pInstance, g_instance_count);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "CreateInstance_OK #%d g_instance=%p next_gipa=%p",
+                 g_instance_count, *pInstance, (void*)next_gipa);
+        layer_marker(buf);
+    } else {
         char buf[128];
-        snprintf(buf, sizeof(buf), "CreateInstance_OK g_instance=%p next_gipa=%p",
-                 *pInstance, (void*)next_gipa);
+        snprintf(buf, sizeof(buf), "CreateInstance_FAIL result=%d", result);
         layer_marker(buf);
     }
 
@@ -1166,13 +1209,23 @@ static VkResult headless_CreateInstance(
 }
 
 static void headless_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator) {
-    (void)instance;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "DestroyInstance_ENTER caller=%p g_instance=%p", instance, g_instance);
+    layer_marker(buf);
+    LOG("vkDestroyInstance: caller=%p, g_instance=%p\n", instance, g_instance);
+
     typedef void (*PFN)(VkInstance, const VkAllocationCallbacks*);
     PFN fn = (PFN)next_instance_proc("vkDestroyInstance");
     /* Use g_instance (ICD's handle) for the actual destroy call */
-    if (fn) fn(g_instance, pAllocator);
+    if (fn) {
+        fn(g_instance, pAllocator);
+        layer_marker("DestroyInstance_DONE");
+    } else {
+        layer_marker("DestroyInstance_NO_FN");
+    }
     g_instance = NULL;
     g_next_gipa = NULL;
+    g_instance_count--;
 }
 
 /* ============================================================================
@@ -1198,15 +1251,25 @@ static VkResult headless_CreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice)
 {
-    LOG("vkCreateDevice intercepted\n");
+    char buf[256];
+    snprintf(buf, sizeof(buf), "CD_ENTER phys=%p g_instance=%p exts=%u",
+             physicalDevice, g_instance, pCreateInfo->enabledExtensionCount);
+    layer_marker(buf);
+    LOG("vkCreateDevice intercepted (phys=%p, %u exts)\n",
+        physicalDevice, pCreateInfo->enabledExtensionCount);
 
     if (!g_physical_device) g_physical_device = physicalDevice;
+
+    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
+        LOG("  dev ext[%u]: %s\n", i, pCreateInfo->ppEnabledExtensionNames[i]);
 
     VkLayerDeviceCreateInfo* chain = find_device_layer_info(pCreateInfo);
     if (!chain || !chain->u.pLayerInfo) {
         LOG("ERROR: No device layer chain info!\n");
+        layer_marker("CD_NO_CHAIN");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    layer_marker("CD_CHAIN_FOUND");
 
     PFN_vkGetInstanceProcAddr next_gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr next_gdpa = chain->u.pLayerInfo->pfnNextGetDeviceProcAddr;
@@ -1217,8 +1280,11 @@ static VkResult headless_CreateDevice(
     PFN_CD next_create = (PFN_CD)next_gipa(g_instance, "vkCreateDevice");
     if (!next_create) {
         LOG("ERROR: Could not get next vkCreateDevice!\n");
+        layer_marker("CD_NEXT_NULL");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    snprintf(buf, sizeof(buf), "CD_NEXT_CREATE=%p", (void*)next_create);
+    layer_marker(buf);
 
     /* Filter VK_KHR_swapchain — we handle it ourselves */
     const char** filtered = malloc(pCreateInfo->enabledExtensionCount * sizeof(char*));
@@ -1236,13 +1302,23 @@ static VkResult headless_CreateDevice(
     modified.enabledExtensionCount = fc;
     modified.ppEnabledExtensionNames = filtered;
 
+    snprintf(buf, sizeof(buf), "CD_CALLING_NEXT dev_exts=%u", fc);
+    layer_marker(buf);
+
     VkResult result = next_create(physicalDevice, &modified, pAllocator, pDevice);
     free(filtered);
+
+    snprintf(buf, sizeof(buf), "CD_RETURNED result=%d", result);
+    layer_marker(buf);
 
     if (result == VK_SUCCESS) {
         g_next_gdpa = next_gdpa;
         g_device = *pDevice;
         LOG("Device created: %p\n", *pDevice);
+        snprintf(buf, sizeof(buf), "CD_OK device=%p gdpa=%p", *pDevice, (void*)next_gdpa);
+        layer_marker(buf);
+    } else {
+        LOG("vkCreateDevice FAILED: %d\n", result);
     }
 
     return result;
@@ -1264,8 +1340,18 @@ static void headless_DestroyDevice(VkDevice device, const VkAllocationCallbacks*
 static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, const char* pName);
 static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char* pName);
 
+static int gipa_call_count = 0;
+
 static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, const char* pName)
 {
+    /* Trace ALL GIPA calls (first 200) to see what the loader/Wine queries */
+    gipa_call_count++;
+    if (gipa_call_count <= 200) {
+        char tbuf[256];
+        snprintf(tbuf, sizeof(tbuf), "GIPA[%d] inst=%p %s", gipa_call_count, instance, pName ? pName : "(null)");
+        layer_marker(tbuf);
+    }
+
     /* Global functions (instance == NULL) */
     if (strcmp(pName, "vkCreateInstance") == 0)
         return (PFN_vkVoidFunction)headless_CreateInstance;
@@ -1275,8 +1361,11 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
         return (PFN_vkVoidFunction)headless_GetInstanceProcAddr;
 
     /* Instance functions */
-    if (strcmp(pName, "vkDestroyInstance") == 0)
-        return (PFN_vkVoidFunction)headless_DestroyInstance;
+    /* DO NOT intercept vkDestroyInstance — causes infinite recursion via
+     * next_instance_proc(), same as EnumPD and EDEP. Also, Wine creates
+     * TWO instances (probe + real), and clearing g_instance/g_next_gipa
+     * when the probe instance is destroyed would break the real instance.
+     * Let the loader dispatch directly to the ICD's DestroyInstance. */
     if (strcmp(pName, "vkCreateDevice") == 0)
         return (PFN_vkVoidFunction)headless_CreateDevice;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
@@ -1287,9 +1376,12 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
      * includes our layer, so fn() calls back into us. Let the loader dispatch
      * directly to the ICD instead. g_physical_device is set in surface queries. */
 
-    /* Extension enumeration */
-    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0)
-        return (PFN_vkVoidFunction)headless_EnumerateDeviceExtensionProperties;
+    /* DO NOT intercept vkEnumerateDeviceExtensionProperties — causes infinite
+     * recursion. next_instance_proc() resolves through the loader's dispatch
+     * table which includes our layer, so fn() calls back into us endlessly.
+     * VK_KHR_swapchain is declared in the layer JSON's "device_extensions",
+     * so the Vulkan loader automatically merges it into the device extension
+     * list. Same fix pattern as vkEnumeratePhysicalDevices above. */
 
     /* Surface functions (VK_KHR_surface + VK_KHR_xcb_surface) */
     if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0)
@@ -1324,11 +1416,36 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
     /* Forward everything else */
     if (g_next_gipa) {
         PFN_vkVoidFunction fn = g_next_gipa(instance, pName);
-        if (fn) LOG("GIPA fwd: %s -> %p\n", pName, (void*)fn);
-        else LOG("GIPA fwd: %s -> NULL\n", pName);
+        /* Log interesting/uncommon lookups */
+        if (!fn || strncmp(pName, "vkGet", 5) == 0 || strncmp(pName, "vkCreate", 8) == 0 ||
+            strncmp(pName, "vkEnum", 6) == 0 || strncmp(pName, "vkCmd", 4) == 0) {
+            LOG("GIPA fwd: %s -> %p (inst=%p)\n", pName, (void*)fn, instance);
+        }
+        /* File-based markers for key probing functions so we can trace Wine's sequence */
+        if (strcmp(pName, "vkGetPhysicalDeviceProperties") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0 ||
+            strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+            strcmp(pName, "vkEnumeratePhysicalDevices") == 0 ||
+            strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0 ||
+            strcmp(pName, "vkCreateDevice") == 0 ||
+            strcmp(pName, "vkDestroyInstance") == 0) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "GIPA_FWD %s -> %p inst=%p", pName, (void*)fn, instance);
+            layer_marker(buf);
+        }
         return fn;
     }
-    LOG("GIPA: %s -> NULL (no next_gipa!)\n", pName);
+    LOG("GIPA: %s -> NULL (no g_next_gipa!)\n", pName);
+    layer_marker("GIPA_NO_NEXT_GIPA");
     return NULL;
 }
 

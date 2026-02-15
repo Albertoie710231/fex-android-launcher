@@ -363,15 +363,27 @@ class ProtonManager(private val context: Context) {
             ln -sf "$fexRootfsDir" "$winePrefix/dosdevices/z:"
             echo "Z: drive -> $fexRootfsDir (host rootfs)"
 
-            # Pre-seed system32 with Proton-GE PE DLLs (Wine's builtin search
-            # may fail under FEX because dladdr() returns host paths).
-            echo "Pre-seeding system32 with Proton-GE DLLs..."
+            # Pre-seed system32 with Proton-GE PE DLLs AND EXEs (Wine's builtin
+            # search may fail under FEX because dladdr() returns host paths).
+            # EXEs are critical: explorer.exe (desktop), services.exe, winedevice.exe, etc.
+            echo "Pre-seeding system32 with Proton-GE DLLs + EXEs..."
             PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
             PROTON_WIN32="$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             cp "${'$'}PROTON_WIN64"/*.dll "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
+            cp "${'$'}PROTON_WIN64"/*.exe "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
             cp "${'$'}PROTON_WIN32"/*.dll "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
+            cp "${'$'}PROTON_WIN32"/*.exe "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
             SYS32_COUNT=${'$'}(ls "$winePrefix/drive_c/windows/system32/"*.dll 2>/dev/null | wc -l)
-            echo "  system32: ${'$'}SYS32_COUNT DLLs"
+            SYS32_EXE=${'$'}(ls "$winePrefix/drive_c/windows/system32/"*.exe 2>/dev/null | wc -l)
+            echo "  system32: ${'$'}SYS32_COUNT DLLs, ${'$'}SYS32_EXE EXEs"
+
+            # Copy key EXEs to windows root (Wine looks here for explorer, etc.)
+            for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
+                if [ -f "${'$'}PROTON_WIN64/${'$'}exe" ]; then
+                    cp "${'$'}PROTON_WIN64/${'$'}exe" "$winePrefix/drive_c/windows/${'$'}exe"
+                fi
+            done
+            echo "  windows root: explorer.exe + key EXEs"
 
             # Initialize the Wine prefix (creates drive_c, registry, etc.)
             echo "Running wineboot -u (this may take a minute)..."
@@ -450,10 +462,22 @@ class ProtonManager(private val context: Context) {
                 ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
             fi
 
+            # Ensure critical EXEs are in the prefix (pre-seed may have missed them)
+            PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
+            SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
+            WINDIR="${'$'}WINEPREFIX/drive_c/windows"
+            if [ ! -f "${'$'}SYS32/explorer.exe" ]; then
+                echo "Fixing missing EXEs in prefix..."
+                cp "${'$'}PROTON_WIN64"/*.exe "${'$'}SYS32/" 2>/dev/null || true
+                for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
+                    [ -f "${'$'}PROTON_WIN64/${'$'}exe" ] && cp "${'$'}PROTON_WIN64/${'$'}exe" "${'$'}WINDIR/${'$'}exe"
+                done
+                echo "  Deployed EXEs to system32 + windows root"
+            fi
+
             # Install standalone DXVK DLLs to system32 (from Proton's dxvk/ directory)
             # These use Vulkan directly — unlike Wine's builtins which need wined3d/VKD3D
             DXVK_DIR="$PROTON_INSTALL_DIR/files/lib/wine/dxvk/x86_64-windows"
-            SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
             mkdir -p "${'$'}SYS32"
             for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
                 if [ -f "${'$'}DXVK_DIR/${'$'}dll" ]; then
