@@ -703,7 +703,12 @@ class ContainerManager(private val context: Context) {
             "libvulkan_headless_layer.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless_layer.so"),
             "VK_LAYER_HEADLESS_surface.json" to File(fexRootfsDir, "usr/share/vulkan/implicit_layer.d/VK_LAYER_HEADLESS_surface.json"),
             // Keep the LD_PRELOAD version too (for non-Wine commands like vkcube)
-            "libvulkan_headless.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless.so")
+            "libvulkan_headless.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless.so"),
+            // FEX thunk ICD shim: bridges guest Vulkan loader → FEX thunks → host Vortek
+            "libfex_thunk_icd.so" to File(fexRootfsDir, "usr/lib/x86_64-linux-gnu/libfex_thunk_icd.so"),
+            "fex_thunk_icd.json" to File(fexRootfsDir, "usr/share/vulkan/icd.d/fex_thunk_icd.json"),
+            // Vulkan loader test (debug tool)
+            "test_vulkan_loader" to File(fexRootfsDir, "usr/local/bin/test_vulkan_loader")
         )
         try {
             for ((assetName, targetFile) in layerFiles) {
