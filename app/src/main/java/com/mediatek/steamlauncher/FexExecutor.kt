@@ -160,8 +160,16 @@ class FexExecutor(private val context: Context) {
                 append("export HOME='${baseEnv["HOME"]}' && ")
                 append("export TMPDIR='$tmpDir' && ")
                 append("export USE_HEAP=1 && ")
-                append("export FEX_DISABLETELEMETRY=1 && ")
+                append("export FEX_DISABLETELEMETRY=0 && ")
                 append("export FEX_HOSTFEATURES='disableavx' && ")
+                append("export FEX_SILENTLOG=0 && ")
+                append("export FEX_OUTPUTLOG='$tmpDir/fex-debug.log' && ")
+                // FEX config via env vars for child process re-exec
+                append("export FEX_ROOTFS='Ubuntu_22_04' && ")
+                append("export FEX_THUNKHOSTLIBS='$fexDir/lib/fex-emu/HostThunks' && ")
+                append("export FEX_THUNKGUESTLIBS='$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks' && ")
+                append("export FEX_THUNKCONFIG='$fexHomeDir/.fex-emu/thunks.json' && ")
+                append("export FEX_X87REDUCEDPRECISION=1 && ")
                 // LD_LIBRARY_PATH for FEX native libraries (RPATH alone isn't sufficient)
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD for thunks: host thunk → ICD loader → Vortek
@@ -290,8 +298,16 @@ class FexExecutor(private val context: Context) {
                 append("export HOME='${baseEnv["HOME"]}' && ")
                 append("export TMPDIR='$tmpDir' && ")
                 append("export USE_HEAP=1 && ")
-                append("export FEX_DISABLETELEMETRY=1 && ")
+                append("export FEX_DISABLETELEMETRY=0 && ")
                 append("export FEX_HOSTFEATURES='disableavx' && ")
+                append("export FEX_SILENTLOG=0 && ")
+                append("export FEX_OUTPUTLOG='$tmpDir/fex-debug.log' && ")
+                // FEX config via env vars for child process re-exec
+                append("export FEX_ROOTFS='Ubuntu_22_04' && ")
+                append("export FEX_THUNKHOSTLIBS='$fexDir/lib/fex-emu/HostThunks' && ")
+                append("export FEX_THUNKGUESTLIBS='$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks' && ")
+                append("export FEX_THUNKCONFIG='$fexHomeDir/.fex-emu/thunks.json' && ")
+                append("export FEX_X87REDUCEDPRECISION=1 && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD for thunks
                 append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
@@ -546,8 +562,20 @@ class FexExecutor(private val context: Context) {
 
             // FEX-specific
             "USE_HEAP" to "1",
-            "FEX_DISABLETELEMETRY" to "1",
+            "FEX_DISABLETELEMETRY" to "0",
             "FEX_HOSTFEATURES" to "disableavx",
+            "FEX_SILENTLOG" to "0",
+            "FEX_OUTPUTLOG" to "$tmpDir/fex-debug.log",
+
+            // FEX config via env vars — critical for Wine child processes.
+            // When Wine spawns subprocesses, FEX re-execs with HOME=/home/user (guest),
+            // can't find Config.json, and falls back to wrong default paths.
+            // These env vars persist through child process re-exec.
+            "FEX_ROOTFS" to "Ubuntu_22_04",
+            "FEX_THUNKHOSTLIBS" to "$fexDir/lib/fex-emu/HostThunks",
+            "FEX_THUNKGUESTLIBS" to "$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks",
+            "FEX_THUNKCONFIG" to "$fexHomeDir/.fex-emu/thunks.json",
+            "FEX_X87REDUCEDPRECISION" to "1",
 
             // Library path for FEX native binaries
             "LD_LIBRARY_PATH" to fexLibPath,

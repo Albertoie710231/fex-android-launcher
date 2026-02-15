@@ -696,19 +696,29 @@ class ContainerManager(private val context: Context) {
      * enabling vkcube to render without an X11 server and capture frames via TCP.
      */
     private fun installHeadlessWrapper() {
-        val targetFile = File(fexRootfsDir, "usr/lib/libvulkan_headless.so")
+        // Deploy headless Vulkan as an implicit layer instead of LD_PRELOAD.
+        // LD_PRELOAD fails under FEX on Android (AT_SECURE/SELinux blocks it).
+        // The Vulkan loader loads implicit layers via dlopen which works fine.
+        val layerFiles = mapOf(
+            "libvulkan_headless_layer.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless_layer.so"),
+            "VK_LAYER_HEADLESS_surface.json" to File(fexRootfsDir, "usr/share/vulkan/implicit_layer.d/VK_LAYER_HEADLESS_surface.json"),
+            // Keep the LD_PRELOAD version too (for non-Wine commands like vkcube)
+            "libvulkan_headless.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless.so")
+        )
         try {
-            context.assets.open("libvulkan_headless.so").use { input ->
-                targetFile.parentFile?.mkdirs()
-                FileOutputStream(targetFile).use { output ->
-                    input.copyTo(output)
+            for ((assetName, targetFile) in layerFiles) {
+                context.assets.open(assetName).use { input ->
+                    targetFile.parentFile?.mkdirs()
+                    FileOutputStream(targetFile).use { output ->
+                        input.copyTo(output)
+                    }
                 }
+                targetFile.setExecutable(true)
+                targetFile.setReadable(true, false)
             }
-            targetFile.setExecutable(true)
-            targetFile.setReadable(true, false)
-            Log.i(TAG, "Headless Vulkan wrapper installed: ${targetFile.absolutePath}")
+            Log.i(TAG, "Headless Vulkan layer + wrapper installed (${layerFiles.size} files)")
         } catch (e: IOException) {
-            Log.w(TAG, "Headless Vulkan wrapper not found in assets: ${e.message}")
+            Log.w(TAG, "Headless Vulkan wrapper install failed: ${e.message}")
         }
     }
 

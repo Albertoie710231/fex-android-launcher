@@ -190,18 +190,21 @@ class ProtonManager(private val context: Context) {
             "PROTON_ENABLE_NVAPI" to "0",
             "PROTON_HIDE_NVIDIA_GPU" to "0",
 
-            // Vulkan ICD (guest-side, through FEX thunks to Vortek)
-            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/vortek_icd.json",
+            // Vulkan ICD (x86-64 shim → FEX thunks → host Vortek)
+            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/fex_thunk_icd.json",
 
-            // Headless frame capture (intercepted by vulkan_headless.so)
-            "LD_PRELOAD" to "/usr/lib/libvulkan_headless.so",
+            // Headless frame capture via Vulkan implicit layer (LD_PRELOAD blocked by AT_SECURE)
+            "HEADLESS_LAYER" to "1",
 
             // Mali GPU workarounds
             "MALI_NO_ASYNC_COMPUTE" to "1",
 
+            // Disable VR in Proton
+            "PROTON_ENABLE_NVAPI" to "0",
+
             // DLL overrides: use DXVK (native) for D3D, disable wined3d (SIGILL),
             // use our stub DLLs for d3dcompiler_47, and disable mscoree/mshtml (.NET/IE)
-            "WINEDLLOVERRIDES" to "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n",
+            "WINEDLLOVERRIDES" to "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d",
             "WINEDEBUG" to "err+all",
 
             // Misc
@@ -425,15 +428,16 @@ class ProtonManager(private val context: Context) {
             export PROTON_NO_FSYNC=1
             export PROTON_USE_WINED3D=0
 
-            # Vulkan via Vortek (thunks handle x86-64 -> ARM64 translation)
-            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+            # Vulkan ICD: x86-64 shim → FEX thunks → host Vortek → Mali GPU
+            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
             export MALI_NO_ASYNC_COMPUTE=1
 
             # Headless frame capture → TCP 19850 → Android SurfaceView
-            export LD_PRELOAD=/usr/lib/libvulkan_headless.so
+            # Use Vulkan implicit layer instead of LD_PRELOAD (LD_PRELOAD blocked by AT_SECURE on Android)
+            export HEADLESS_LAYER=1
 
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
-            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n"
+            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d"
             export WINEDEBUG=err+all
 
             # Misc
@@ -460,6 +464,14 @@ class ProtonManager(private val context: Context) {
             [ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "${'$'}SYS32/d3dcompiler_47.dll"
             echo "DXVK standalone DLLs installed to system32"
 
+            # Create DXVK config to disable OpenVR/OpenXR (no VR hardware, avoids extension query crash)
+            cat > "$exeDir/dxvk.conf" << 'DXVKEOF'
+# DXVK config for Android/FEX-Emu
+dxgi.enableOpenVR = False
+dxgi.enableOpenXR = False
+dxgi.maxFrameLatency = 1
+DXVKEOF
+
             # Deploy game-specific stub DLLs (backup originals if present)
             for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
                 if [ -f "/opt/stubs/${'$'}stub" ]; then
@@ -479,6 +491,13 @@ class ProtonManager(private val context: Context) {
 
             cd "$exeDir"
             wine64 "$exePath" $extraArgs 2>&1
+            WINE_EXIT=${'$'}?
+            echo ""
+            echo "[wine64 exit code: ${'$'}WINE_EXIT]"
+            if [ ${'$'}WINE_EXIT -eq 132 ]; then
+                echo "=== SIGILL CRASH — FEX debug log (last 100 lines) ==="
+                tail -100 /tmp/fex-debug.log 2>/dev/null || echo "(no FEX log at /tmp)"
+            fi
         """.trimIndent()
     }
 

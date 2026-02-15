@@ -160,14 +160,14 @@ fi
 export VKD3D_FEATURE_LEVEL=12_1
 
 # Vulkan ICD (guest-side, routed through FEX thunks to Vortek)
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
 
 # Mali GPU workarounds
 export MALI_NO_ASYNC_COMPUTE=1
 
 # Headless frame capture
 if [ "$HEADLESS" -eq 1 ]; then
-    export LD_PRELOAD=/usr/lib/libvulkan_headless.so
+    export LD_PRELOAD=libvulkan_headless.so
 fi
 
 # Misc
