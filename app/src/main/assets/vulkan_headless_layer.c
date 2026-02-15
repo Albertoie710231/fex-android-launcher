@@ -1282,9 +1282,10 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (PFN_vkVoidFunction)headless_GetDeviceProcAddr;
 
-    /* Physical device enumeration — intercept for debugging */
-    if (strcmp(pName, "vkEnumeratePhysicalDevices") == 0)
-        return (PFN_vkVoidFunction)headless_EnumeratePhysicalDevices;
+    /* DO NOT intercept vkEnumeratePhysicalDevices — causes infinite recursion.
+     * next_instance_proc() resolves through the loader's dispatch table which
+     * includes our layer, so fn() calls back into us. Let the loader dispatch
+     * directly to the ICD instead. g_physical_device is set in surface queries. */
 
     /* Extension enumeration */
     if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0)
