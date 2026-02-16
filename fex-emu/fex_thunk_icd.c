@@ -136,6 +136,30 @@ static VkResult wrapped_EnumeratePhysicalDevices(void* instance, uint32_t* pCoun
     return res;
 }
 
+/* ---- Wrapper: vkGetDeviceProcAddr ---- */
+/* FEX thunks' vkGetDeviceProcAddr only returns ~6 device functions.
+ * All others return NULL even though they ARE thunked and accessible via GIPA.
+ * Wine's winevulkan calls GDPA for ALL device functions to build its dispatch
+ * table, so NULL entries cause an assertion crash.
+ * Fix: fall back to GIPA(instance, name) when GDPA returns NULL. */
+
+typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(void*, const char*);
+static PFN_vkGetDeviceProcAddr real_gdpa = NULL;
+
+static PFN_vkVoidFunction wrapped_GetDeviceProcAddr(void* device, const char* pName) {
+    /* FEX thunks' real GDPA crashes (segfault) for most device functions
+     * (e.g., vkQueueSubmit). Only ~6 functions work via GDPA.
+     * Use GIPA exclusively — it returns valid pointers for ALL device functions
+     * via instance-level dispatch. This is how vkcube/vulkaninfo work. */
+    PFN_vkVoidFunction fn = NULL;
+    (void)device; /* Not used — GIPA uses saved_instance instead */
+
+    if (real_gipa && saved_instance)
+        fn = real_gipa(saved_instance, pName);
+
+    return fn;
+}
+
 /* ---- Wrapper: vkDestroyInstance ---- */
 
 typedef void (*PFN_vkDestroyInstance)(void*, const void*);
@@ -147,6 +171,7 @@ static void wrapped_DestroyInstance(void* instance, const void* pAllocator) {
     if (real_destroy_instance) real_destroy_instance(instance, pAllocator);
     icd_marker("DestroyInstance_DONE");
     saved_instance = NULL;
+    real_gdpa = NULL;
 }
 
 /* ICD protocol entry points */
@@ -187,6 +212,14 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
         LOG("GIPA: vkDestroyInstance -> real=%p, wrapper=%p\n",
             (void*)real_destroy_instance, (void*)wrapped_DestroyInstance);
         return (PFN_vkVoidFunction)wrapped_DestroyInstance;
+    }
+
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        real_gdpa = (PFN_vkGetDeviceProcAddr)real_gipa(instance, pName);
+        LOG("GIPA: vkGetDeviceProcAddr -> real=%p, wrapper=%p\n",
+            (void*)real_gdpa, (void*)wrapped_GetDeviceProcAddr);
+        icd_marker("GIPA_vkGetDeviceProcAddr");
+        return (PFN_vkVoidFunction)wrapped_GetDeviceProcAddr;
     }
 
     /* Everything else: pass through directly */

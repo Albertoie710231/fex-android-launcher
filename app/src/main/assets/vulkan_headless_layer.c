@@ -2003,9 +2003,16 @@ static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)headless_QueuePresentKHR;
 
-    /* Forward */
-    if (g_next_gdpa) return g_next_gdpa(device, pName);
-    return NULL;
+    /* FEX thunks' GDPA crashes (segfault) for most device functions.
+     * Use GIPA exclusively — safe and returns all device functions. */
+    PFN_vkVoidFunction fn = NULL;
+    if (g_next_gipa && g_instance)
+        fn = g_next_gipa(g_instance, pName);
+    /* Last resort: try GDPA if GIPA failed (shouldn't happen) */
+    if (!fn && g_next_gdpa)
+        fn = g_next_gdpa(device, pName);
+
+    return fn;
 }
 
 /* ============================================================================
