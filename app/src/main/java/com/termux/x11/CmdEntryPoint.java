@@ -84,8 +84,12 @@ public class CmdEntryPoint {
             }, "X11-Listener");
             listenerThread.start();
 
+            // Set initial screen dimensions so clients get valid geometry
+            // (before any LorieView is attached)
+            LorieView.sendWindowChange(1920, 1080, 60, "Steam Launcher");
+
             serverStarted = true;
-            Log.i(TAG, "X11 server started");
+            Log.i(TAG, "X11 server started (1920x1080, TCP + abstract socket)");
             return true;
         } catch (Exception e) {
             Log.e(TAG, "Failed to start X11 server", e);
@@ -136,33 +140,23 @@ public class CmdEntryPoint {
 
     /**
      * Attempt to establish the connection with the LorieView.
-     * Retries if surface is not ready yet.
+     * Works without a LorieView — uses hardcoded dimensions for headless X11.
+     * Game rendering goes through DXVK → Vulkan headless layer → TCP → SurfaceView,
+     * NOT through X11/LorieView. X11 is only needed for windowing/protocol.
      */
     private void establishConnection(int attempt) {
         try {
+            // Get dimensions from LorieView if available, otherwise use defaults
+            int w = 1920;
+            int h = 1080;
             LorieView view = MainActivity.getLorieView();
-            if (view == null) {
-                if (attempt < 20) {
-                    Log.w(TAG, "LorieView not ready, retrying in 100ms (attempt " + (attempt + 1) + ")");
-                    handler.postDelayed(() -> establishConnection(attempt + 1), 100);
-                } else {
-                    Log.e(TAG, "LorieView not available after " + attempt + " attempts");
+            if (view != null) {
+                int vw = view.getWidth();
+                int vh = view.getHeight();
+                if (vw > 0 && vh > 0) {
+                    w = vw;
+                    h = vh;
                 }
-                return;
-            }
-
-            int w = view.getWidth();
-            int h = view.getHeight();
-
-            // Check if surface has dimensions (is ready)
-            if (w <= 0 || h <= 0) {
-                if (attempt < 20) {
-                    Log.w(TAG, "Surface not ready (size: " + w + "x" + h + "), retrying in 100ms (attempt " + (attempt + 1) + ")");
-                    handler.postDelayed(() -> establishConnection(attempt + 1), 100);
-                } else {
-                    Log.e(TAG, "Surface not ready after " + attempt + " attempts");
-                }
-                return;
             }
 
             // Only call connect() once
@@ -171,27 +165,24 @@ public class CmdEntryPoint {
                     return;
                 }
 
-                Log.i(TAG, "Surface ready (" + w + "x" + h + "), establishing connection");
+                Log.i(TAG, "Establishing X11 connection (" + w + "x" + h + ", LorieView=" + (view != null) + ")");
 
-                // Try to establish connection via fd - use detachFd() to transfer ownership
+                // Send window change to configure screen dimensions
+                LorieView.sendWindowChange(w, h, 60, "Steam Launcher");
+
+                // Try to establish connection via fd
                 ParcelFileDescriptor pfd = getXConnection();
                 if (pfd != null) {
-                    int fd = pfd.detachFd();  // Use detachFd() instead of getFd()
+                    int fd = pfd.detachFd();
                     Log.i(TAG, "Got X connection fd: " + fd);
 
                     if (fd >= 0) {
-                        // Call connect() to establish the frame delivery pipeline
-                        Log.i(TAG, "Calling LorieView.connect(" + fd + ")");
                         LorieView.connect(fd);
                         Log.i(TAG, "After connect(), connected = " + LorieView.connected());
                     }
                 } else {
-                    Log.w(TAG, "getXConnection() returned null");
+                    Log.w(TAG, "getXConnection() returned null — X11 protocol still works via native listener");
                 }
-
-                // Send window change to configure dimensions
-                Log.i(TAG, "Sending window change: " + w + "x" + h);
-                LorieView.sendWindowChange(w, h, 60, "Steam Launcher");
 
                 // Request connection to start rendering
                 boolean reqResult = LorieView.requestConnection();

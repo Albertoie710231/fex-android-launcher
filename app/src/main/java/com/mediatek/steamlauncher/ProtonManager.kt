@@ -171,8 +171,9 @@ class ProtonManager(private val context: Context) {
             "WINESERVER" to "$PROTON_INSTALL_DIR/files/bin/wineserver",
             "LD_LIBRARY_PATH" to "$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib",
 
-            // X11 via libXlorie (native ARM64 X server, TCP port 6000)
-            "DISPLAY" to "localhost:0",
+            // X11 via libXlorie (native ARM64 X server, abstract socket @/tmp/.X11-unix/X0)
+            // DISPLAY=:0 uses abstract sockets (NOT TCP) — FEX passes connect() to host kernel
+            "DISPLAY" to ":0",
 
             // DXVK (DirectX 11 -> Vulkan translation)
             "DXVK_ASYNC" to "1",
@@ -217,7 +218,7 @@ class ProtonManager(private val context: Context) {
     /**
      * Command to check X11 server connectivity from FEX guest side.
      * libXlorie runs natively on Android (ARM64), started by TerminalActivity.
-     * Wine connects via DISPLAY=localhost:0 (TCP port 6000).
+     * Wine connects via DISPLAY=:0 (abstract socket @/tmp/.X11-unix/X0).
      */
     fun getXServerStartCommand(): String {
         return """
@@ -225,12 +226,18 @@ class ProtonManager(private val context: Context) {
             echo "libXlorie (native ARM64) should be started from Android side."
             echo "Press 'Start X' button in the app first."
             echo ""
-            echo "Testing TCP connection to localhost:6000 (display :0)..."
-            if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
-                echo "OK: X11 server is listening on TCP port 6000"
-                echo "Use: export DISPLAY=localhost:0"
+            echo "libXlorie uses abstract socket @/tmp/.X11-unix/X0"
+            echo "FEX guest connects via DISPLAY=:0 (abstract socket, NOT TCP)"
+            echo "Checking if abstract socket exists..."
+            if [ -e /tmp/.X11-unix/X0 ] || python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+try: s.connect('\x00/tmp/.X11-unix/X0'); print('OK: abstract socket reachable'); s.close()
+except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
+" 2>/dev/null; then
+                echo "Use: export DISPLAY=:0"
             else
-                echo "NOT RUNNING: X11 server not detected on TCP port 6000"
+                echo "NOT RUNNING: X11 server not detected"
                 echo "Press the 'Start X' button in the app toolbar."
             fi
         """.trimIndent()
@@ -298,7 +305,7 @@ class ProtonManager(private val context: Context) {
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=localhost:0
+            export DISPLAY=:0
             export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
@@ -371,8 +378,10 @@ class ProtonManager(private val context: Context) {
             PROTON_WIN32="$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             cp "${'$'}PROTON_WIN64"/*.dll "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
             cp "${'$'}PROTON_WIN64"/*.exe "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
+            cp "${'$'}PROTON_WIN64"/*.drv "$winePrefix/drive_c/windows/system32/" 2>/dev/null || true
             cp "${'$'}PROTON_WIN32"/*.dll "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
             cp "${'$'}PROTON_WIN32"/*.exe "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
+            cp "${'$'}PROTON_WIN32"/*.drv "$winePrefix/drive_c/windows/syswow64/" 2>/dev/null || true
             SYS32_COUNT=${'$'}(ls "$winePrefix/drive_c/windows/system32/"*.dll 2>/dev/null | wc -l)
             SYS32_EXE=${'$'}(ls "$winePrefix/drive_c/windows/system32/"*.exe 2>/dev/null | wc -l)
             echo "  system32: ${'$'}SYS32_COUNT DLLs, ${'$'}SYS32_EXE EXEs"
@@ -426,7 +435,7 @@ class ProtonManager(private val context: Context) {
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=localhost:0
+            export DISPLAY=:0
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
 
             # DXVK settings
@@ -466,13 +475,14 @@ class ProtonManager(private val context: Context) {
             PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
             SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
             WINDIR="${'$'}WINEPREFIX/drive_c/windows"
-            if [ ! -f "${'$'}SYS32/explorer.exe" ]; then
-                echo "Fixing missing EXEs in prefix..."
+            if [ ! -f "${'$'}SYS32/explorer.exe" ] || [ ! -f "${'$'}SYS32/winex11.drv" ]; then
+                echo "Fixing missing EXEs/DRVs in prefix..."
                 cp "${'$'}PROTON_WIN64"/*.exe "${'$'}SYS32/" 2>/dev/null || true
+                cp "${'$'}PROTON_WIN64"/*.drv "${'$'}SYS32/" 2>/dev/null || true
                 for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
                     [ -f "${'$'}PROTON_WIN64/${'$'}exe" ] && cp "${'$'}PROTON_WIN64/${'$'}exe" "${'$'}WINDIR/${'$'}exe"
                 done
-                echo "  Deployed EXEs to system32 + windows root"
+                echo "  Deployed EXEs + DRVs to system32 + windows root"
             fi
 
             # Install standalone DXVK DLLs to system32 (from Proton's dxvk/ directory)
@@ -509,10 +519,55 @@ DXVKEOF
                 fi
             done
 
+            # Verify X11 display connectivity before launch
+            echo "=== X11 Display Check ==="
+            echo "DISPLAY=${'$'}DISPLAY"
+            # Test BOTH abstract socket and TCP, use whichever works
+            X11_OK=0
+            python3 -c "
+import socket, sys
+# Test 1: Abstract socket (DISPLAY=:0)
+try:
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    s.connect('\x00/tmp/.X11-unix/X0')
+    print('X11 abstract socket @/tmp/.X11-unix/X0: CONNECTED')
+    s.close()
+    sys.exit(0)
+except Exception as e:
+    print(f'X11 abstract socket: FAILED ({e})')
+# Test 2: TCP (DISPLAY=localhost:0 → port 6000)
+try:
+    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    s.settimeout(2)
+    s.connect(('127.0.0.1',6000))
+    print('X11 TCP 127.0.0.1:6000: CONNECTED')
+    s.close()
+    sys.exit(10)  # signal TCP works
+except Exception as e:
+    print(f'X11 TCP port 6000: FAILED ({e})')
+    print('ERROR: No X11 connection method works!')
+    sys.exit(1)
+" 2>&1
+            X11_RESULT=${'$'}?
+            if [ ${'$'}X11_RESULT -eq 0 ]; then
+                export DISPLAY=:0
+                echo "Using DISPLAY=:0 (abstract socket)"
+                X11_OK=1
+            elif [ ${'$'}X11_RESULT -eq 10 ]; then
+                export DISPLAY=localhost:0
+                echo "Using DISPLAY=localhost:0 (TCP fallback)"
+                X11_OK=1
+            else
+                echo "WARNING: No X11 server reachable! Wine cannot create windows."
+            fi
+
             echo "=== Launching: $exePath ==="
             echo "Working dir: $exeDir"
             echo "Wine prefix: $winePrefix"
             echo ""
+
+            # Clear old layer trace log for this run
+            rm -f /tmp/layer_trace.log
 
             cd "$exeDir"
             wine64 "$exePath" $extraArgs 2>&1
@@ -561,7 +616,7 @@ DXVKEOF
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=localhost:0
+            export DISPLAY=:0
             export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
@@ -573,7 +628,7 @@ DXVKEOF
             fi
 
             echo "=== Notepad Test ==="
-            echo "DISPLAY=${'$'}DISPLAY (libXlorie via TCP port 6000)"
+            echo "DISPLAY=${'$'}DISPLAY (libXlorie via abstract socket)"
             echo "Starting Wine notepad..."
             timeout 30 wine64 notepad 2>&1 || true
             echo ""
@@ -613,12 +668,18 @@ DXVKEOF
             done
             echo ""
 
-            echo "--- X11 Server (libXlorie via TCP) ---"
-            if (echo > /dev/tcp/localhost/6000) 2>/dev/null; then
-                echo "OK: X11 server listening on TCP port 6000 (display :0)"
-            else
-                echo "NOT RUNNING: Press 'Start X' button in the app"
-            fi
+            echo "--- X11 Server (libXlorie via abstract socket) ---"
+            python3 -c "
+import socket
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+try:
+    s.connect('\x00/tmp/.X11-unix/X0')
+    print('OK: X11 abstract socket @/tmp/.X11-unix/X0 reachable')
+    s.close()
+except Exception as e:
+    print(f'NOT REACHABLE: {e}')
+    print('Press Start X button in the app')
+" 2>&1 || echo "(python3 not available — cannot test abstract socket)"
             echo ""
 
             echo "--- Proton-GE ---"

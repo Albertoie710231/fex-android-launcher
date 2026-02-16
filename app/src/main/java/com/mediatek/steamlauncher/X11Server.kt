@@ -80,19 +80,15 @@ class X11Server(private val context: Context) {
                 Thread.sleep(100)
             }
 
-            // Create a symlink from where the FEX container expects the socket to where libXlorie creates it
-            // libXlorie creates an abstract socket, so we need to bridge this
-            // For now, clients should use TCP: DISPLAY=localhost:0 or DISPLAY=127.0.0.1:0
-            // Or use our socket server for bridging (disabled for now due to crashes)
-
-            // NOTE: libXlorie doesn't expose filesystem sockets easily.
-            // Best approach for FEX container X11 clients is to use TCP.
-            // DISPLAY=127.0.0.1:0 connects to TCP port 6000 if enabled.
+            // libXlorie creates an abstract socket @/tmp/.X11-unix/X0
+            // FEX guest connects via DISPLAY=:0 — libxcb tries filesystem socket first
+            // (fails, no file), then abstract socket (connects to libXlorie on host).
+            // Abstract sockets work because FEX passes connect() to host kernel,
+            // and both processes share the same network namespace.
 
             isRunning = true
             Log.i(TAG, "X11 server started successfully")
-            Log.i(TAG, "For FEX container X11 apps, use: DISPLAY=127.0.0.1:0 (if TCP enabled)")
-            Log.i(TAG, "Or use: DISPLAY=:0 with proper socket forwarding")
+            Log.i(TAG, "FEX container X11 apps use: DISPLAY=:0 (abstract socket @/tmp/.X11-unix/X0)")
 
             handler.post { onServerStarted?.invoke() }
             true

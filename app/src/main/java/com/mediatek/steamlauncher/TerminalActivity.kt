@@ -243,18 +243,18 @@ class TerminalActivity : AppCompatActivity() {
         }
 
         // Start libXlorie X11 server (native ARM64 — NOT inside FEX)
-        // Listens on TCP port 6000 (display :0). Wine connects via DISPLAY=localhost:0
+        // Uses abstract socket @/tmp/.X11-unix/X0. Wine connects via DISPLAY=:0
         findViewById<Button>(R.id.btnStartXvfb).setOnClickListener {
             if (x11Server?.isRunning() == true) {
-                appendOutput("[X11 server already running on display :0 (TCP port 6000)]\n")
+                appendOutput("[X11 server already running on display :0 (abstract socket)]\n")
                 return@setOnClickListener
             }
             appendOutput("Starting libXlorie X11 server (native ARM64)...\n")
             x11Server = X11Server(this).apply {
                 onServerStarted = {
                     handler.post {
-                        appendOutput("[X11 server started on display :0 (TCP port 6000)]\n")
-                        appendOutput("Wine commands will use DISPLAY=localhost:0\n")
+                        appendOutput("[X11 server started on display :0 (abstract socket)]\n")
+                        appendOutput("Wine commands will use DISPLAY=:0\n")
                     }
                 }
                 onError = { msg ->
@@ -407,7 +407,9 @@ class TerminalActivity : AppCompatActivity() {
                         totalRead += count
                         val text = String(buffer, 0, count)
                         fullOutput.append(text)
-                        Log.d(TAG, "Read text (${text.length} chars): ${text.take(200)}")
+                        // Log full output to logcat for diagnostic capture
+                        // Use: adb logcat -s FexOutput:I
+                        logFullOutput(text)
 
                         // For cd commands, don't show the trailing pwd output
                         if (!isCdCommand) {
@@ -547,6 +549,19 @@ class TerminalActivity : AppCompatActivity() {
     private fun setRunning(running: Boolean) {
         isRunning = running
         btnSend.text = if (running) "Send" else "Run"
+    }
+
+    /**
+     * Log full process output to logcat for diagnostic capture.
+     * Capture with: adb logcat -s FexOutput:I
+     */
+    private fun logFullOutput(text: String) {
+        var remaining = text
+        while (remaining.isNotEmpty()) {
+            val chunk = remaining.take(3900)
+            Log.i("FexOutput", chunk)
+            remaining = remaining.drop(3900)
+        }
     }
 
     private fun appendOutput(text: String) {

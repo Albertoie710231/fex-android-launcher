@@ -2,13 +2,13 @@
  * Vulkan Implicit Layer: Headless Surface Bridge
  * ================================================
  *
- * Provides VK_KHR_xcb_surface + VK_KHR_swapchain for Wine/DXVK on FEX-Emu.
- * Intercepts XCB surface creation and emulates swapchain with CPU readback
- * + TCP frame sending to FrameSocketServer on Android.
+ * Provides VK_KHR_xcb_surface + VK_KHR_xlib_surface + VK_KHR_swapchain for
+ * Wine/DXVK on FEX-Emu. Intercepts XCB/Xlib surface creation and emulates
+ * swapchain with CPU readback + TCP frame sending to FrameSocketServer on Android.
  *
  * Rendering pipeline:
- *   Game -> DXVK (DX11->Vulkan) -> winevulkan (win32->xcb surface)
- *   -> THIS LAYER (xcb->headless, swapchain->frame capture)
+ *   Game -> DXVK (DX11->Vulkan) -> winevulkan (win32->xlib/xcb surface)
+ *   -> THIS LAYER (xlib/xcb->headless, swapchain->frame capture)
  *   -> ICD (Vortek via FEX thunks -> Mali GPU)
  *   -> TCP 19850 -> FrameSocketServer -> Android SurfaceView
  *
@@ -670,14 +670,89 @@ static VkResult headless_GetPhysicalDeviceProperties(
 }
 
 /* ============================================================================
- * Section 7c: Physical Device Feature & Format Spoofing (textureCompressionBC)
+ * Section 7c: Physical Device Feature & Format Spoofing
  *
- * Mali GPUs don't support BC (S3TC/DXT) texture compression natively, but
- * DXVK requires textureCompressionBC to accept the device. We intercept
- * GetPhysicalDeviceFeatures to report BC support, and GetFormatProperties
- * to report BC format capabilities. The actual BC handling depends on
- * the ICD (Vortek may transcode BC→ASTC/RGBA internally).
+ * Spoof features that DXVK requires but the thunk chain may not expose:
+ * - textureCompressionBC: Mali doesn't support BC natively, but Vortek may
+ *   transcode BC→ASTC/RGBA internally. DXVK requires this to accept device.
+ * - depthClipEnable (VK_EXT_depth_clip_enable): Required for D3D11's
+ *   DepthClipEnable rasterizer state. Mali supports this natively but
+ *   FEX thunks may not expose the extension.
+ * - customBorderColors (VK_EXT_custom_border_color): Required for D3D11
+ *   sampler border colors.
  * ============================================================================ */
+
+/* sType values for pNext chain feature structs */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT 1000102000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT 1000287002
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT 1000028000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT 1000286000
+
+/* Generic pNext chain walker: find a struct by sType */
+static void* find_pnext(void* pFeatures, int target_stype) {
+    /* pFeatures points to VkPhysicalDeviceFeatures2 or similar with {sType, pNext, ...} */
+    typedef struct { int sType; void* pNext; } VkBaseOutStructure;
+    VkBaseOutStructure* s = (VkBaseOutStructure*)pFeatures;
+    s = (VkBaseOutStructure*)s->pNext; /* skip the root struct */
+    while (s) {
+        if (s->sType == target_stype)
+            return s;
+        s = (VkBaseOutStructure*)s->pNext;
+    }
+    return NULL;
+}
+
+/* Feature struct layouts for spoofing (only the fields we need) */
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 depthClipEnable;
+} VkPhysicalDeviceDepthClipEnableFeaturesEXT;
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 customBorderColors;
+    VkBool32 customBorderColorWithoutFormatFeature;
+} VkPhysicalDeviceCustomBorderColorFeaturesEXT;
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 transformFeedback;
+    VkBool32 geometryStreams;
+} VkPhysicalDeviceTransformFeedbackFeaturesEXT;
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 robustBufferAccess2;
+    VkBool32 robustImageAccess2;
+    VkBool32 nullDescriptor;
+} VkPhysicalDeviceRobustness2FeaturesEXT;
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 maintenance5;
+} VkPhysicalDeviceMaintenance5FeaturesKHR;
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 maintenance6;
+} VkPhysicalDeviceMaintenance6FeaturesKHR;
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR 1000470000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR 1000545000
+
+typedef struct {
+    int sType;
+    void* pNext;
+    VkBool32 nonSeamlessCubeMap;
+} VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT;
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT 1000411000
 
 static int is_bc_format(int format) {
     return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
@@ -733,6 +808,104 @@ static void headless_GetPhysicalDeviceFeatures2(
             pFeatures->features.textureCompressionBC = VK_TRUE;
             LOG("Spoofed textureCompressionBC = VK_TRUE (Features2)\n");
             layer_marker("SPOOF_BC_FEATURES2");
+        }
+
+        /* Walk pNext chain to spoof extension features DXVK requires */
+        VkPhysicalDeviceDepthClipEnableFeaturesEXT* dce =
+            (VkPhysicalDeviceDepthClipEnableFeaturesEXT*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
+        if (dce && !dce->depthClipEnable) {
+            dce->depthClipEnable = VK_TRUE;
+            LOG("Spoofed depthClipEnable = VK_TRUE\n");
+        }
+
+        VkPhysicalDeviceCustomBorderColorFeaturesEXT* cbc =
+            (VkPhysicalDeviceCustomBorderColorFeaturesEXT*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
+        if (cbc) {
+            if (!cbc->customBorderColors) {
+                cbc->customBorderColors = VK_TRUE;
+                LOG("Spoofed customBorderColors = VK_TRUE\n");
+            }
+            if (!cbc->customBorderColorWithoutFormatFeature) {
+                cbc->customBorderColorWithoutFormatFeature = VK_TRUE;
+                LOG("Spoofed customBorderColorWithoutFormatFeature = VK_TRUE\n");
+            }
+        }
+
+        VkPhysicalDeviceTransformFeedbackFeaturesEXT* tfb =
+            (VkPhysicalDeviceTransformFeedbackFeaturesEXT*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT);
+        if (tfb) {
+            if (!tfb->transformFeedback) {
+                tfb->transformFeedback = VK_TRUE;
+                LOG("Spoofed transformFeedback = VK_TRUE\n");
+            }
+            if (!tfb->geometryStreams) {
+                tfb->geometryStreams = VK_TRUE;
+                LOG("Spoofed geometryStreams = VK_TRUE\n");
+            }
+        }
+
+        VkPhysicalDeviceRobustness2FeaturesEXT* rb2 =
+            (VkPhysicalDeviceRobustness2FeaturesEXT*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
+        if (rb2) {
+            if (!rb2->robustBufferAccess2) {
+                rb2->robustBufferAccess2 = VK_TRUE;
+                LOG("Spoofed robustBufferAccess2 = VK_TRUE\n");
+            }
+            if (!rb2->robustImageAccess2) {
+                rb2->robustImageAccess2 = VK_TRUE;
+                LOG("Spoofed robustImageAccess2 = VK_TRUE\n");
+            }
+            if (!rb2->nullDescriptor) {
+                rb2->nullDescriptor = VK_TRUE;
+                LOG("Spoofed nullDescriptor = VK_TRUE\n");
+            }
+        }
+
+        VkPhysicalDeviceMaintenance5FeaturesKHR* m5 =
+            (VkPhysicalDeviceMaintenance5FeaturesKHR*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
+        if (m5) {
+            if (!m5->maintenance5) {
+                m5->maintenance5 = VK_TRUE;
+                LOG("Spoofed maintenance5 = VK_TRUE\n");
+            }
+        }
+
+        VkPhysicalDeviceMaintenance6FeaturesKHR* m6 =
+            (VkPhysicalDeviceMaintenance6FeaturesKHR*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR);
+        if (m6) {
+            if (!m6->maintenance6) {
+                m6->maintenance6 = VK_TRUE;
+                LOG("Spoofed maintenance6 = VK_TRUE\n");
+            }
+        }
+
+        VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT* nscm =
+            (VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT*)find_pnext(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT);
+        if (nscm) {
+            if (!nscm->nonSeamlessCubeMap) {
+                nscm->nonSeamlessCubeMap = VK_TRUE;
+                LOG("Spoofed nonSeamlessCubeMap = VK_TRUE\n");
+            }
+        }
+
+        /* Log ALL sTypes in pNext chain so we can see what DXVK queries */
+        {
+            typedef struct { int sType; void* pNext; } BaseS;
+            BaseS* s = (BaseS*)pFeatures->pNext;
+            int idx = 0;
+            while (s) {
+                LOG("  pNext[%d] sType=%d (0x%x)\n", idx, s->sType, s->sType);
+                s = (BaseS*)s->pNext;
+                idx++;
+            }
+            LOG("  pNext chain total: %d structs\n", idx);
         }
     }
 }
@@ -817,6 +990,32 @@ static VkBool32 headless_GetPhysicalDeviceXcbPresentationSupportKHR(
     VkPhysicalDevice pd, uint32_t qfi, void* conn, uint32_t vid)
 {
     (void)pd; (void)qfi; (void)conn; (void)vid;
+    return VK_TRUE;
+}
+
+/* Xlib surface — Wine/Proton-GE maps VK_KHR_win32_surface to VK_KHR_xlib_surface */
+static VkResult headless_CreateXlibSurfaceKHR(
+    VkInstance instance,
+    const void* pCreateInfo,  /* VkXlibSurfaceCreateInfoKHR* */
+    const VkAllocationCallbacks* pAllocator,
+    VkSurfaceKHR* pSurface)
+{
+    (void)instance; (void)pCreateInfo; (void)pAllocator;
+    layer_marker("CreateXlibSurface_ENTER");
+    SurfaceEntry* e = add_surface(1920, 1080);
+    if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *pSurface = e->handle;
+    char sbuf[128];
+    snprintf(sbuf, sizeof(sbuf), "CreateXlibSurface_OK handle=0x%lx", (unsigned long)e->handle);
+    layer_marker(sbuf);
+    LOG("vkCreateXlibSurfaceKHR -> headless surface 0x%lx (1920x1080)\n", (unsigned long)e->handle);
+    return VK_SUCCESS;
+}
+
+static VkBool32 headless_GetPhysicalDeviceXlibPresentationSupportKHR(
+    VkPhysicalDevice pd, uint32_t qfi, void* dpy, unsigned long vid)
+{
+    (void)pd; (void)qfi; (void)dpy; (void)vid;
     return VK_TRUE;
 }
 
@@ -1222,13 +1421,14 @@ static VkResult headless_EnumerateInstanceExtensionProperties(
         static const VkExtensionProperties exts[] = {
             { "VK_KHR_surface", 25 },
             { "VK_KHR_xcb_surface", 6 },
+            { "VK_KHR_xlib_surface", 6 },
             { "VK_EXT_headless_surface", 1 }
         };
-        if (!pProps) { *pCount = 3; return VK_SUCCESS; }
-        uint32_t n = *pCount < 3 ? *pCount : 3;
+        if (!pProps) { *pCount = 4; return VK_SUCCESS; }
+        uint32_t n = *pCount < 4 ? *pCount : 4;
         memcpy(pProps, exts, n * sizeof(VkExtensionProperties));
         *pCount = n;
-        return n < 3 ? VK_INCOMPLETE : VK_SUCCESS;
+        return n < 4 ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
     /* For other layer names or NULL (global), forward to next layer */
@@ -1260,39 +1460,63 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
     VkResult res = fn(pd, pLayerName, &real_count, NULL);
     if (res != VK_SUCCESS) return res;
 
-    /* Check if VK_KHR_swapchain already present */
-    int has_swapchain = 0;
+    /* Extensions to inject if missing */
+    static const struct { const char* name; uint32_t specVersion; } inject_exts[] = {
+        { "VK_KHR_swapchain", 70 },
+        { "VK_EXT_depth_clip_enable", 1 },
+        { "VK_EXT_custom_border_color", 12 },
+        { "VK_EXT_transform_feedback", 1 },
+        { "VK_EXT_robustness2", 1 },
+        { "VK_KHR_maintenance5", 1 },
+        { "VK_KHR_maintenance6", 1 },
+        { "VK_KHR_pipeline_library", 1 },
+        { "VK_EXT_non_seamless_cube_map", 1 },
+        { "VK_EXT_graphics_pipeline_library", 1 },
+    };
+    static const int num_inject = sizeof(inject_exts) / sizeof(inject_exts[0]);
+
+    /* Check which extensions are already present */
+    int has_ext[sizeof(inject_exts) / sizeof(inject_exts[0])];
+    memset(has_ext, 0, sizeof(has_ext));
+    int need_inject = 0;
+
     if (real_count > 0) {
         VkExtensionProperties* tmp = malloc(real_count * sizeof(VkExtensionProperties));
         if (tmp) {
             uint32_t tc = real_count;
             fn(pd, pLayerName, &tc, tmp);
             for (uint32_t i = 0; i < tc; i++) {
-                if (strcmp(tmp[i].extensionName, "VK_KHR_swapchain") == 0) {
-                    has_swapchain = 1;
-                    break;
+                for (int j = 0; j < num_inject; j++) {
+                    if (strcmp(tmp[i].extensionName, inject_exts[j].name) == 0)
+                        has_ext[j] = 1;
                 }
             }
             free(tmp);
         }
     }
 
-    uint32_t total = real_count + (has_swapchain ? 0 : 1);
+    for (int j = 0; j < num_inject; j++)
+        if (!has_ext[j]) need_inject++;
+
+    uint32_t total = real_count + need_inject;
     if (!pProps) { *pCount = total; return VK_SUCCESS; }
 
     uint32_t get = *pCount < real_count ? *pCount : real_count;
     res = fn(pd, pLayerName, &get, pProps);
 
-    if (!has_swapchain && *pCount > real_count) {
-        strncpy(pProps[real_count].extensionName, "VK_KHR_swapchain", VK_MAX_EXTENSION_NAME_SIZE);
-        pProps[real_count].specVersion = 70;
-        *pCount = real_count + 1;
-        LOG("Injected VK_KHR_swapchain device extension\n");
-        layer_marker("EDEP_INJECTED_SWAPCHAIN");
-    } else {
-        *pCount = get;
+    /* Append missing extensions */
+    uint32_t idx = get;
+    for (int j = 0; j < num_inject && idx < *pCount; j++) {
+        if (!has_ext[j]) {
+            strncpy(pProps[idx].extensionName, inject_exts[j].name, VK_MAX_EXTENSION_NAME_SIZE);
+            pProps[idx].specVersion = inject_exts[j].specVersion;
+            LOG("Injected device extension: %s\n", inject_exts[j].name);
+            idx++;
+        }
     }
-    snprintf(mbuf, sizeof(mbuf), "EDEP_DONE total=%u has_swp=%d", *pCount, has_swapchain);
+    *pCount = idx;
+
+    snprintf(mbuf, sizeof(mbuf), "EDEP_DONE total=%u injected=%d", *pCount, need_inject);
     layer_marker(mbuf);
     return VK_SUCCESS;
 }
@@ -1372,6 +1596,7 @@ static VkResult headless_CreateInstance(
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
         if (strcmp(ext, "VK_KHR_surface") == 0 ||
             strcmp(ext, "VK_KHR_xcb_surface") == 0 ||
+            strcmp(ext, "VK_KHR_xlib_surface") == 0 ||
             strcmp(ext, "VK_EXT_headless_surface") == 0) {
             LOG("Filtering extension: %s (we provide it)\n", ext);
         } else {
@@ -1510,13 +1735,31 @@ static VkResult headless_CreateDevice(
     snprintf(buf, sizeof(buf), "CD_NEXT_CREATE=%p", (void*)next_create);
     layer_marker(buf);
 
-    /* Filter VK_KHR_swapchain — we handle it ourselves */
+    /* Filter extensions that we spoof — the ICD doesn't actually support them.
+     * We advertise them in enumeration and spoof their features, but the ICD
+     * would reject vkCreateDevice if we pass them through. */
+    static const char* spoofed_exts[] = {
+        "VK_KHR_swapchain",
+        "VK_EXT_depth_clip_enable",
+        "VK_EXT_custom_border_color",
+        "VK_EXT_transform_feedback",
+        "VK_EXT_robustness2",
+        "VK_KHR_maintenance5",
+        "VK_KHR_maintenance6",
+        "VK_KHR_pipeline_library",
+        "VK_EXT_non_seamless_cube_map",
+        "VK_EXT_graphics_pipeline_library",
+    };
     const char** filtered = malloc(pCreateInfo->enabledExtensionCount * sizeof(char*));
     uint32_t fc = 0;
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
-        if (strcmp(ext, "VK_KHR_swapchain") == 0) {
-            LOG("Filtering device extension: %s (we provide it)\n", ext);
+        int is_spoofed = 0;
+        for (int j = 0; j < (int)(sizeof(spoofed_exts)/sizeof(spoofed_exts[0])); j++) {
+            if (strcmp(ext, spoofed_exts[j]) == 0) { is_spoofed = 1; break; }
+        }
+        if (is_spoofed) {
+            LOG("Filtering spoofed device extension: %s\n", ext);
         } else {
             filtered[fc++] = ext;
         }
@@ -1591,6 +1834,8 @@ static PFN_vkVoidFunction headless_GetPhysicalDeviceProcAddr(VkInstance instance
     /* Surface queries (physical device level) */
     if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceXcbPresentationSupportKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceXlibPresentationSupportKHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceSupportKHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
@@ -1645,13 +1890,17 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
      * so the Vulkan loader automatically merges it into the device extension
      * list. Same fix pattern as vkEnumeratePhysicalDevices above. */
 
-    /* Surface functions (VK_KHR_surface + VK_KHR_xcb_surface) */
+    /* Surface functions (VK_KHR_surface + VK_KHR_xcb_surface + VK_KHR_xlib_surface) */
     if (strcmp(pName, "vkCreateXcbSurfaceKHR") == 0)
         return (PFN_vkVoidFunction)headless_CreateXcbSurfaceKHR;
+    if (strcmp(pName, "vkCreateXlibSurfaceKHR") == 0)
+        return (PFN_vkVoidFunction)headless_CreateXlibSurfaceKHR;
     if (strcmp(pName, "vkCreateHeadlessSurfaceEXT") == 0)
         return (PFN_vkVoidFunction)headless_CreateHeadlessSurfaceEXT;
     if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceXcbPresentationSupportKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceXlibPresentationSupportKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceXlibPresentationSupportKHR;
     if (strcmp(pName, "vkDestroySurfaceKHR") == 0)
         return (PFN_vkVoidFunction)headless_DestroySurfaceKHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)

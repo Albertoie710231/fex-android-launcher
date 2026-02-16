@@ -157,9 +157,9 @@ class ContainerManager(private val context: Context) {
 
         Log.i(TAG, "Refreshed nativeLibDir paths: $nativeLibDir")
 
-        // Deploy stub DLLs and fix Mesa/GLVND on every launch
-        // (these are idempotent and fast — ensures rootfs is always patched)
+        // Deploy assets on every launch (idempotent and fast — ensures rootfs is always patched)
         if (fexRootfsDir.exists()) {
+            installHeadlessWrapper()
             deployStubDlls()
             fixupMesaAndGlvnd()
         }
