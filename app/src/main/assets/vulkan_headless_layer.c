@@ -1735,35 +1735,52 @@ static VkResult headless_CreateDevice(
     snprintf(buf, sizeof(buf), "CD_NEXT_CREATE=%p", (void*)next_create);
     layer_marker(buf);
 
-    /* Filter extensions that we spoof — the ICD doesn't actually support them.
-     * We advertise them in enumeration and spoof their features, but the ICD
-     * would reject vkCreateDevice if we pass them through. */
-    static const char* spoofed_exts[] = {
-        "VK_KHR_swapchain",
-        "VK_EXT_depth_clip_enable",
-        "VK_EXT_custom_border_color",
-        "VK_EXT_transform_feedback",
-        "VK_EXT_robustness2",
-        "VK_KHR_maintenance5",
-        "VK_KHR_maintenance6",
-        "VK_KHR_pipeline_library",
-        "VK_EXT_non_seamless_cube_map",
-        "VK_EXT_graphics_pipeline_library",
-    };
+    /* Query the ICD's REAL device extensions so we only filter truly spoofed ones.
+     * Extensions the ICD supports should pass through; only filter:
+     * 1. VK_KHR_swapchain — layer provides headless swapchain implementation
+     * 2. Extensions the ICD doesn't actually support (truly spoofed by us) */
+    typedef VkResult (*PFN_EDEP)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
+    PFN_EDEP edep_fn = (PFN_EDEP)next_gipa(g_instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t icd_ext_count = 0;
+    VkExtensionProperties* icd_exts = NULL;
+    if (edep_fn) {
+        edep_fn(physicalDevice, NULL, &icd_ext_count, NULL);
+        if (icd_ext_count > 0) {
+            icd_exts = malloc(icd_ext_count * sizeof(VkExtensionProperties));
+            if (icd_exts)
+                edep_fn(physicalDevice, NULL, &icd_ext_count, icd_exts);
+        }
+    }
+
     const char** filtered = malloc(pCreateInfo->enabledExtensionCount * sizeof(char*));
     uint32_t fc = 0;
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char* ext = pCreateInfo->ppEnabledExtensionNames[i];
-        int is_spoofed = 0;
-        for (int j = 0; j < (int)(sizeof(spoofed_exts)/sizeof(spoofed_exts[0])); j++) {
-            if (strcmp(ext, spoofed_exts[j]) == 0) { is_spoofed = 1; break; }
+
+        /* Always filter swapchain — layer provides headless implementation */
+        if (strcmp(ext, "VK_KHR_swapchain") == 0 ||
+            strcmp(ext, "VK_KHR_swapchain_mutable_format") == 0) {
+            LOG("Filtering layer-provided extension: %s\n", ext);
+            continue;
         }
-        if (is_spoofed) {
-            LOG("Filtering spoofed device extension: %s\n", ext);
-        } else {
+
+        /* Check if ICD actually supports this extension */
+        int icd_has_it = 0;
+        for (uint32_t j = 0; j < icd_ext_count && icd_exts; j++) {
+            if (strcmp(ext, icd_exts[j].extensionName) == 0) {
+                icd_has_it = 1;
+                break;
+            }
+        }
+
+        if (icd_has_it) {
             filtered[fc++] = ext;
+            LOG("Passing through real ICD extension: %s\n", ext);
+        } else {
+            LOG("Filtering spoofed extension (ICD lacks): %s\n", ext);
         }
     }
+    free(icd_exts);
 
     VkDeviceCreateInfo modified = *pCreateInfo;
     modified.enabledExtensionCount = fc;
@@ -2003,13 +2020,11 @@ static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)headless_QueuePresentKHR;
 
-    /* FEX thunks' GDPA crashes (segfault) for most device functions.
-     * Use GIPA exclusively — safe and returns all device functions. */
+    /* Use GDPA only — the ICD's GDPA uses dlsym() for safe dispatch.
+     * NEVER use GIPA here: it creates dev_ext_trampolines that cause
+     * infinite thunk recursion in FEX. */
     PFN_vkVoidFunction fn = NULL;
-    if (g_next_gipa && g_instance)
-        fn = g_next_gipa(g_instance, pName);
-    /* Last resort: try GDPA if GIPA failed (shouldn't happen) */
-    if (!fn && g_next_gdpa)
+    if (g_next_gdpa)
         fn = g_next_gdpa(device, pName);
 
     return fn;
