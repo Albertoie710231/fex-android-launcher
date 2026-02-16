@@ -223,6 +223,92 @@ typedef struct VkSubresourceLayout {
     VkDeviceSize arrayPitch; VkDeviceSize depthPitch;
 } VkSubresourceLayout;
 
+/* Physical device features — full struct needed for textureCompressionBC spoofing */
+typedef struct VkPhysicalDeviceFeatures {
+    VkBool32 robustBufferAccess;
+    VkBool32 fullDrawIndexUint32;
+    VkBool32 imageCubeArray;
+    VkBool32 independentBlend;
+    VkBool32 geometryShader;
+    VkBool32 tessellationShader;
+    VkBool32 sampleRateShading;
+    VkBool32 dualSrcBlend;
+    VkBool32 logicOp;
+    VkBool32 multiDrawIndirect;
+    VkBool32 drawIndirectFirstInstance;
+    VkBool32 depthClamp;
+    VkBool32 depthBiasClamp;
+    VkBool32 fillModeNonSolid;
+    VkBool32 depthBounds;
+    VkBool32 wideLines;
+    VkBool32 largePoints;
+    VkBool32 alphaToOne;
+    VkBool32 multiViewport;
+    VkBool32 samplerAnisotropy;
+    VkBool32 textureCompressionETC2;
+    VkBool32 textureCompressionASTC_LDR;
+    VkBool32 textureCompressionBC;
+    VkBool32 occlusionQueryPrecise;
+    VkBool32 pipelineStatisticsQuery;
+    VkBool32 vertexPipelineStoresAndAtomics;
+    VkBool32 fragmentStoresAndAtomics;
+    VkBool32 shaderTessellationAndGeometryPointSize;
+    VkBool32 shaderImageGatherExtended;
+    VkBool32 shaderStorageImageExtendedFormats;
+    VkBool32 shaderStorageImageMultisample;
+    VkBool32 shaderStorageImageReadWithoutFormat;
+    VkBool32 shaderStorageImageWriteWithoutFormat;
+    VkBool32 shaderUniformBufferArrayDynamicIndexing;
+    VkBool32 shaderSampledImageArrayDynamicIndexing;
+    VkBool32 shaderStorageBufferArrayDynamicIndexing;
+    VkBool32 shaderStorageImageArrayDynamicIndexing;
+    VkBool32 shaderClipDistance;
+    VkBool32 shaderCullDistance;
+    VkBool32 shaderFloat64;
+    VkBool32 shaderInt64;
+    VkBool32 shaderInt16;
+    VkBool32 shaderResourceResidency;
+    VkBool32 shaderResourceMinLod;
+    VkBool32 sparseBinding;
+    VkBool32 sparseResidencyBuffer;
+    VkBool32 sparseResidencyImage2D;
+    VkBool32 sparseResidencyImage3D;
+    VkBool32 sparseResidency2Samples;
+    VkBool32 sparseResidency4Samples;
+    VkBool32 sparseResidency8Samples;
+    VkBool32 sparseResidency16Samples;
+    VkBool32 sparseResidencyAliased;
+    VkBool32 variableMultisampleRate;
+    VkBool32 inheritedQueries;
+} VkPhysicalDeviceFeatures;
+
+typedef struct VkPhysicalDeviceFeatures2 {
+    int sType; void* pNext;
+    VkPhysicalDeviceFeatures features;
+} VkPhysicalDeviceFeatures2;
+
+typedef struct VkFormatProperties {
+    VkFlags linearTilingFeatures;
+    VkFlags optimalTilingFeatures;
+    VkFlags bufferFeatures;
+} VkFormatProperties;
+
+typedef struct VkFormatProperties2 {
+    int sType; void* pNext;
+    VkFormatProperties formatProperties;
+} VkFormatProperties2;
+
+/* BC (S3TC/DXT) texture format range: VK_FORMAT_BC1_RGB_UNORM_BLOCK .. VK_FORMAT_BC7_SRGB_BLOCK */
+#define VK_FORMAT_BC1_RGB_UNORM_BLOCK   131
+#define VK_FORMAT_BC7_SRGB_BLOCK        146
+
+/* Format feature bits for BC spoofing */
+#define VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT                 0x00000001
+#define VK_FORMAT_FEATURE_BLIT_SRC_BIT                      0x00000004
+#define VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT   0x00001000
+#define VK_FORMAT_FEATURE_TRANSFER_SRC_BIT                  0x00004000
+#define VK_FORMAT_FEATURE_TRANSFER_DST_BIT                  0x00008000
+
 /* ============================================================================
  * Section 2: Vulkan Layer Protocol Types
  * ============================================================================ */
@@ -290,6 +376,16 @@ static VkInstance g_instance = NULL;
 static VkDevice g_device = NULL;
 static VkPhysicalDevice g_physical_device = NULL;
 static int g_instance_count = 0; /* tracks how many CreateInstance calls succeeded */
+
+/* Real function pointers for feature/format spoofing (resolved in CreateInstance) */
+typedef void (*PFN_GetFeatures)(VkPhysicalDevice, VkPhysicalDeviceFeatures*);
+typedef void (*PFN_GetFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
+typedef void (*PFN_GetFormatProps)(VkPhysicalDevice, int, VkFormatProperties*);
+typedef void (*PFN_GetFormatProps2)(VkPhysicalDevice, int, VkFormatProperties2*);
+static PFN_GetFeatures g_real_get_features = NULL;
+static PFN_GetFeatures2 g_real_get_features2 = NULL;
+static PFN_GetFormatProps g_real_get_format_props = NULL;
+static PFN_GetFormatProps2 g_real_get_format_props2 = NULL;
 
 /* Logging */
 #define LOG_TAG "[HeadlessLayer] "
@@ -571,6 +667,114 @@ static VkResult headless_GetPhysicalDeviceProperties(
     if (fn) fn(pd, pProperties);
     LOG("vkGetPhysicalDeviceProperties done\n");
     return VK_SUCCESS;
+}
+
+/* ============================================================================
+ * Section 7c: Physical Device Feature & Format Spoofing (textureCompressionBC)
+ *
+ * Mali GPUs don't support BC (S3TC/DXT) texture compression natively, but
+ * DXVK requires textureCompressionBC to accept the device. We intercept
+ * GetPhysicalDeviceFeatures to report BC support, and GetFormatProperties
+ * to report BC format capabilities. The actual BC handling depends on
+ * the ICD (Vortek may transcode BC→ASTC/RGBA internally).
+ * ============================================================================ */
+
+static int is_bc_format(int format) {
+    return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+/* Spoofed BC format features: sampling + linear filter + transfer */
+#define BC_FORMAT_FEATURES \
+    (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | \
+     VK_FORMAT_FEATURE_BLIT_SRC_BIT | \
+     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | \
+     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | \
+     VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+
+static void headless_GetPhysicalDeviceFeatures(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceFeatures* pFeatures)
+{
+    LOG(">>> GetPhysicalDeviceFeatures CALLED pd=%p pF=%p g_real=%p\n",
+        physicalDevice, pFeatures, (void*)g_real_get_features);
+    layer_marker("CALL_GetFeatures");
+
+    if (g_real_get_features)
+        g_real_get_features(physicalDevice, pFeatures);
+    else
+        LOG("!!! GetPhysicalDeviceFeatures: g_real_get_features is NULL!\n");
+
+    if (pFeatures) {
+        LOG("    BC before spoof: %d\n", pFeatures->textureCompressionBC);
+        if (!pFeatures->textureCompressionBC) {
+            pFeatures->textureCompressionBC = VK_TRUE;
+            LOG("Spoofed textureCompressionBC = VK_TRUE\n");
+            layer_marker("SPOOF_BC_FEATURES");
+        }
+    }
+}
+
+static void headless_GetPhysicalDeviceFeatures2(
+    VkPhysicalDevice physicalDevice,
+    VkPhysicalDeviceFeatures2* pFeatures)
+{
+    LOG(">>> GetPhysicalDeviceFeatures2 CALLED pd=%p pF=%p g_real=%p\n",
+        physicalDevice, pFeatures, (void*)g_real_get_features2);
+    layer_marker("CALL_GetFeatures2");
+
+    if (g_real_get_features2)
+        g_real_get_features2(physicalDevice, pFeatures);
+    else
+        LOG("!!! GetPhysicalDeviceFeatures2: g_real_get_features2 is NULL!\n");
+
+    if (pFeatures) {
+        LOG("    BC before spoof: %d\n", pFeatures->features.textureCompressionBC);
+        if (!pFeatures->features.textureCompressionBC) {
+            pFeatures->features.textureCompressionBC = VK_TRUE;
+            LOG("Spoofed textureCompressionBC = VK_TRUE (Features2)\n");
+            layer_marker("SPOOF_BC_FEATURES2");
+        }
+    }
+}
+
+static void headless_GetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice physicalDevice,
+    int format,
+    VkFormatProperties* pFormatProperties)
+{
+    if (is_bc_format(format)) {
+        LOG(">>> GetFormatProperties CALLED format=%d (BC!) pd=%p g_real=%p\n",
+            format, physicalDevice, (void*)g_real_get_format_props);
+    }
+
+    if (g_real_get_format_props)
+        g_real_get_format_props(physicalDevice, format, pFormatProperties);
+
+    if (pFormatProperties && is_bc_format(format) &&
+        pFormatProperties->optimalTilingFeatures == 0) {
+        pFormatProperties->optimalTilingFeatures = BC_FORMAT_FEATURES;
+        LOG("Spoofed BC format %d optimal tiling features\n", format);
+    }
+}
+
+static void headless_GetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+    int format,
+    VkFormatProperties2* pFormatProperties)
+{
+    if (is_bc_format(format)) {
+        LOG(">>> GetFormatProperties2 CALLED format=%d (BC!) pd=%p g_real=%p\n",
+            format, physicalDevice, (void*)g_real_get_format_props2);
+    }
+
+    if (g_real_get_format_props2)
+        g_real_get_format_props2(physicalDevice, format, pFormatProperties);
+
+    if (pFormatProperties && is_bc_format(format) &&
+        pFormatProperties->formatProperties.optimalTilingFeatures == 0) {
+        pFormatProperties->formatProperties.optimalTilingFeatures = BC_FORMAT_FEATURES;
+        LOG("Spoofed BC format %d optimal tiling features (FP2)\n", format);
+    }
 }
 
 /* ============================================================================
@@ -1194,6 +1398,22 @@ static VkResult headless_CreateInstance(
         g_instance_count++;
         g_next_gipa = next_gipa;
         g_instance = *pInstance;
+
+        /* Resolve real function pointers for feature/format spoofing.
+         * We use next_gipa (the next layer's GIPA) so we get the ICD's
+         * actual implementations, NOT our own interceptors. */
+        g_real_get_features = (PFN_GetFeatures)next_gipa(*pInstance, "vkGetPhysicalDeviceFeatures");
+        g_real_get_features2 = (PFN_GetFeatures2)next_gipa(*pInstance, "vkGetPhysicalDeviceFeatures2");
+        if (!g_real_get_features2)
+            g_real_get_features2 = (PFN_GetFeatures2)next_gipa(*pInstance, "vkGetPhysicalDeviceFeatures2KHR");
+        g_real_get_format_props = (PFN_GetFormatProps)next_gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties");
+        g_real_get_format_props2 = (PFN_GetFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2");
+        if (!g_real_get_format_props2)
+            g_real_get_format_props2 = (PFN_GetFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2KHR");
+        LOG("BC spoof: features=%p features2=%p fmtprops=%p fmtprops2=%p\n",
+            (void*)g_real_get_features, (void*)g_real_get_features2,
+            (void*)g_real_get_format_props, (void*)g_real_get_format_props2);
+
         LOG("Instance created: %p (instance #%d)\n", *pInstance, g_instance_count);
         char buf[256];
         snprintf(buf, sizeof(buf), "CreateInstance_OK #%d g_instance=%p next_gipa=%p",
@@ -1225,6 +1445,10 @@ static void headless_DestroyInstance(VkInstance instance, const VkAllocationCall
     }
     g_instance = NULL;
     g_next_gipa = NULL;
+    g_real_get_features = NULL;
+    g_real_get_features2 = NULL;
+    g_real_get_format_props = NULL;
+    g_real_get_format_props2 = NULL;
     g_instance_count--;
 }
 
@@ -1333,7 +1557,8 @@ static void headless_DestroyDevice(VkDevice device, const VkAllocationCallbacks*
 }
 
 /* ============================================================================
- * Section 13: vkGetInstanceProcAddr / vkGetDeviceProcAddr
+ * Section 13: vkGetInstanceProcAddr / vkGetDeviceProcAddr /
+ *             vkGetPhysicalDeviceProcAddr (for physical device interception)
  * ============================================================================ */
 
 /* Forward declarations */
@@ -1341,6 +1566,43 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
 static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char* pName);
 
 static int gipa_call_count = 0;
+
+/* The Vulkan loader uses pfnGetPhysicalDeviceProcAddr (interface version 2)
+ * as the AUTHORITATIVE source for which physical device functions a layer
+ * intercepts. If this returns NULL for a function, the loader bypasses the
+ * layer entirely for that function's dispatch — even if GIPA returns an
+ * interceptor. Without this, our BC spoofing in GIPA is silently ignored. */
+static PFN_vkVoidFunction headless_GetPhysicalDeviceProcAddr(VkInstance instance, const char* pName)
+{
+    if (!pName) return NULL;
+
+    /* textureCompressionBC spoofing for DXVK */
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures;
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures2;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties2;
+
+    /* Surface queries (physical device level) */
+    if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceXcbPresentationSupportKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceSupportKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceFormatsKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfacePresentModesKHR;
+
+    /* Not intercepted — let the loader skip this layer for this function */
+    return NULL;
+}
 
 static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, const char* pName)
 {
@@ -1412,6 +1674,30 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
         return (PFN_vkVoidFunction)headless_AcquireNextImageKHR;
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)headless_QueuePresentKHR;
+
+    /* Physical device features & format spoofing (textureCompressionBC for DXVK) */
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0) {
+        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFeatures (g_real=%p)\n",
+            pName, (void*)g_real_get_features);
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {
+        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFeatures2 (g_real=%p)\n",
+            pName, (void*)g_real_get_features2);
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures2;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0) {
+        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFormatProperties (g_real=%p)\n",
+            pName, (void*)g_real_get_format_props);
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0) {
+        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFormatProperties2 (g_real=%p)\n",
+            pName, (void*)g_real_get_format_props2);
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties2;
+    }
 
     /* Forward everything else */
     if (g_next_gipa) {
@@ -1487,11 +1773,16 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
     if (pVersionStruct->loaderLayerInterfaceVersion >= 2) {
         pVersionStruct->pfnGetInstanceProcAddr = headless_GetInstanceProcAddr;
         pVersionStruct->pfnGetDeviceProcAddr = headless_GetDeviceProcAddr;
-        pVersionStruct->pfnGetPhysicalDeviceProcAddr = NULL;
+        /* CRITICAL: Must provide pfnGetPhysicalDeviceProcAddr for the loader
+         * to route physical device functions through our layer. Without this,
+         * the loader bypasses us for vkGetPhysicalDeviceFeatures etc., and our
+         * textureCompressionBC spoofing in GIPA is never used for dispatch. */
+        pVersionStruct->pfnGetPhysicalDeviceProcAddr = (PFN_vkVoidFunction)headless_GetPhysicalDeviceProcAddr;
     }
     pVersionStruct->loaderLayerInterfaceVersion = 2;
 
-    LOG("Layer negotiation complete (interface version 2)\n");
+    LOG("Layer negotiation complete (interface version 2, GPDPA=%p)\n",
+        (void*)headless_GetPhysicalDeviceProcAddr);
     return VK_SUCCESS;
 }
 

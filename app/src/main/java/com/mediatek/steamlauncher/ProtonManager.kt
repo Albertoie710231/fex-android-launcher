@@ -160,7 +160,7 @@ class ProtonManager(private val context: Context) {
     fun getWineEnvironment(
         winePrefix: String = "/home/user/.wine",
         enableDxvkHud: Boolean = true,
-        dxvkLogLevel: String = "info"
+        dxvkLogLevel: String = "trace"
     ): Map<String, String> {
         return mapOf(
             // Wine/Proton paths
@@ -432,7 +432,7 @@ class ProtonManager(private val context: Context) {
             # DXVK settings
             export DXVK_ASYNC=1
             export DXVK_STATE_CACHE=1
-            export DXVK_LOG_LEVEL=info
+            export DXVK_LOG_LEVEL=trace
             export DXVK_HUD=fps,devinfo
 
             # Proton compatibility
@@ -494,6 +494,7 @@ class ProtonManager(private val context: Context) {
 dxgi.enableOpenVR = False
 dxgi.enableOpenXR = False
 dxgi.maxFrameLatency = 1
+dxvk.logLevel = trace
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
@@ -518,6 +519,12 @@ DXVKEOF
             WINE_EXIT=${'$'}?
             echo ""
             echo "[wine64 exit code: ${'$'}WINE_EXIT]"
+
+            # Dump headless layer trace log (critical for BC spoofing diagnostics)
+            echo "=== /tmp/layer_trace.log ==="
+            cat /tmp/layer_trace.log 2>/dev/null || echo "(no layer_trace.log)"
+            echo "=== end layer_trace.log ==="
+
             if [ ${'$'}WINE_EXIT -eq 132 ]; then
                 echo "=== SIGILL CRASH — FEX debug log (last 100 lines) ==="
                 tail -100 /tmp/fex-debug.log 2>/dev/null || echo "(no FEX log at /tmp)"
