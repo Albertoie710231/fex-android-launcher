@@ -37,6 +37,7 @@ static int init_done = 0;
 static void* saved_instance = NULL;
 static void* thunk_device = NULL;
 static void* thunk_device_dispatch = NULL;
+static volatile int dispatch_lock = 0;
 
 #define LOG(...) do { fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); } while(0)
 
@@ -45,38 +46,52 @@ static void icd_marker(const char* msg) {
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-/* ---- x86-64 trampoline generator ----
+/* ---- x86-64 trampoline generator (thread-safe with spinlock) ----
  *
  * Generates a small x86-64 code stub that:
- * 1. Saves callee-saved registers (rbx, r12)
- * 2. Saves the device pointer (rdi) and its current dispatch table
- * 3. Writes the thunk's original dispatch to *(void**)device
- * 4. Calls the real thunk function
- * 5. Restores the loader's dispatch table
- * 6. Returns
+ * 1. Saves callee-saved registers (rbx, r12, r13)
+ * 2. Acquires a spinlock (dispatch_lock) via lock xchg
+ * 3. Saves the device's current dispatch table from offset 0
+ * 4. Writes the thunk's original dispatch to *(void**)device
+ * 5. Calls the real thunk function
+ * 6. Restores the loader's dispatch table
+ * 7. Releases the spinlock
+ * 8. Returns
  *
- * This allows the host driver to see the correct dispatch table during
- * the thunk bridge call, while the loader sees its own table at other times.
+ * The spinlock serializes all VkDevice function calls to prevent races
+ * where two threads modify *(void**)device concurrently. Without this,
+ * Thread B could save the thunk dispatch (written by Thread A) instead
+ * of the loader dispatch, corrupting the device state.
  *
  * Assembly (AT&T syntax):
  *   push %rbx
  *   push %r12
+ *   push %r13
  *   mov  %rdi, %rbx            # save device in callee-saved
- *   mov  (%rdi), %r12          # save current dispatch
+ *   movabs $<lock_ptr>, %r13   # address of dispatch_lock
+ * .spin:
+ *   mov  $1, %eax
+ *   lock xchg (%r13), %eax     # atomic swap: [lock] <-> eax
+ *   test %eax, %eax
+ *   jz   .acquired
+ *   pause                       # hint: spin-wait
+ *   jmp  .spin
+ * .acquired:
+ *   mov  (%rbx), %r12          # save current dispatch
  *   movabs $<dispatch_ptr>, %rax
- *   mov  (%rax), %rax          # load thunk_device_dispatch value
- *   mov  %rax, (%rdi)          # write thunk dispatch to device
- *   sub  $8, %rsp              # align stack for call
+ *   mov  (%rax), %rax          # load thunk_device_dispatch
+ *   mov  %rax, (%rbx)          # write thunk dispatch to device
  *   movabs $<real_func>, %rax
  *   call *%rax
- *   add  $8, %rsp
  *   mov  %r12, (%rbx)          # restore loader dispatch
+ *   movl $0, (%r13)            # release spinlock
+ *   pop  %r13
  *   pop  %r12
  *   pop  %rbx
  *   ret
  */
 
-#define TRAMPOLINE_SIZE 64  /* padded to 8-byte alignment */
+#define TRAMPOLINE_SIZE 96  /* enough for ~84 bytes of code + padding */
 
 static uint8_t* trampoline_pages[32] = {0};
 static int trampoline_page_idx = 0;
@@ -103,29 +118,58 @@ static PFN_vkVoidFunction make_dispatch_trampoline(PFN_vkVoidFunction real_func)
     c[i++] = 0x53;
     /* push r12 */
     c[i++] = 0x41; c[i++] = 0x54;
+    /* push r13 */
+    c[i++] = 0x41; c[i++] = 0x55;
     /* mov rbx, rdi  (save device pointer) */
     c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0xFB;
-    /* mov r12, [rdi]  (save current dispatch) */
-    c[i++] = 0x4C; c[i++] = 0x8B; c[i++] = 0x27;
-    /* movabs rax, &thunk_device_dispatch  (address of global var) */
+
+    /* movabs r13, &dispatch_lock  (spinlock address) */
+    c[i++] = 0x49; c[i++] = 0xBD;
+    void* lock_addr = (void*)&dispatch_lock;
+    memcpy(c + i, &lock_addr, 8); i += 8;
+
+    /* .spin: mov eax, 1 */
+    int spin_label = i;
+    c[i++] = 0xB8; c[i++] = 0x01; c[i++] = 0x00; c[i++] = 0x00; c[i++] = 0x00;
+    /* lock xchg [r13+0], eax  (atomic: eax <-> [lock]) */
+    c[i++] = 0xF0; c[i++] = 0x41; c[i++] = 0x87; c[i++] = 0x45; c[i++] = 0x00;
+    /* test eax, eax */
+    c[i++] = 0x85; c[i++] = 0xC0;
+    /* jz .acquired  (skip pause+jmp if lock was free) */
+    c[i++] = 0x74; c[i++] = 0x04;  /* +4 bytes forward */
+    /* pause  (spin-wait hint) */
+    c[i++] = 0xF3; c[i++] = 0x90;
+    /* jmp .spin */
+    c[i] = 0xEB;
+    c[i+1] = (uint8_t)(spin_label - (i + 2));  /* rel8 back to .spin */
+    i += 2;
+
+    /* .acquired: */
+    /* mov r12, [rbx]  (save current dispatch) */
+    c[i++] = 0x4C; c[i++] = 0x8B; c[i++] = 0x23;
+    /* movabs rax, &thunk_device_dispatch */
     c[i++] = 0x48; c[i++] = 0xB8;
     void* dispatch_addr = &thunk_device_dispatch;
     memcpy(c + i, &dispatch_addr, 8); i += 8;
     /* mov rax, [rax]  (load the dispatch value) */
     c[i++] = 0x48; c[i++] = 0x8B; c[i++] = 0x00;
-    /* mov [rdi], rax  (write thunk dispatch to device) */
-    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0x07;
-    /* sub rsp, 8  (align stack for call) */
-    c[i++] = 0x48; c[i++] = 0x83; c[i++] = 0xEC; c[i++] = 0x08;
+    /* mov [rbx], rax  (write thunk dispatch to device) */
+    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0x03;
+
     /* movabs rax, real_func */
     c[i++] = 0x48; c[i++] = 0xB8;
     memcpy(c + i, &real_func, 8); i += 8;
     /* call rax */
     c[i++] = 0xFF; c[i++] = 0xD0;
-    /* add rsp, 8 */
-    c[i++] = 0x48; c[i++] = 0x83; c[i++] = 0xC4; c[i++] = 0x08;
+
     /* mov [rbx], r12  (restore loader dispatch) */
     c[i++] = 0x4C; c[i++] = 0x89; c[i++] = 0x23;
+    /* mov dword [r13+0], 0  (release spinlock) */
+    c[i++] = 0x41; c[i++] = 0xC7; c[i++] = 0x45; c[i++] = 0x00;
+    c[i++] = 0x00; c[i++] = 0x00; c[i++] = 0x00; c[i++] = 0x00;
+
+    /* pop r13 */
+    c[i++] = 0x41; c[i++] = 0x5D;
     /* pop r12 */
     c[i++] = 0x41; c[i++] = 0x5C;
     /* pop rbx */
@@ -237,8 +281,11 @@ typedef void (*PFN_vkDestroyDevice)(void*, const void*);
 
 static PFN_vkVoidFunction wrapped_DestroyDevice_fn = NULL;
 
-/* DestroyDevice needs special handling: clear our state after calling */
+/* DestroyDevice needs special handling: acquire lock, restore dispatch, call, clear state */
 static void wrapped_DestroyDevice(void* device, const void* pAllocator) {
+    /* Acquire spinlock — prevent other threads from using the device mid-destroy */
+    while (__sync_lock_test_and_set(&dispatch_lock, 1)) { /* spin */ }
+
     /* Restore dispatch for the destroy call */
     if (thunk_device && thunk_device_dispatch)
         *(void**)thunk_device = thunk_device_dispatch;
@@ -246,6 +293,9 @@ static void wrapped_DestroyDevice(void* device, const void* pAllocator) {
     if (fn) fn(thunk_device ? thunk_device : device, pAllocator);
     thunk_device = NULL;
     thunk_device_dispatch = NULL;
+
+    /* Release spinlock */
+    __sync_lock_release(&dispatch_lock);
 }
 
 /* ---- vkGetDeviceProcAddr: GIPA-based + dispatch trampolines ---- */
