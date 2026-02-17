@@ -127,7 +127,7 @@ export PATH="${PROTON_DIR}/files/bin:${PATH}"
 export WINEDLLPATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib/wine/x86_64-windows:${PROTON_DIR}/files/lib/wine/i386-unix:${PROTON_DIR}/files/lib/wine/i386-windows"
 export WINELOADER="${PROTON_DIR}/files/bin/wine"
 export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
-export DISPLAY=localhost:0
+export DISPLAY=:0
 export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 
 # Proton compatibility (Android kernel limitations)
@@ -233,5 +233,11 @@ if [ "$EXE_PATH" != "notepad" ]; then
     done
 fi
 
-# Launch via wine64
-exec wine64 "$EXE_PATH" $EXTRA_ARGS 2>&1
+# Launch via wine64 with virtual desktop
+# (libXlorie doesn't support RandR mode switching, so ChangeDisplaySettings fails.
+# Virtual desktop handles display modes internally, avoiding the hang.)
+if [ "$EXE_PATH" = "notepad" ]; then
+    exec wine64 notepad 2>&1
+else
+    exec wine64 explorer /desktop=Game,1920x1080 "$EXE_PATH" $EXTRA_ARGS 2>&1
+fi

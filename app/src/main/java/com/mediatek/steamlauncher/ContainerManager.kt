@@ -839,6 +839,8 @@ class ContainerManager(private val context: Context) {
         copyAssetToFile("d3dcompiler_47_stub.dll", File(stubsDir, "d3dcompiler_47.dll"))
         copyAssetToFile("Galaxy64.dll", File(stubsDir, "Galaxy64.dll"))
         copyAssetToFile("GFSDK_SSAO_D3D11.win64.dll", File(stubsDir, "GFSDK_SSAO_D3D11.win64.dll"))
+        copyAssetToFile("steam_api64.dll", File(stubsDir, "steam_api64.dll"))
+        copyAssetToFile("test_vk_cmdbuf.exe", File(stubsDir, "test_vk_cmdbuf.exe"))
 
         Log.i(TAG, "Stub DLLs deployed to Wine path and /opt/stubs/")
     }

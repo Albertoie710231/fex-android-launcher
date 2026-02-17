@@ -458,7 +458,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export HEADLESS_LAYER=1
 
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
-            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d"
+            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;xaudio2_0=d;xaudio2_1=d;xaudio2_2=d;xaudio2_3=d;xaudio2_4=d;xaudio2_5=d;xaudio2_6=d;xaudio2_7=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d;quartz=d;wmvcore=d"
             export WINEDEBUG=err+all
 
             # Misc
@@ -508,7 +508,7 @@ dxvk.logLevel = trace
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
-            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
+            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll steam_api64.dll; do
                 if [ -f "/opt/stubs/${'$'}stub" ]; then
                     if [ -f "$exeDir/${'$'}stub" ] && [ ! -f "$exeDir/${'$'}{stub}.orig" ]; then
                         cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
@@ -519,47 +519,16 @@ DXVKEOF
                 fi
             done
 
-            # Verify X11 display connectivity before launch
+            # X11: always use abstract socket (libXlorie), never TCP
             echo "=== X11 Display Check ==="
-            echo "DISPLAY=${'$'}DISPLAY"
-            # Test BOTH abstract socket and TCP, use whichever works
-            X11_OK=0
-            python3 -c "
-import socket, sys
-# Test 1: Abstract socket (DISPLAY=:0)
-try:
-    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-    s.connect('\x00/tmp/.X11-unix/X0')
-    print('X11 abstract socket @/tmp/.X11-unix/X0: CONNECTED')
-    s.close()
-    sys.exit(0)
-except Exception as e:
-    print(f'X11 abstract socket: FAILED ({e})')
-# Test 2: TCP (DISPLAY=localhost:0 → port 6000)
-try:
-    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-    s.settimeout(2)
-    s.connect(('127.0.0.1',6000))
-    print('X11 TCP 127.0.0.1:6000: CONNECTED')
-    s.close()
-    sys.exit(10)  # signal TCP works
-except Exception as e:
-    print(f'X11 TCP port 6000: FAILED ({e})')
-    print('ERROR: No X11 connection method works!')
-    sys.exit(1)
-" 2>&1
-            X11_RESULT=${'$'}?
-            if [ ${'$'}X11_RESULT -eq 0 ]; then
-                export DISPLAY=:0
-                echo "Using DISPLAY=:0 (abstract socket)"
-                X11_OK=1
-            elif [ ${'$'}X11_RESULT -eq 10 ]; then
-                export DISPLAY=localhost:0
-                echo "Using DISPLAY=localhost:0 (TCP fallback)"
-                X11_OK=1
-            else
-                echo "WARNING: No X11 server reachable! Wine cannot create windows."
-            fi
+            export DISPLAY=:0
+            echo "DISPLAY=:0 (abstract socket)"
+
+            # Disable XRandR — libXlorie doesn't support mode switching,
+            # causing NtUserChangeDisplaySettings to return -2 and Wine to poll forever.
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
+            echo "Disabled XRandR/XVidMode in Wine registry"
 
             echo "=== Launching: $exePath ==="
             echo "Working dir: $exeDir"
@@ -570,7 +539,60 @@ except Exception as e:
             rm -f /tmp/layer_trace.log
 
             cd "$exeDir"
-            wine64 "$exePath" $extraArgs 2>&1
+
+            # Create steam_appid.txt BEFORE wine launch (prevents Steam client check)
+            echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
+
+            # Dump game's PE imports to identify which DLLs are loaded
+            echo "=== PE IMPORTS ==="
+            objdump -p "$exePath" 2>/dev/null | grep "DLL Name" | head -30 || echo "(objdump not available)"
+            echo "=== END PE IMPORTS ==="
+
+            # Launch wine in background so we can inspect its threads
+            wine64 "$exePath" $extraArgs 2>&1 &
+            WINE_PID=${'$'}!
+            echo "Wine PID: ${'$'}WINE_PID"
+
+            # Thread diagnostic — sample at t+15s and t+45s to see if CPU increases
+            dump_threads() {
+                local LABEL=${'$'}1
+                echo ""
+                echo "=== THREAD DIAGNOSTIC (${'$'}LABEL, Wine PID=${'$'}WINE_PID) ==="
+                if [ -d /proc/${'$'}WINE_PID ]; then
+                    for tp in /proc/${'$'}WINE_PID/task/*; do
+                        tid=${'$'}{tp##*/}
+                        STATE=${'$'}(grep '^State:' ${'$'}tp/status 2>/dev/null | awk '{print ${'$'}2, ${'$'}3}')
+                        WCHAN=${'$'}(cat ${'$'}tp/wchan 2>/dev/null)
+                        SYSCALL=${'$'}(cat ${'$'}tp/syscall 2>/dev/null | cut -d' ' -f1)
+                        UT=${'$'}(awk '{print ${'$'}14}' ${'$'}tp/stat 2>/dev/null)
+                        ST=${'$'}(awk '{print ${'$'}15}' ${'$'}tp/stat 2>/dev/null)
+                        MINFLT=${'$'}(awk '{print ${'$'}10}' ${'$'}tp/stat 2>/dev/null)
+                        MAJFLT=${'$'}(awk '{print ${'$'}12}' ${'$'}tp/stat 2>/dev/null)
+                        echo "  TID ${'$'}tid: ${'$'}STATE wchan=${'$'}WCHAN u=${'$'}UT s=${'$'}ST minflt=${'$'}MINFLT majflt=${'$'}MAJFLT sys=${'$'}SYSCALL"
+                    done
+                else
+                    echo "  Wine PID ${'$'}WINE_PID no longer exists!"
+                fi
+                echo "=== END DIAGNOSTIC ==="
+            }
+
+            sleep 15
+            dump_threads "t+15s"
+
+            # Dump memory maps (raw, first 40 lines + last 20)
+            echo ""
+            echo "=== PROC MAPS (head) ==="
+            head -40 /proc/${'$'}WINE_PID/maps 2>/dev/null || echo "(maps not readable)"
+            echo "..."
+            echo "=== PROC MAPS (named regions) ==="
+            grep -v '^\S* \S* \S* \S* 0 ' /proc/${'$'}WINE_PID/maps 2>/dev/null | tail -30
+            echo "=== END MAPS ==="
+
+            sleep 15
+            dump_threads "t+30s"
+
+            # Wait for wine to finish
+            wait ${'$'}WINE_PID 2>/dev/null
             WINE_EXIT=${'$'}?
             echo ""
             echo "[wine64 exit code: ${'$'}WINE_EXIT]"
@@ -583,6 +605,45 @@ except Exception as e:
             if [ ${'$'}WINE_EXIT -eq 132 ]; then
                 echo "=== SIGILL CRASH — FEX debug log (last 100 lines) ==="
                 tail -100 /tmp/fex-debug.log 2>/dev/null || echo "(no FEX log at /tmp)"
+            fi
+        """.trimIndent()
+    }
+
+    /**
+     * Test vkBeginCommandBuffer through Wine's winevulkan path.
+     * This isolates whether the hang is in Wine's Vulkan PE/unix bridge.
+     */
+    fun getVkCmdBufTestCommand(): String {
+        return """
+            export WINEPREFIX="/home/user/.wine"
+            export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
+            export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
+            export MALI_NO_ASYNC_COMPUTE=1
+            export HEADLESS_LAYER=1
+            export PROTON_NO_ESYNC=1
+            export PROTON_NO_FSYNC=1
+            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d"
+            export WINEDEBUG=err+all
+
+            echo "=== Vulkan CmdBuf Test (FULL game env: HeadlessLayer + Proton winevulkan) ==="
+            echo "HEADLESS_LAYER=${'$'}HEADLESS_LAYER"
+            echo "VK_ICD_FILENAMES=${'$'}VK_ICD_FILENAMES"
+            echo ""
+
+            # Run with 30s timeout — if it hangs on vkBeginCommandBuffer, timeout fires
+            timeout 30 wine64 /opt/stubs/test_vk_cmdbuf.exe 2>&1
+            EXIT=${'$'}?
+            echo ""
+            if [ ${'$'}EXIT -eq 0 ]; then
+                echo "=== TEST PASSED: vkBeginCommandBuffer works through Wine ==="
+            elif [ ${'$'}EXIT -eq 124 ]; then
+                echo "=== TEST FAILED: TIMEOUT (30s) — vkBeginCommandBuffer HANGS through Wine ==="
+            else
+                echo "=== TEST FAILED: exit code ${'$'}EXIT ==="
             fi
         """.trimIndent()
     }
@@ -616,10 +677,21 @@ except Exception as e:
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=:0
             export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # Critical: disable wined3d (SIGILL from Mesa GLX) and unnecessary DLLs
+            export WINEDLLOVERRIDES="wined3d=d;mscoree=d;mshtml=d"
+            export WINEDEBUG=err+all
+
+            # X11: always use abstract socket (libXlorie), never TCP
+            export DISPLAY=:0
+            echo "DISPLAY=:0 (abstract socket)"
+
+            # Disable XRandR/XVidMode (libXlorie doesn't support mode switching)
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
 
             # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
             if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
@@ -628,9 +700,8 @@ except Exception as e:
             fi
 
             echo "=== Notepad Test ==="
-            echo "DISPLAY=${'$'}DISPLAY (libXlorie via abstract socket)"
-            echo "Starting Wine notepad..."
-            timeout 30 wine64 notepad 2>&1 || true
+            echo "Testing basic Wine windowing (30s timeout)..."
+            timeout 30 wine64 notepad 2>&1 || echo "[notepad timed out or exited]"
             echo ""
             echo "Test complete"
         """.trimIndent()

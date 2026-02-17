@@ -24,6 +24,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 typedef void (*PFN_vkVoidFunction)(void);
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
@@ -38,6 +40,54 @@ static void* saved_instance = NULL;
 static void* thunk_device = NULL;
 static void* thunk_device_dispatch = NULL;
 static volatile int dispatch_lock = 0;
+
+/* Per-device dispatch table: maps device handles to their original ICD dispatch pointers.
+ * Each device from the ICD gets its own dispatch table allocated during vkCreateDevice.
+ * Trampolines must restore the CORRECT dispatch for the specific device being called,
+ * because the thunk may use the dispatch pointer to identify the host-side device. */
+#define MAX_TRACKED_DEVICES 8
+static struct {
+    void* device;
+    void* dispatch;
+} device_dispatch_table[MAX_TRACKED_DEVICES];
+static int device_dispatch_count = 0;
+
+/* Look up the correct dispatch pointer for a specific device handle.
+ * Called from x86-64 trampoline machine code via function pointer. */
+static void* get_dispatch_for_device(void* device) {
+    for (int i = 0; i < device_dispatch_count; i++) {
+        if (device_dispatch_table[i].device == device)
+            return device_dispatch_table[i].dispatch;
+    }
+    return thunk_device_dispatch;  /* fallback */
+}
+
+static void register_device_dispatch(void* device, void* dispatch) {
+    for (int i = 0; i < device_dispatch_count; i++) {
+        if (device_dispatch_table[i].device == device) {
+            device_dispatch_table[i].dispatch = dispatch;
+            return;
+        }
+    }
+    if (device_dispatch_count < MAX_TRACKED_DEVICES) {
+        device_dispatch_table[device_dispatch_count].device = device;
+        device_dispatch_table[device_dispatch_count].dispatch = dispatch;
+        device_dispatch_count++;
+    } else {
+        fprintf(stderr, "fex_thunk_icd: WARNING: device table full, can't track %p\n", device);
+    }
+}
+
+static void remove_device_dispatch(void* device) {
+    for (int i = 0; i < device_dispatch_count; i++) {
+        if (device_dispatch_table[i].device == device) {
+            for (int j = i; j < device_dispatch_count - 1; j++)
+                device_dispatch_table[j] = device_dispatch_table[j + 1];
+            device_dispatch_count--;
+            return;
+        }
+    }
+}
 
 #define LOG(...) do { fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); } while(0)
 
@@ -91,7 +141,7 @@ static void icd_marker(const char* msg) {
  *   ret
  */
 
-#define TRAMPOLINE_SIZE 96  /* enough for ~84 bytes of code + padding */
+#define TRAMPOLINE_SIZE 128  /* enough for ~105 bytes of code + padding */
 
 static uint8_t* trampoline_pages[32] = {0};
 static int trampoline_page_idx = 0;
@@ -145,15 +195,34 @@ static PFN_vkVoidFunction make_dispatch_trampoline(PFN_vkVoidFunction real_func)
     i += 2;
 
     /* .acquired: */
-    /* mov r12, [rbx]  (save current dispatch) */
+    /* mov r12, [rbx]  (save current dispatch — loader's) */
     c[i++] = 0x4C; c[i++] = 0x8B; c[i++] = 0x23;
-    /* movabs rax, &thunk_device_dispatch */
+
+    /* Per-device dispatch lookup: call get_dispatch_for_device(device)
+     * Save all argument registers, call C function, restore args.
+     * Result in rax is the correct ICD dispatch for this specific device. */
+    c[i++] = 0x57;                    /* push rdi */
+    c[i++] = 0x56;                    /* push rsi */
+    c[i++] = 0x52;                    /* push rdx */
+    c[i++] = 0x51;                    /* push rcx */
+    c[i++] = 0x41; c[i++] = 0x50;    /* push r8  */
+    c[i++] = 0x41; c[i++] = 0x51;    /* push r9  */
+    /* mov rdi, rbx  (device pointer as arg) */
+    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0xDF;
+    /* movabs rax, get_dispatch_for_device */
     c[i++] = 0x48; c[i++] = 0xB8;
-    void* dispatch_addr = &thunk_device_dispatch;
-    memcpy(c + i, &dispatch_addr, 8); i += 8;
-    /* mov rax, [rax]  (load the dispatch value) */
-    c[i++] = 0x48; c[i++] = 0x8B; c[i++] = 0x00;
-    /* mov [rbx], rax  (write thunk dispatch to device) */
+    void* lookup_fn = (void*)get_dispatch_for_device;
+    memcpy(c + i, &lookup_fn, 8); i += 8;
+    /* call rax */
+    c[i++] = 0xFF; c[i++] = 0xD0;
+    /* Restore argument registers (rax = dispatch result, untouched by pops) */
+    c[i++] = 0x41; c[i++] = 0x59;    /* pop r9  */
+    c[i++] = 0x41; c[i++] = 0x58;    /* pop r8  */
+    c[i++] = 0x59;                    /* pop rcx */
+    c[i++] = 0x5A;                    /* pop rdx */
+    c[i++] = 0x5E;                    /* pop rsi */
+    c[i++] = 0x5F;                    /* pop rdi */
+    /* mov [rbx], rax  (write correct ICD dispatch to device) */
     c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0x03;
 
     /* movabs rax, real_func */
@@ -181,15 +250,129 @@ static PFN_vkVoidFunction make_dispatch_trampoline(PFN_vkVoidFunction real_func)
     return (PFN_vkVoidFunction)c;
 }
 
-/* Check if a function takes VkQueue or VkCommandBuffer as first arg
- * (these don't need dispatch fixup since loader doesn't patch them) */
-static int is_queue_or_cmdbuf_func(const char* pName) {
-    if (strncmp(pName, "vkQueue", 7) == 0) return 1;
+/* Lock-free trampoline for VkCommandBuffer functions.
+ * Same dispatch fixup as make_dispatch_trampoline but WITHOUT spinlock.
+ * Safe because Vulkan spec requires external synchronization for command buffers
+ * (each command buffer is used by at most one thread at a time).
+ * This avoids serializing the thousands of vkCmd* calls per frame. */
+static PFN_vkVoidFunction make_dispatch_trampoline_nolock(PFN_vkVoidFunction real_func) {
+    if (!trampoline_pages[trampoline_page_idx] ||
+        trampoline_offset + TRAMPOLINE_SIZE > 4096) {
+        void* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) return real_func;
+        if (trampoline_page_idx < 31) {
+            trampoline_pages[++trampoline_page_idx] = page;
+        } else {
+            trampoline_pages[trampoline_page_idx] = page;
+        }
+        trampoline_offset = 0;
+    }
+
+    uint8_t* c = trampoline_pages[trampoline_page_idx] + trampoline_offset;
+    int i = 0;
+
+    /* Prologue: save callee-saved registers + align stack (3 pushes = 24 bytes,
+     * entry rsp ≡ 8 mod 16, after 3 pushes rsp ≡ 0 mod 16 for C call) */
+    c[i++] = 0x53;                    /* push rbx */
+    c[i++] = 0x41; c[i++] = 0x54;    /* push r12 */
+    c[i++] = 0x41; c[i++] = 0x55;    /* push r13 (for alignment) */
+    /* mov rbx, rdi  (save handle pointer — VkCommandBuffer) */
+    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0xFB;
+    /* mov r12, [rbx]  (save current dispatch — loader's) */
+    c[i++] = 0x4C; c[i++] = 0x8B; c[i++] = 0x23;
+
+    /* Save argument registers for C function call */
+    c[i++] = 0x57;                    /* push rdi */
+    c[i++] = 0x56;                    /* push rsi */
+    c[i++] = 0x52;                    /* push rdx */
+    c[i++] = 0x51;                    /* push rcx */
+    c[i++] = 0x41; c[i++] = 0x50;    /* push r8  */
+    c[i++] = 0x41; c[i++] = 0x51;    /* push r9  */
+    /* mov rdi, rbx  (handle pointer as arg) */
+    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0xDF;
+    /* movabs rax, get_dispatch_for_device */
+    c[i++] = 0x48; c[i++] = 0xB8;
+    void* lookup_fn = (void*)get_dispatch_for_device;
+    memcpy(c + i, &lookup_fn, 8); i += 8;
+    /* call rax */
+    c[i++] = 0xFF; c[i++] = 0xD0;
+    /* Restore argument registers (rax = dispatch result, untouched by pops) */
+    c[i++] = 0x41; c[i++] = 0x59;    /* pop r9  */
+    c[i++] = 0x41; c[i++] = 0x58;    /* pop r8  */
+    c[i++] = 0x59;                    /* pop rcx */
+    c[i++] = 0x5A;                    /* pop rdx */
+    c[i++] = 0x5E;                    /* pop rsi */
+    c[i++] = 0x5F;                    /* pop rdi */
+    /* mov [rbx], rax  (write correct ICD dispatch to handle) */
+    c[i++] = 0x48; c[i++] = 0x89; c[i++] = 0x03;
+
+    /* movabs rax, real_func */
+    c[i++] = 0x48; c[i++] = 0xB8;
+    memcpy(c + i, &real_func, 8); i += 8;
+    /* call rax */
+    c[i++] = 0xFF; c[i++] = 0xD0;
+
+    /* mov [rbx], r12  (restore loader dispatch) */
+    c[i++] = 0x4C; c[i++] = 0x89; c[i++] = 0x23;
+
+    /* Epilogue */
+    c[i++] = 0x41; c[i++] = 0x5D;    /* pop r13 */
+    c[i++] = 0x41; c[i++] = 0x5C;    /* pop r12 */
+    c[i++] = 0x5B;                    /* pop rbx */
+    c[i++] = 0xC3;                    /* ret */
+
+    trampoline_offset += TRAMPOLINE_SIZE;
+    return (PFN_vkVoidFunction)c;
+}
+
+/* Check if a function takes VkCommandBuffer as first arg.
+ * These get lock-free trampolines (not locked ones) for dispatch fixup. */
+static int is_cmdbuf_func(const char* pName) {
     if (strncmp(pName, "vkCmd", 5) == 0) return 1;
     if (strcmp(pName, "vkBeginCommandBuffer") == 0) return 1;
     if (strcmp(pName, "vkEndCommandBuffer") == 0) return 1;
     if (strcmp(pName, "vkResetCommandBuffer") == 0) return 1;
     return 0;
+}
+
+/* ---- Diagnostic: logged wrappers for command buffer functions ---- */
+
+static inline long get_tid(void) { return syscall(SYS_gettid); }
+
+typedef VkResult (*PFN_vkBeginCmdBuf)(void*, const void*);
+typedef VkResult (*PFN_vkEndCmdBuf)(void*);
+typedef VkResult (*PFN_vkResetCmdBuf)(void*, uint32_t);
+
+static PFN_vkBeginCmdBuf real_begin_cmdbuf = NULL;
+static PFN_vkEndCmdBuf real_end_cmdbuf = NULL;
+static PFN_vkResetCmdBuf real_reset_cmdbuf = NULL;
+static volatile int begin_cmdbuf_count = 0;
+
+static VkResult logged_BeginCommandBuffer(void* cmdBuf, const void* pBeginInfo) {
+    long tid = get_tid();
+    int n = __sync_add_and_fetch(&begin_cmdbuf_count, 1);
+    LOG("[tid=%ld] vkBeginCommandBuffer #%d ENTER cmdBuf=%p dispatch_at_0=%p lock=%d\n",
+        tid, n, cmdBuf, cmdBuf ? *(void**)cmdBuf : NULL, dispatch_lock);
+    VkResult r = real_begin_cmdbuf(cmdBuf, pBeginInfo);
+    LOG("[tid=%ld] vkBeginCommandBuffer #%d EXIT result=%d\n", tid, n, r);
+    return r;
+}
+
+static VkResult logged_EndCommandBuffer(void* cmdBuf) {
+    long tid = get_tid();
+    LOG("[tid=%ld] vkEndCommandBuffer cmdBuf=%p\n", tid, cmdBuf);
+    VkResult r = real_end_cmdbuf(cmdBuf);
+    LOG("[tid=%ld] vkEndCommandBuffer EXIT result=%d\n", tid, r);
+    return r;
+}
+
+static VkResult logged_ResetCommandBuffer(void* cmdBuf, uint32_t flags) {
+    long tid = get_tid();
+    LOG("[tid=%ld] vkResetCommandBuffer cmdBuf=%p flags=%u\n", tid, cmdBuf, flags);
+    VkResult r = real_reset_cmdbuf(cmdBuf, flags);
+    LOG("[tid=%ld] vkResetCommandBuffer EXIT result=%d\n", tid, r);
+    return r;
 }
 
 /* ---- Standard init ---- */
@@ -256,10 +439,16 @@ static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
     if (!real_create_device) return -3;
     VkResult res = real_create_device(physDev, pCreateInfo, pAllocator, pDevice);
     if (res == 0 && pDevice && *pDevice) {
+        void* new_dispatch = *(void**)*pDevice;
+        /* Register per-device dispatch: each device gets its own ICD dispatch pointer.
+         * The thunk allocates a separate dispatch table per device, so the pointer
+         * at *(void**)device differs between devices even from the same ICD.
+         * Trampolines must restore the CORRECT dispatch for each specific device. */
+        register_device_dispatch(*pDevice, new_dispatch);
+        thunk_device_dispatch = new_dispatch;  /* always update fallback to latest device */
         thunk_device = *pDevice;
-        thunk_device_dispatch = *(void**)*pDevice;
-        LOG("CreateDevice OK: thunk_device=%p dispatch=%p\n",
-            *pDevice, thunk_device_dispatch);
+        LOG("CreateDevice OK: device=%p dispatch=%p (tracked=%d)\n",
+            *pDevice, new_dispatch, device_dispatch_count);
         icd_marker("CreateDevice_saved");
     }
     return res;
@@ -272,7 +461,10 @@ static PFN_vkDestroyInstance real_destroy_instance = NULL;
 
 static void wrapped_DestroyInstance(void* instance, const void* pAllocator) {
     if (real_destroy_instance) real_destroy_instance(instance, pAllocator);
-    saved_instance = NULL;
+    /* Only clear saved_instance if THIS is the one we saved — other instances
+     * (e.g., watchdog probe) should not clobber DXVK's active instance. */
+    if (instance == saved_instance)
+        saved_instance = NULL;
 }
 
 /* ---- vkDestroyDevice wrapper ---- */
@@ -281,20 +473,41 @@ typedef void (*PFN_vkDestroyDevice)(void*, const void*);
 
 static PFN_vkVoidFunction wrapped_DestroyDevice_fn = NULL;
 
-/* DestroyDevice needs special handling: acquire lock, restore dispatch, call, clear state */
+/* DestroyDevice needs special handling: acquire lock, restore correct per-device
+ * dispatch, call thunk's destroy, remove from tracking table.
+ *
+ * CRITICAL: Must restore THIS device's own dispatch pointer (not another device's),
+ * because the thunk may use the dispatch pointer to identify the host-side device. */
 static void wrapped_DestroyDevice(void* device, const void* pAllocator) {
-    /* Acquire spinlock — prevent other threads from using the device mid-destroy */
     while (__sync_lock_test_and_set(&dispatch_lock, 1)) { /* spin */ }
 
-    /* Restore dispatch for the destroy call */
-    if (thunk_device && thunk_device_dispatch)
-        *(void**)thunk_device = thunk_device_dispatch;
-    PFN_vkDestroyDevice fn = (PFN_vkDestroyDevice)wrapped_DestroyDevice_fn;
-    if (fn) fn(thunk_device ? thunk_device : device, pAllocator);
-    thunk_device = NULL;
-    thunk_device_dispatch = NULL;
+    LOG("DestroyDevice: device=%p thunk_device=%p tracked=%d\n",
+        device, thunk_device, device_dispatch_count);
 
-    /* Release spinlock */
+    /* Restore THIS device's own ICD dispatch before destroying */
+    if (device) {
+        void* dispatch = get_dispatch_for_device(device);
+        if (dispatch) {
+            LOG("DestroyDevice: restoring dispatch=%p for device=%p\n", dispatch, device);
+            *(void**)device = dispatch;
+        }
+    }
+
+    PFN_vkDestroyDevice fn = (PFN_vkDestroyDevice)wrapped_DestroyDevice_fn;
+    if (fn) fn(device, pAllocator);
+
+    /* Remove from per-device tracking table */
+    remove_device_dispatch(device);
+
+    /* Update fallback dispatch to a surviving device's dispatch (avoid dangling pointer) */
+    if (device_dispatch_count > 0)
+        thunk_device_dispatch = device_dispatch_table[0].dispatch;
+
+    if (device == thunk_device)
+        thunk_device = NULL;
+
+    LOG("DestroyDevice: done, tracked=%d remaining, fallback=%p\n",
+        device_dispatch_count, thunk_device_dispatch);
     __sync_lock_release(&dispatch_lock);
 }
 
@@ -328,16 +541,38 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
 
     if (!fn) return NULL;
 
-    /* VkQueue and VkCommandBuffer functions: no dispatch fixup needed */
-    if (is_queue_or_cmdbuf_func(pName)) {
-        if (gdpa_count <= 5 || strncmp(pName, "vkQueue", 7) == 0)
-            LOG("GDPA[%d]: %s -> %p (no fixup)\n", gdpa_count, pName, (void*)fn);
-        return fn;
+    /* VkCommandBuffer functions: need lock-free dispatch fixup (loader patches
+     * *(void**)cmdBuf just like device/queue) + diagnostic logging for key ones. */
+    if (strcmp(pName, "vkBeginCommandBuffer") == 0) {
+        real_begin_cmdbuf = (PFN_vkBeginCmdBuf)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline_nolock((PFN_vkVoidFunction)logged_BeginCommandBuffer);
+        LOG("GDPA: vkBeginCommandBuffer -> %p (logged+nolock tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (strcmp(pName, "vkEndCommandBuffer") == 0) {
+        real_end_cmdbuf = (PFN_vkEndCmdBuf)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline_nolock((PFN_vkVoidFunction)logged_EndCommandBuffer);
+        LOG("GDPA: vkEndCommandBuffer -> %p (logged+nolock tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (strcmp(pName, "vkResetCommandBuffer") == 0) {
+        real_reset_cmdbuf = (PFN_vkResetCmdBuf)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline_nolock((PFN_vkVoidFunction)logged_ResetCommandBuffer);
+        LOG("GDPA: vkResetCommandBuffer -> %p (logged+nolock tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (is_cmdbuf_func(pName)) {
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline_nolock(fn);
+        if (gdpa_count <= 5)
+            LOG("GDPA[%d]: %s -> %p (nolock tramp=%p)\n", gdpa_count, pName, (void*)fn, (void*)tramp);
+        return tramp;
     }
 
-    /* All other device functions: generate dispatch-fixing trampoline */
+    /* All other device/queue functions: generate dispatch-fixing trampoline.
+     * VkQueue functions need this too — the loader patches *(void**)queue. */
     PFN_vkVoidFunction tramp = make_dispatch_trampoline(fn);
     if (gdpa_count <= 10 ||
+        strncmp(pName, "vkQueue", 7) == 0 ||
         strncmp(pName, "vkGetDeviceQueue", 16) == 0 ||
         strncmp(pName, "vkCreate", 8) == 0) {
         LOG("GDPA[%d]: %s -> %p (trampoline=%p)\n", gdpa_count, pName,

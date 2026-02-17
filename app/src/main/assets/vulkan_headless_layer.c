@@ -104,8 +104,18 @@ typedef uint64_t VkImageView;
 typedef void (*PFN_vkVoidFunction)(void);
 typedef void VkAllocationCallbacks;
 
+typedef void* VkCommandBuffer;
+typedef void* VkCommandPool;
+
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char*);
 typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char*);
+
+/* Command buffer function pointers for diagnostic interception */
+typedef VkResult (*PFN_vkBeginCommandBuffer)(VkCommandBuffer, const void*);
+typedef VkResult (*PFN_vkEndCommandBuffer)(VkCommandBuffer);
+typedef VkResult (*PFN_vkAllocateCommandBuffers)(VkDevice, const void*, VkCommandBuffer*);
+typedef VkResult (*PFN_vkQueueSubmit)(VkQueue, uint32_t, const void*, uint64_t);
+typedef VkResult (*PFN_vkCreateCommandPool)(VkDevice, const void*, const void*, VkCommandPool*);
 
 typedef struct VkExtent2D { uint32_t width; uint32_t height; } VkExtent2D;
 
@@ -372,6 +382,15 @@ typedef struct VkNegotiateLayerInterface_ {
 /* Next-layer function pointers (saved during vkCreateInstance/vkCreateDevice) */
 static PFN_vkGetInstanceProcAddr g_next_gipa = NULL;
 static PFN_vkGetDeviceProcAddr g_next_gdpa = NULL;
+
+/* Diagnostic: Vulkan command buffer interception to find where vkBeginCommandBuffer hangs */
+static PFN_vkBeginCommandBuffer g_real_BeginCmdBuf = NULL;
+static PFN_vkEndCommandBuffer g_real_EndCmdBuf = NULL;
+static PFN_vkAllocateCommandBuffers g_real_AllocCmdBufs = NULL;
+static PFN_vkQueueSubmit g_real_QueueSubmit = NULL;
+static PFN_vkCreateCommandPool g_real_CreateCmdPool = NULL;
+static volatile int g_beginCmdBuf_count = 0;
+static volatile int g_endCmdBuf_count = 0;
 static VkInstance g_instance = NULL;
 static VkDevice g_device = NULL;
 static VkPhysicalDevice g_physical_device = NULL;
@@ -786,6 +805,10 @@ static void headless_GetPhysicalDeviceFeatures(
             LOG("Spoofed textureCompressionBC = VK_TRUE\n");
             layer_marker("SPOOF_BC_FEATURES");
         }
+        if (!pFeatures->vertexPipelineStoresAndAtomics) {
+            pFeatures->vertexPipelineStoresAndAtomics = VK_TRUE;
+            LOG("Spoofed vertexPipelineStoresAndAtomics = VK_TRUE\n");
+        }
     }
 }
 
@@ -808,6 +831,10 @@ static void headless_GetPhysicalDeviceFeatures2(
             pFeatures->features.textureCompressionBC = VK_TRUE;
             LOG("Spoofed textureCompressionBC = VK_TRUE (Features2)\n");
             layer_marker("SPOOF_BC_FEATURES2");
+        }
+        if (!pFeatures->features.vertexPipelineStoresAndAtomics) {
+            pFeatures->features.vertexPipelineStoresAndAtomics = VK_TRUE;
+            LOG("Spoofed vertexPipelineStoresAndAtomics = VK_TRUE (Features2)\n");
         }
 
         /* Walk pNext chain to spoof extension features DXVK requires */
@@ -2001,12 +2028,80 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
     return NULL;
 }
 
+/* ============================================================================
+ * Diagnostic: vkBeginCommandBuffer / vkEndCommandBuffer / vkQueueSubmit wrappers
+ * ============================================================================ */
+
+static VkResult headless_BeginCommandBuffer(VkCommandBuffer cmdBuf, const void* pBeginInfo) {
+    int n = __sync_add_and_fetch(&g_beginCmdBuf_count, 1);
+    if (n <= 5 || (n % 100) == 0) {
+        LOG("vkBeginCommandBuffer #%d (cmdBuf=%p) ENTER\n", n, cmdBuf);
+    }
+    VkResult r = g_real_BeginCmdBuf(cmdBuf, pBeginInfo);
+    if (n <= 5 || (n % 100) == 0) {
+        LOG("vkBeginCommandBuffer #%d result=%d DONE\n", n, r);
+    }
+    return r;
+}
+
+static VkResult headless_EndCommandBuffer(VkCommandBuffer cmdBuf) {
+    int n = __sync_add_and_fetch(&g_endCmdBuf_count, 1);
+    if (n <= 5 || (n % 100) == 0) {
+        LOG("vkEndCommandBuffer #%d (cmdBuf=%p)\n", n, cmdBuf);
+    }
+    return g_real_EndCmdBuf(cmdBuf);
+}
+
+static VkResult headless_AllocateCommandBuffers(VkDevice dev, const void* pInfo, VkCommandBuffer* pBufs) {
+    LOG("vkAllocateCommandBuffers ENTER\n");
+    VkResult r = g_real_AllocCmdBufs(dev, pInfo, pBufs);
+    LOG("vkAllocateCommandBuffers result=%d cmdBuf=%p\n", r, pBufs ? *pBufs : NULL);
+    return r;
+}
+
+static VkResult headless_QueueSubmit(VkQueue queue, uint32_t submitCount, const void* pSubmits, uint64_t fence) {
+    LOG("vkQueueSubmit (queue=%p, submits=%u) ENTER\n", queue, submitCount);
+    VkResult r = g_real_QueueSubmit(queue, submitCount, pSubmits, fence);
+    LOG("vkQueueSubmit result=%d DONE\n", r);
+    return r;
+}
+
+static VkResult headless_CreateCommandPool(VkDevice dev, const void* pInfo, const void* pAlloc, VkCommandPool* pPool) {
+    LOG("vkCreateCommandPool ENTER\n");
+    VkResult r = g_real_CreateCmdPool(dev, pInfo, pAlloc, pPool);
+    LOG("vkCreateCommandPool result=%d pool=%p\n", r, pPool ? *pPool : NULL);
+    return r;
+}
+
 static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char* pName)
 {
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (PFN_vkVoidFunction)headless_GetDeviceProcAddr;
     if (strcmp(pName, "vkDestroyDevice") == 0)
         return (PFN_vkVoidFunction)headless_DestroyDevice;
+
+    /* NOTE: Do NOT intercept vkBeginCommandBuffer/vkEndCommandBuffer here!
+     * Dispatchable handle (VkCommandBuffer) dispatch through GDPA causes
+     * recursive PE↔unix call that triggers Wine assertion crash.
+     * Only intercept non-dispatchable or device-level functions. */
+    if (strcmp(pName, "vkAllocateCommandBuffers") == 0) {
+        if (!g_real_AllocCmdBufs && g_next_gdpa)
+            g_real_AllocCmdBufs = (PFN_vkAllocateCommandBuffers)g_next_gdpa(device, pName);
+        if (g_real_AllocCmdBufs)
+            return (PFN_vkVoidFunction)headless_AllocateCommandBuffers;
+    }
+    if (strcmp(pName, "vkQueueSubmit") == 0) {
+        if (!g_real_QueueSubmit && g_next_gdpa)
+            g_real_QueueSubmit = (PFN_vkQueueSubmit)g_next_gdpa(device, pName);
+        if (g_real_QueueSubmit)
+            return (PFN_vkVoidFunction)headless_QueueSubmit;
+    }
+    if (strcmp(pName, "vkCreateCommandPool") == 0) {
+        if (!g_real_CreateCmdPool && g_next_gdpa)
+            g_real_CreateCmdPool = (PFN_vkCreateCommandPool)g_next_gdpa(device, pName);
+        if (g_real_CreateCmdPool)
+            return (PFN_vkVoidFunction)headless_CreateCommandPool;
+    }
 
     /* Swapchain */
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0)

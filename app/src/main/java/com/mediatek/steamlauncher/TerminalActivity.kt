@@ -234,7 +234,7 @@ class TerminalActivity : AppCompatActivity() {
 
         // Wine version test: verify wine64 binary works under FEX
         findViewById<Button>(R.id.btnWineTest).setOnClickListener {
-            executeCommand(protonManager.getWineVersionTestCommand())
+            executeCommand(protonManager.getVkCmdBufTestCommand())
         }
 
         // Check rootfs dependencies for Wine/Proton
@@ -275,13 +275,31 @@ class TerminalActivity : AppCompatActivity() {
             executeCommand(protonManager.getWineBootCommand())
         }
 
-        // Quick test: run Wine notepad
+        // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
+            // Start X11 if needed (notepad needs X11 for its window)
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for notepad]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
             executeCommand(protonManager.getNotepadTestCommand())
         }
 
         // Launch Ys IX game
         findViewById<Button>(R.id.btnLaunchGame).setOnClickListener {
+            // Start X11 if needed (Wine needs X11 for windows and display)
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for game]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            // Switch to display mode to show frames on SurfaceView
+            if (!isDisplayMode) toggleDisplayMode()
             executeCommand(protonManager.getLaunchCommand(
                 "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
             ))

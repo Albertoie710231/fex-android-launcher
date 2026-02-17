@@ -144,7 +144,7 @@ class X11Server(private val context: Context) {
 
         if (width > 0 && height > 0) {
             // Send window change to ensure X11 knows our dimensions
-            LorieView.sendWindowChange(width, height, 60, "Steam Launcher")
+            LorieView.sendWindowChange(width, height, 120, "Steam Launcher")
             Log.i(TAG, "Sent window change: ${width}x${height}")
 
             // Request connection to trigger rendering
