@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <signal.h>
 
 /* ============================================================================
  * Section 1: Vulkan Types and Constants (inline, no SDK headers needed)
@@ -139,6 +140,25 @@ typedef struct VkSurfaceCapabilitiesKHR {
 
 typedef struct VkSurfaceFormatKHR { int format; int colorSpace; } VkSurfaceFormatKHR;
 typedef int VkPresentModeKHR;
+
+/* VK_KHR_get_surface_capabilities2 structs */
+typedef struct VkPhysicalDeviceSurfaceInfo2KHR {
+    int sType;          /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR = 1000119000 */
+    const void* pNext;
+    VkSurfaceKHR surface;
+} VkPhysicalDeviceSurfaceInfo2KHR;
+
+typedef struct VkSurfaceCapabilities2KHR {
+    int sType;          /* VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR = 1000119001 */
+    void* pNext;
+    VkSurfaceCapabilitiesKHR surfaceCapabilities;
+} VkSurfaceCapabilities2KHR;
+
+typedef struct VkSurfaceFormat2KHR {
+    int sType;          /* VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR = 1000119002 */
+    void* pNext;
+    VkSurfaceFormatKHR surfaceFormat;
+} VkSurfaceFormat2KHR;
 
 typedef struct VkApplicationInfo {
     int sType; const void* pNext;
@@ -383,6 +403,15 @@ typedef struct VkNegotiateLayerInterface_ {
 static PFN_vkGetInstanceProcAddr g_next_gipa = NULL;
 static PFN_vkGetDeviceProcAddr g_next_gdpa = NULL;
 
+/* Per-device dispatch table — needed because DXVK creates multiple devices
+ * (probe device + real device) and destroying the probe clears globals. */
+#define MAX_LAYER_DEVICES 8
+static struct {
+    VkDevice device;
+    PFN_vkGetDeviceProcAddr gdpa;
+} g_device_table[MAX_LAYER_DEVICES];
+static int g_device_count = 0;
+
 /* Diagnostic: Vulkan command buffer interception to find where vkBeginCommandBuffer hangs */
 static PFN_vkBeginCommandBuffer g_real_BeginCmdBuf = NULL;
 static PFN_vkEndCommandBuffer g_real_EndCmdBuf = NULL;
@@ -414,6 +443,33 @@ static PFN_GetFormatProps2 g_real_get_format_props2 = NULL;
 static void layer_marker(const char* msg) {
     FILE* f = fopen("/tmp/layer_trace.log", "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
+/* Global call tracker — identifies last Vulkan function called before crash */
+static volatile const char* g_last_fn = "none";
+static volatile int g_call_seq = 0;
+
+#define TRACE_FN(name) do { \
+    g_last_fn = name; \
+    int _seq = __sync_add_and_fetch(&g_call_seq, 1); \
+    char _tb[128]; snprintf(_tb, sizeof(_tb), "[%d] " name, _seq); \
+    layer_marker(_tb); \
+} while(0)
+
+/* SIGABRT handler — Wine's _wassert calls abort() which raises SIGABRT.
+ * We log the last known function to help identify which PE→Unix call failed. */
+static void sigabrt_handler(int sig) {
+    (void)sig;
+    FILE* f = fopen("/tmp/vk_abort_info.log", "w");
+    if (f) {
+        fprintf(f, "SIGABRT caught!\n");
+        fprintf(f, "Last Vulkan function: %s\n", (const char*)g_last_fn);
+        fprintf(f, "Call sequence: %d\n", g_call_seq);
+        fclose(f);
+    }
+    /* Re-raise to allow default abort behavior */
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
 }
 
 /* ============================================================================
@@ -632,9 +688,36 @@ static PFN_vkVoidFunction next_instance_proc(const char* name) {
     return NULL;
 }
 
+/* Look up GDPA for a specific device from the per-device table */
+static PFN_vkGetDeviceProcAddr gdpa_for_device(VkDevice device) {
+    for (int i = 0; i < g_device_count; i++) {
+        if (g_device_table[i].device == device)
+            return g_device_table[i].gdpa;
+    }
+    /* Fallback to global (last-known) GDPA */
+    return g_next_gdpa;
+}
+
+/* Resolve device function using specific device's dispatch chain */
+static PFN_vkVoidFunction next_device_proc_for(VkDevice device, const char* name) {
+    PFN_vkGetDeviceProcAddr gdpa = gdpa_for_device(device);
+    if (gdpa && device)
+        return gdpa(device, name);
+    return NULL;
+}
+
+/* Legacy: resolve using any known device (for code without a device param) */
 static PFN_vkVoidFunction next_device_proc(const char* name) {
+    /* Try global first */
     if (g_next_gdpa && g_device)
         return g_next_gdpa(g_device, name);
+    /* Fallback: try any device in the table */
+    for (int i = 0; i < g_device_count; i++) {
+        if (g_device_table[i].device && g_device_table[i].gdpa) {
+            PFN_vkVoidFunction fn = g_device_table[i].gdpa(g_device_table[i].device, name);
+            if (fn) return fn;
+        }
+    }
     return NULL;
 }
 
@@ -988,7 +1071,7 @@ static VkResult headless_CreateXcbSurfaceKHR(
     VkSurfaceKHR* pSurface)
 {
     (void)instance; (void)pCreateInfo; (void)pAllocator;
-    layer_marker("CreateXcbSurface_ENTER");
+    TRACE_FN("vkCreateXcbSurfaceKHR");
     SurfaceEntry* e = add_surface(1920, 1080);
     if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *pSurface = e->handle;
@@ -1028,7 +1111,7 @@ static VkResult headless_CreateXlibSurfaceKHR(
     VkSurfaceKHR* pSurface)
 {
     (void)instance; (void)pCreateInfo; (void)pAllocator;
-    layer_marker("CreateXlibSurface_ENTER");
+    TRACE_FN("vkCreateXlibSurfaceKHR");
     SurfaceEntry* e = add_surface(1920, 1080);
     if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *pSurface = e->handle;
@@ -1049,6 +1132,7 @@ static VkBool32 headless_GetPhysicalDeviceXlibPresentationSupportKHR(
 static void headless_DestroySurfaceKHR(
     VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator)
 {
+    TRACE_FN("vkDestroySurfaceKHR");
     if (find_surface(surface)) {
         LOG("DestroySurfaceKHR: headless surface 0x%lx\n", (unsigned long)surface);
         remove_surface(surface);
@@ -1063,6 +1147,7 @@ static void headless_DestroySurfaceKHR(
 static VkResult headless_GetPhysicalDeviceSurfaceSupportKHR(
     VkPhysicalDevice pd, uint32_t qfi, VkSurfaceKHR surface, VkBool32* pSupported)
 {
+    TRACE_FN("vkGetPhysicalDeviceSurfaceSupportKHR");
     if (!g_physical_device) g_physical_device = pd;
     if (find_surface(surface)) { *pSupported = VK_TRUE; return VK_SUCCESS; }
     typedef VkResult (*PFN)(VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32*);
@@ -1074,6 +1159,7 @@ static VkResult headless_GetPhysicalDeviceSurfaceSupportKHR(
 static VkResult headless_GetPhysicalDeviceSurfaceCapabilitiesKHR(
     VkPhysicalDevice pd, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* caps)
 {
+    TRACE_FN("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
     SurfaceEntry* e = find_surface(surface);
     if (e) {
         caps->minImageCount = 2;
@@ -1100,6 +1186,7 @@ static VkResult headless_GetPhysicalDeviceSurfaceCapabilitiesKHR(
 static VkResult headless_GetPhysicalDeviceSurfaceFormatsKHR(
     VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t* pCount, VkSurfaceFormatKHR* pFormats)
 {
+    TRACE_FN("vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (find_surface(surface)) {
         if (!pFormats) { *pCount = 1; return VK_SUCCESS; }
         if (*pCount >= 1) {
@@ -1118,6 +1205,7 @@ static VkResult headless_GetPhysicalDeviceSurfaceFormatsKHR(
 static VkResult headless_GetPhysicalDeviceSurfacePresentModesKHR(
     VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t* pCount, VkPresentModeKHR* pModes)
 {
+    TRACE_FN("vkGetPhysicalDeviceSurfacePresentModesKHR");
     if (find_surface(surface)) {
         if (!pModes) { *pCount = 2; return VK_SUCCESS; }
         uint32_t n = *pCount < 2 ? *pCount : 2;
@@ -1129,6 +1217,66 @@ static VkResult headless_GetPhysicalDeviceSurfacePresentModesKHR(
     typedef VkResult (*PFN)(VkPhysicalDevice, VkSurfaceKHR, uint32_t*, VkPresentModeKHR*);
     PFN fn = (PFN)next_instance_proc("vkGetPhysicalDeviceSurfacePresentModesKHR");
     if (fn) return fn(pd, surface, pCount, pModes);
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+/* --- VK_KHR_get_surface_capabilities2 --- */
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR 1000119000
+#define VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR 1000119001
+#define VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR 1000119002
+
+static VkResult headless_GetPhysicalDeviceSurfaceCapabilities2KHR(
+    VkPhysicalDevice pd, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
+    VkSurfaceCapabilities2KHR* pSurfaceCapabilities)
+{
+    TRACE_FN("vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+    LOG("vkGetPhysicalDeviceSurfaceCapabilities2KHR: surface=0x%llx\n",
+        (unsigned long long)(pSurfaceInfo ? pSurfaceInfo->surface : 0));
+
+    if (pSurfaceInfo) {
+        /* Delegate to our existing capabilities handler */
+        VkResult r = headless_GetPhysicalDeviceSurfaceCapabilitiesKHR(
+            pd, pSurfaceInfo->surface, &pSurfaceCapabilities->surfaceCapabilities);
+        if (r == VK_SUCCESS) return VK_SUCCESS;
+    }
+
+    /* Fall through to next layer/ICD for non-headless surfaces */
+    typedef VkResult (*PFN)(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR*,
+                            VkSurfaceCapabilities2KHR*);
+    PFN fn = (PFN)next_instance_proc("vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+    if (fn) return fn(pd, pSurfaceInfo, pSurfaceCapabilities);
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+static VkResult headless_GetPhysicalDeviceSurfaceFormats2KHR(
+    VkPhysicalDevice pd, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
+    uint32_t* pSurfaceFormatCount, VkSurfaceFormat2KHR* pSurfaceFormats)
+{
+    TRACE_FN("vkGetPhysicalDeviceSurfaceFormats2KHR");
+    VkSurfaceKHR surface = pSurfaceInfo ? pSurfaceInfo->surface : 0;
+    LOG("vkGetPhysicalDeviceSurfaceFormats2KHR: surface=0x%llx count=%p formats=%p\n",
+        (unsigned long long)surface, (void*)pSurfaceFormatCount, (void*)pSurfaceFormats);
+
+    if (find_surface(surface)) {
+        if (!pSurfaceFormats) {
+            *pSurfaceFormatCount = 1;
+            return VK_SUCCESS;
+        }
+        if (*pSurfaceFormatCount >= 1) {
+            pSurfaceFormats[0].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+            pSurfaceFormats[0].pNext = NULL;
+            pSurfaceFormats[0].surfaceFormat.format = VK_FORMAT_B8G8R8A8_UNORM;
+            pSurfaceFormats[0].surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+            *pSurfaceFormatCount = 1;
+        }
+        return VK_SUCCESS;
+    }
+
+    typedef VkResult (*PFN)(VkPhysicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR*,
+                            uint32_t*, VkSurfaceFormat2KHR*);
+    PFN fn = (PFN)next_instance_proc("vkGetPhysicalDeviceSurfaceFormats2KHR");
+    if (fn) return fn(pd, pSurfaceInfo, pSurfaceFormatCount, pSurfaceFormats);
     return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
@@ -1167,6 +1315,7 @@ static VkResult headless_CreateSwapchainKHR(
     const VkAllocationCallbacks* pAllocator,
     VkSwapchainKHR* pSwapchain)
 {
+    TRACE_FN("vkCreateSwapchainKHR");
     /* Only handle our surfaces */
     char scbuf[256];
     snprintf(scbuf, sizeof(scbuf), "SC_ENTER surface=0x%lx dev=%p %ux%u fmt=%d",
@@ -1179,7 +1328,7 @@ static VkResult headless_CreateSwapchainKHR(
     if (!surf) {
         layer_marker("SC_NOT_OUR_SURFACE_forwarding");
         typedef VkResult (*PFN)(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*);
-        PFN fn = (PFN)next_device_proc("vkCreateSwapchainKHR");
+        PFN fn = (PFN)next_device_proc_for(device, "vkCreateSwapchainKHR");
         if (fn) return fn(device, pCreateInfo, pAllocator, pSwapchain);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -1205,22 +1354,44 @@ static VkResult headless_CreateSwapchainKHR(
     sc->image_count = pCreateInfo->minImageCount;
     if (sc->image_count > MAX_SC_IMAGES) sc->image_count = MAX_SC_IMAGES;
 
-    /* Get Vulkan functions for image creation */
+    /* Get Vulkan functions for image creation — use THIS device's dispatch */
     typedef VkResult (*PFN_CI)(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage*);
     typedef void (*PFN_GMR)(VkDevice, VkImage, VkMemoryRequirements*);
     typedef VkResult (*PFN_AM)(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory*);
     typedef VkResult (*PFN_BIM)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
     typedef void (*PFN_GSL)(VkDevice, VkImage, const VkImageSubresource*, VkSubresourceLayout*);
 
-    PFN_CI fn_ci = (PFN_CI)next_device_proc("vkCreateImage");
-    PFN_GMR fn_gmr = (PFN_GMR)next_device_proc("vkGetImageMemoryRequirements");
-    PFN_AM fn_am = (PFN_AM)next_device_proc("vkAllocateMemory");
-    PFN_BIM fn_bim = (PFN_BIM)next_device_proc("vkBindImageMemory");
-    PFN_GSL fn_gsl = (PFN_GSL)next_device_proc("vkGetImageSubresourceLayout");
+    layer_marker("SC_RESOLVE_FN_START");
+    PFN_CI fn_ci = (PFN_CI)next_device_proc_for(device, "vkCreateImage");
+    layer_marker("SC_GOT_CI");
+    PFN_GMR fn_gmr = (PFN_GMR)next_device_proc_for(device, "vkGetImageMemoryRequirements");
+    layer_marker("SC_GOT_GMR");
+    PFN_AM fn_am = (PFN_AM)next_device_proc_for(device, "vkAllocateMemory");
+    layer_marker("SC_GOT_AM");
+    PFN_BIM fn_bim = (PFN_BIM)next_device_proc_for(device, "vkBindImageMemory");
+    layer_marker("SC_GOT_BIM");
+    PFN_GSL fn_gsl = (PFN_GSL)next_device_proc_for(device, "vkGetImageSubresourceLayout");
+
+    char dbuf[256];
+    snprintf(dbuf, sizeof(dbuf), "SC_FNS ci=%p gmr=%p am=%p bim=%p gsl=%p",
+             (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim, (void*)fn_gsl);
+    layer_marker(dbuf);
+
+    if (!fn_ci || !fn_gmr || !fn_am || !fn_bim) {
+        LOG("Missing core Vulkan functions! ci=%p gmr=%p am=%p bim=%p gsl=%p dev=%p gdpa=%p\n",
+            (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim, (void*)fn_gsl,
+            device, (void*)gdpa_for_device(device));
+        layer_marker("SC_MISSING_FNS");
+    }
+
+    /* Query memory properties early for diagnostics */
+    query_mem_props();
+    snprintf(dbuf, sizeof(dbuf), "SC_MEMTYPES=%u phys=%p",
+             g_mem_props.memoryTypeCount, g_physical_device);
+    layer_marker(dbuf);
 
     for (uint32_t i = 0; i < sc->image_count; i++) {
         if (!fn_ci || !fn_gmr || !fn_am || !fn_bim) {
-            LOG("Missing core Vulkan functions for image creation!\n");
             break;
         }
 
@@ -1239,7 +1410,14 @@ static VkResult headless_CreateSwapchainKHR(
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = 0; /* UNDEFINED */
 
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_CREATE %ux%u fmt=%d usage=0x%x layers=%u",
+                 i, sc->width, sc->height, ici.format, ici.usage, ici.arrayLayers);
+        layer_marker(dbuf);
+
         VkResult res = fn_ci(device, &ici, NULL, &sc->images[i]);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_RESULT res=%d img=0x%lx",
+                 i, res, (unsigned long)sc->images[i]);
+        layer_marker(dbuf);
         if (res != VK_SUCCESS) {
             LOG("vkCreateImage[%u] failed: %d\n", i, res);
             continue;
@@ -1247,19 +1425,33 @@ static VkResult headless_CreateSwapchainKHR(
 
         VkMemoryRequirements memReq = {0};
         fn_gmr(device, sc->images[i], &memReq);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_MEMREQ size=%lu align=%lu bits=0x%x",
+                 i, (unsigned long)memReq.size, (unsigned long)memReq.alignment, memReq.memoryTypeBits);
+        layer_marker(dbuf);
 
         VkMemoryAllocateInfo ai = {0};
         ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.allocationSize = memReq.size;
         ai.memoryTypeIndex = find_host_visible_mem(memReq.memoryTypeBits);
 
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_ALLOC size=%lu typeIdx=%u",
+                 i, (unsigned long)ai.allocationSize, ai.memoryTypeIndex);
+        layer_marker(dbuf);
+
         res = fn_am(device, &ai, NULL, &sc->memory[i]);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_ALLOC_RESULT res=%d mem=0x%lx",
+                 i, res, (unsigned long)sc->memory[i]);
+        layer_marker(dbuf);
         if (res != VK_SUCCESS) {
             LOG("vkAllocateMemory[%u] failed: %d\n", i, res);
             continue;
         }
 
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_BIND", i);
+        layer_marker(dbuf);
         res = fn_bim(device, sc->images[i], sc->memory[i], 0);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_BIND_RESULT res=%d", i, res);
+        layer_marker(dbuf);
         if (res != VK_SUCCESS) {
             LOG("vkBindImageMemory[%u] failed: %d\n", i, res);
             continue;
@@ -1277,6 +1469,8 @@ static VkResult headless_CreateSwapchainKHR(
         LOG("Image[%u]: 0x%lx, mem=0x%lx, pitch=%lu\n",
             i, (unsigned long)sc->images[i], (unsigned long)sc->memory[i],
             (unsigned long)sc->row_pitch[i]);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_DONE pitch=%lu", i, (unsigned long)sc->row_pitch[i]);
+        layer_marker(dbuf);
     }
 
     pthread_mutex_lock(&g_mutex);
@@ -1295,9 +1489,10 @@ static VkResult headless_CreateSwapchainKHR(
 static void headless_DestroySwapchainKHR(
     VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
 {
+    TRACE_FN("vkDestroySwapchainKHR");
     if (!is_our_swapchain(swapchain)) {
         typedef void (*PFN)(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*);
-        PFN fn = (PFN)next_device_proc("vkDestroySwapchainKHR");
+        PFN fn = (PFN)next_device_proc_for(device, "vkDestroySwapchainKHR");
         if (fn) fn(device, swapchain, pAllocator);
         return;
     }
@@ -1323,9 +1518,9 @@ static void headless_DestroySwapchainKHR(
     typedef void (*PFN_DI)(VkDevice, VkImage, const VkAllocationCallbacks*);
     typedef void (*PFN_FM)(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*);
 
-    PFN_WI fn_wait = (PFN_WI)next_device_proc("vkDeviceWaitIdle");
-    PFN_DI fn_di = (PFN_DI)next_device_proc("vkDestroyImage");
-    PFN_FM fn_fm = (PFN_FM)next_device_proc("vkFreeMemory");
+    PFN_WI fn_wait = (PFN_WI)next_device_proc_for(dev, "vkDeviceWaitIdle");
+    PFN_DI fn_di = (PFN_DI)next_device_proc_for(dev, "vkDestroyImage");
+    PFN_FM fn_fm = (PFN_FM)next_device_proc_for(dev, "vkFreeMemory");
 
     if (fn_wait) fn_wait(dev);
     for (uint32_t i = 0; i < to_free->image_count; i++) {
@@ -1339,10 +1534,11 @@ static void headless_DestroySwapchainKHR(
 static VkResult headless_GetSwapchainImagesKHR(
     VkDevice device, VkSwapchainKHR swapchain, uint32_t* pCount, VkImage* pImages)
 {
+    TRACE_FN("vkGetSwapchainImagesKHR");
     SwapchainEntry* sc = find_swapchain(swapchain);
     if (!sc) {
         typedef VkResult (*PFN)(VkDevice, VkSwapchainKHR, uint32_t*, VkImage*);
-        PFN fn = (PFN)next_device_proc("vkGetSwapchainImagesKHR");
+        PFN fn = (PFN)next_device_proc_for(device, "vkGetSwapchainImagesKHR");
         if (fn) return fn(device, swapchain, pCount, pImages);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -1357,10 +1553,11 @@ static VkResult headless_AcquireNextImageKHR(
     VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
     VkSemaphore sem, VkFence fence, uint32_t* pImageIndex)
 {
+    TRACE_FN("vkAcquireNextImageKHR");
     SwapchainEntry* sc = find_swapchain(swapchain);
     if (!sc) {
         typedef VkResult (*PFN)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*);
-        PFN fn = (PFN)next_device_proc("vkAcquireNextImageKHR");
+        PFN fn = (PFN)next_device_proc_for(device, "vkAcquireNextImageKHR");
         if (fn) return fn(device, swapchain, timeout, sem, fence, pImageIndex);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -1373,6 +1570,7 @@ static int g_present_count = 0;
 
 static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
+    TRACE_FN("vkQueuePresentKHR");
     if (g_present_count < 3) {
         char pbuf[128];
         snprintf(pbuf, sizeof(pbuf), "QueuePresent #%d swapchains=%u", g_present_count, pPresentInfo->swapchainCount);
@@ -1394,15 +1592,15 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
         if (idx < sc->image_count && sc->memory[idx]) {
             /* Wait for GPU */
             typedef VkResult (*PFN_QWI)(VkQueue);
-            PFN_QWI fn_qwi = (PFN_QWI)next_device_proc("vkQueueWaitIdle");
+            PFN_QWI fn_qwi = (PFN_QWI)next_device_proc_for(sc->device, "vkQueueWaitIdle");
             if (fn_qwi && queue) fn_qwi(queue);
 
             /* Map and send */
             typedef VkResult (*PFN_MM)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
             typedef void (*PFN_UM)(VkDevice, VkDeviceMemory);
 
-            PFN_MM fn_map = (PFN_MM)next_device_proc("vkMapMemory");
-            PFN_UM fn_unmap = (PFN_UM)next_device_proc("vkUnmapMemory");
+            PFN_MM fn_map = (PFN_MM)next_device_proc_for(sc->device, "vkMapMemory");
+            PFN_UM fn_unmap = (PFN_UM)next_device_proc_for(sc->device, "vkUnmapMemory");
 
             if (fn_map && fn_unmap) {
                 void* mapped = NULL;
@@ -1487,6 +1685,16 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
     VkResult res = fn(pd, pLayerName, &real_count, NULL);
     if (res != VK_SUCCESS) return res;
 
+    /* Extensions to filter OUT — these cause crashes through FEX thunks.
+     * VK_KHR_map_memory2 + VK_EXT_map_memory_placed: Wine uses placed memory
+     * mapping (vkMapMemory2KHR with VK_MEMORY_MAP_PLACED_BIT_EXT) when it sees
+     * these, but the placed path crashes through FEX thunks/Vortek. */
+    static const char* filter_exts[] = {
+        "VK_KHR_map_memory2",
+        "VK_EXT_map_memory_placed",
+    };
+    static const int num_filter = sizeof(filter_exts) / sizeof(filter_exts[0]);
+
     /* Extensions to inject if missing */
     static const struct { const char* name; uint32_t specVersion; } inject_exts[] = {
         { "VK_KHR_swapchain", 70 },
@@ -1502,37 +1710,62 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
     };
     static const int num_inject = sizeof(inject_exts) / sizeof(inject_exts[0]);
 
-    /* Check which extensions are already present */
+    /* Fetch all real extensions into temp buffer for filtering */
     int has_ext[sizeof(inject_exts) / sizeof(inject_exts[0])];
     memset(has_ext, 0, sizeof(has_ext));
     int need_inject = 0;
+    int num_filtered = 0;
 
+    VkExtensionProperties* tmp = NULL;
+    uint32_t tc = 0;
     if (real_count > 0) {
-        VkExtensionProperties* tmp = malloc(real_count * sizeof(VkExtensionProperties));
+        tmp = malloc(real_count * sizeof(VkExtensionProperties));
         if (tmp) {
-            uint32_t tc = real_count;
+            tc = real_count;
             fn(pd, pLayerName, &tc, tmp);
             for (uint32_t i = 0; i < tc; i++) {
-                for (int j = 0; j < num_inject; j++) {
-                    if (strcmp(tmp[i].extensionName, inject_exts[j].name) == 0)
-                        has_ext[j] = 1;
+                /* Check if this extension should be filtered out */
+                int filtered = 0;
+                for (int f = 0; f < num_filter; f++) {
+                    if (strcmp(tmp[i].extensionName, filter_exts[f]) == 0) {
+                        filtered = 1;
+                        num_filtered++;
+                        LOG("Filtering out device extension: %s\n", tmp[i].extensionName);
+                        break;
+                    }
+                }
+                if (!filtered) {
+                    for (int j = 0; j < num_inject; j++) {
+                        if (strcmp(tmp[i].extensionName, inject_exts[j].name) == 0)
+                            has_ext[j] = 1;
+                    }
                 }
             }
-            free(tmp);
         }
     }
 
     for (int j = 0; j < num_inject; j++)
         if (!has_ext[j]) need_inject++;
 
-    uint32_t total = real_count + need_inject;
-    if (!pProps) { *pCount = total; return VK_SUCCESS; }
+    uint32_t total = (tc - num_filtered) + need_inject;
+    if (!pProps) { *pCount = total; free(tmp); return VK_SUCCESS; }
 
-    uint32_t get = *pCount < real_count ? *pCount : real_count;
-    res = fn(pd, pLayerName, &get, pProps);
+    /* Copy non-filtered extensions */
+    uint32_t idx = 0;
+    for (uint32_t i = 0; i < tc && idx < *pCount; i++) {
+        int filtered = 0;
+        for (int f = 0; f < num_filter; f++) {
+            if (strcmp(tmp[i].extensionName, filter_exts[f]) == 0) {
+                filtered = 1;
+                break;
+            }
+        }
+        if (!filtered)
+            pProps[idx++] = tmp[i];
+    }
+    free(tmp);
 
-    /* Append missing extensions */
-    uint32_t idx = get;
+    /* Append missing injected extensions */
     for (int j = 0; j < num_inject && idx < *pCount; j++) {
         if (!has_ext[j]) {
             strncpy(pProps[idx].extensionName, inject_exts[j].name, VK_MAX_EXTENSION_NAME_SIZE);
@@ -1579,7 +1812,7 @@ static VkResult headless_CreateInstance(
     const VkAllocationCallbacks* pAllocator,
     VkInstance* pInstance)
 {
-    layer_marker("CI_ENTER");
+    TRACE_FN("vkCreateInstance");
     LOG("vkCreateInstance intercepted (%u extensions requested)\n",
         pCreateInfo->enabledExtensionCount);
 
@@ -1727,6 +1960,7 @@ static VkResult headless_CreateDevice(
     const VkAllocationCallbacks* pAllocator,
     VkDevice* pDevice)
 {
+    TRACE_FN("vkCreateDevice");
     char buf[256];
     snprintf(buf, sizeof(buf), "CD_ENTER phys=%p g_instance=%p exts=%u",
              physicalDevice, g_instance, pCreateInfo->enabledExtensionCount);
@@ -1791,6 +2025,13 @@ static VkResult headless_CreateDevice(
             continue;
         }
 
+        /* Filter extensions that crash through FEX thunks */
+        if (strcmp(ext, "VK_KHR_map_memory2") == 0 ||
+            strcmp(ext, "VK_EXT_map_memory_placed") == 0) {
+            LOG("Filtering dangerous extension: %s\n", ext);
+            continue;
+        }
+
         /* Check if ICD actually supports this extension */
         int icd_has_it = 0;
         for (uint32_t j = 0; j < icd_ext_count && icd_exts; j++) {
@@ -1825,7 +2066,13 @@ static VkResult headless_CreateDevice(
     if (result == VK_SUCCESS) {
         g_next_gdpa = next_gdpa;
         g_device = *pDevice;
-        LOG("Device created: %p\n", *pDevice);
+        /* Store in per-device table */
+        if (g_device_count < MAX_LAYER_DEVICES) {
+            g_device_table[g_device_count].device = *pDevice;
+            g_device_table[g_device_count].gdpa = next_gdpa;
+            g_device_count++;
+        }
+        LOG("Device created: %p (tracked %d devices)\n", *pDevice, g_device_count);
         snprintf(buf, sizeof(buf), "CD_OK device=%p gdpa=%p", *pDevice, (void*)next_gdpa);
         layer_marker(buf);
     } else {
@@ -1836,11 +2083,35 @@ static VkResult headless_CreateDevice(
 }
 
 static void headless_DestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
+    TRACE_FN("vkDestroyDevice");
+    /* Use THIS device's GDPA to resolve vkDestroyDevice */
     typedef void (*PFN)(VkDevice, const VkAllocationCallbacks*);
-    PFN fn = (PFN)next_device_proc("vkDestroyDevice");
+    PFN fn = (PFN)next_device_proc_for(device, "vkDestroyDevice");
     if (fn) fn(device, pAllocator);
-    g_device = NULL;
-    g_next_gdpa = NULL;
+
+    /* Remove from per-device table */
+    for (int i = 0; i < g_device_count; i++) {
+        if (g_device_table[i].device == device) {
+            /* Shift remaining entries down */
+            for (int j = i; j < g_device_count - 1; j++)
+                g_device_table[j] = g_device_table[j + 1];
+            g_device_count--;
+            break;
+        }
+    }
+
+    /* Only clear globals if THIS was the global device */
+    if (g_device == device) {
+        if (g_device_count > 0) {
+            /* Point globals to another live device */
+            g_device = g_device_table[g_device_count - 1].device;
+            g_next_gdpa = g_device_table[g_device_count - 1].gdpa;
+        } else {
+            g_device = NULL;
+            g_next_gdpa = NULL;
+        }
+    }
+    LOG("Device destroyed: %p (remaining %d devices)\n", device, g_device_count);
 }
 
 /* ============================================================================
@@ -1884,8 +2155,12 @@ static PFN_vkVoidFunction headless_GetPhysicalDeviceProcAddr(VkInstance instance
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceSupportKHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceCapabilities2KHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceFormatsKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormats2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceFormats2KHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfacePresentModesKHR;
 
@@ -1951,8 +2226,12 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceSupportKHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilities2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceCapabilities2KHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceFormatsKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormats2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfaceFormats2KHR;
     if (strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceSurfacePresentModesKHR;
 
@@ -2053,13 +2332,41 @@ static VkResult headless_EndCommandBuffer(VkCommandBuffer cmdBuf) {
 }
 
 static VkResult headless_AllocateCommandBuffers(VkDevice dev, const void* pInfo, VkCommandBuffer* pBufs) {
-    LOG("vkAllocateCommandBuffers ENTER\n");
+    TRACE_FN("vkAllocateCommandBuffers");
+    /* VkCommandBufferAllocateInfo layout on x86-64:
+     * offset 0: sType(4) + pad(4), offset 8: pNext(8),
+     * offset 16: commandPool(8), offset 24: level(4), offset 28: count(4) */
+    uint64_t pool = 0;
+    uint32_t level = 0, count = 0;
+    if (pInfo) {
+        pool = *(const uint64_t*)((const char*)pInfo + 16);
+        level = *(const uint32_t*)((const char*)pInfo + 24);
+        count = *(const uint32_t*)((const char*)pInfo + 28);
+    }
+    LOG("vkAllocateCommandBuffers: dev=%p pool=0x%llx level=%u count=%u pBufs=%p\n",
+        dev, (unsigned long long)pool, level, count, (void*)pBufs);
+    char tbuf[256];
+    snprintf(tbuf, sizeof(tbuf), "ACB dev=%p pool=0x%llx count=%u pBufs=%p real=%p",
+             dev, (unsigned long long)pool, count, (void*)pBufs, (void*)g_real_AllocCmdBufs);
+    layer_marker(tbuf);
+
+    if (!g_real_AllocCmdBufs) {
+        LOG("vkAllocateCommandBuffers: g_real_AllocCmdBufs is NULL!\n");
+        layer_marker("ACB_NULL_REAL_FN");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    layer_marker("ACB_CALLING");
     VkResult r = g_real_AllocCmdBufs(dev, pInfo, pBufs);
+    snprintf(tbuf, sizeof(tbuf), "ACB_RESULT=%d cmdBuf0=%p", r,
+             (pBufs && count > 0) ? (void*)*pBufs : NULL);
+    layer_marker(tbuf);
     LOG("vkAllocateCommandBuffers result=%d cmdBuf=%p\n", r, pBufs ? *pBufs : NULL);
     return r;
 }
 
 static VkResult headless_QueueSubmit(VkQueue queue, uint32_t submitCount, const void* pSubmits, uint64_t fence) {
+    TRACE_FN("vkQueueSubmit");
     LOG("vkQueueSubmit (queue=%p, submits=%u) ENTER\n", queue, submitCount);
     VkResult r = g_real_QueueSubmit(queue, submitCount, pSubmits, fence);
     LOG("vkQueueSubmit result=%d DONE\n", r);
@@ -2067,14 +2374,63 @@ static VkResult headless_QueueSubmit(VkQueue queue, uint32_t submitCount, const 
 }
 
 static VkResult headless_CreateCommandPool(VkDevice dev, const void* pInfo, const void* pAlloc, VkCommandPool* pPool) {
-    LOG("vkCreateCommandPool ENTER\n");
+    TRACE_FN("vkCreateCommandPool");
+    LOG("vkCreateCommandPool: dev=%p pInfo=%p pAlloc=%p pPool=%p real=%p\n",
+        dev, pInfo, pAlloc, (void*)pPool, (void*)g_real_CreateCmdPool);
+    if (!g_real_CreateCmdPool) {
+        LOG("vkCreateCommandPool: g_real_CreateCmdPool is NULL!\n");
+        layer_marker("CCP_NULL_REAL_FN");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    layer_marker("CCP_CALLING");
     VkResult r = g_real_CreateCmdPool(dev, pInfo, pAlloc, pPool);
-    LOG("vkCreateCommandPool result=%d pool=%p\n", r, pPool ? *pPool : NULL);
+    char tbuf[128];
+    snprintf(tbuf, sizeof(tbuf), "CCP_RESULT=%d pool=0x%llx",
+             r, (unsigned long long)(pPool ? *pPool : 0));
+    layer_marker(tbuf);
+    LOG("vkCreateCommandPool result=%d pool=0x%llx\n", r, (unsigned long long)(pPool ? *pPool : 0));
     return r;
 }
 
+/* Logged wrappers for common device functions — helps identify which call
+ * triggers Wine's PE→Unix assertion before reaching our layer/ICD */
+typedef VkResult (*PFN_vkCreateFence)(VkDevice, const void*, const void*, uint64_t*);
+typedef VkResult (*PFN_vkCreateSemaphore)(VkDevice, const void*, const void*, uint64_t*);
+typedef VkResult (*PFN_vkCreateEvent)(VkDevice, const void*, const void*, uint64_t*);
+typedef void (*PFN_vkDestroyFence)(VkDevice, uint64_t, const void*);
+typedef void (*PFN_vkDestroySemaphore)(VkDevice, uint64_t, const void*);
+typedef VkResult (*PFN_vkWaitForFences)(VkDevice, uint32_t, const uint64_t*, uint32_t, uint64_t);
+typedef VkResult (*PFN_vkResetFences)(VkDevice, uint32_t, const uint64_t*);
+
+static PFN_vkCreateFence g_real_CreateFence = NULL;
+static PFN_vkCreateSemaphore g_real_CreateSemaphore = NULL;
+
+static VkResult headless_wrap_CreateFence(VkDevice dev, const void* ci, const void* alloc, uint64_t* out) {
+    TRACE_FN("vkCreateFence");
+    VkResult r = g_real_CreateFence(dev, ci, alloc, out);
+    LOG("vkCreateFence: result=%d handle=0x%llx\n", r, out ? (unsigned long long)*out : 0);
+    return r;
+}
+
+static VkResult headless_wrap_CreateSemaphore(VkDevice dev, const void* ci, const void* alloc, uint64_t* out) {
+    TRACE_FN("vkCreateSemaphore");
+    VkResult r = g_real_CreateSemaphore(dev, ci, alloc, out);
+    LOG("vkCreateSemaphore: result=%d handle=0x%llx\n", r, out ? (unsigned long long)*out : 0);
+    return r;
+}
+
+static int gdpa_log_count = 0;
+
 static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char* pName)
 {
+    /* Log ALL GDPA lookups to trace file for diagnostics */
+    gdpa_log_count++;
+    if (gdpa_log_count <= 500) {
+        char tbuf[256];
+        snprintf(tbuf, sizeof(tbuf), "GDPA[%d] dev=%p %s", gdpa_log_count, device, pName ? pName : "(null)");
+        layer_marker(tbuf);
+    }
+
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (PFN_vkVoidFunction)headless_GetDeviceProcAddr;
     if (strcmp(pName, "vkDestroyDevice") == 0)
@@ -2101,6 +2457,20 @@ static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char
             g_real_CreateCmdPool = (PFN_vkCreateCommandPool)g_next_gdpa(device, pName);
         if (g_real_CreateCmdPool)
             return (PFN_vkVoidFunction)headless_CreateCommandPool;
+    }
+
+    /* Device function call tracing — intercept common create functions */
+    if (strcmp(pName, "vkCreateFence") == 0) {
+        if (!g_real_CreateFence && g_next_gdpa)
+            g_real_CreateFence = (PFN_vkCreateFence)g_next_gdpa(device, pName);
+        if (g_real_CreateFence)
+            return (PFN_vkVoidFunction)headless_wrap_CreateFence;
+    }
+    if (strcmp(pName, "vkCreateSemaphore") == 0) {
+        if (!g_real_CreateSemaphore && g_next_gdpa)
+            g_real_CreateSemaphore = (PFN_vkCreateSemaphore)g_next_gdpa(device, pName);
+        if (g_real_CreateSemaphore)
+            return (PFN_vkVoidFunction)headless_wrap_CreateSemaphore;
     }
 
     /* Swapchain */
@@ -2152,8 +2522,9 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
     return VK_SUCCESS;
 }
 
-/* Constructor: log that the layer .so was loaded */
+/* Constructor: log that the layer .so was loaded + install SIGABRT handler */
 __attribute__((constructor))
 static void layer_init(void) {
     LOG("Vulkan headless surface layer loaded (pid=%d)\n", getpid());
+    signal(SIGABRT, sigabrt_handler);
 }

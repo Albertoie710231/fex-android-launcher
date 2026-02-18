@@ -375,6 +375,103 @@ static VkResult logged_ResetCommandBuffer(void* cmdBuf, uint32_t flags) {
     return r;
 }
 
+/* ---- Diagnostic: vkMapMemory / vkAllocateMemory / vkGetDeviceQueue ---- */
+
+typedef VkResult (*PFN_vkMapMemory)(void* device, uint64_t memory, uint64_t offset,
+                                     uint64_t size, uint32_t flags, void** ppData);
+typedef VkResult (*PFN_vkAllocMemory)(void* device, const void* pAllocInfo,
+                                       const void* pAllocator, uint64_t* pMemory);
+typedef void (*PFN_vkGetDeviceQueue)(void* device, uint32_t qfi, uint32_t qi, void** pQueue);
+
+static PFN_vkMapMemory real_map_memory = NULL;
+static PFN_vkAllocMemory real_alloc_memory = NULL;
+static PFN_vkGetDeviceQueue real_get_device_queue = NULL;
+
+static VkResult logged_MapMemory(void* device, uint64_t memory, uint64_t offset,
+                                  uint64_t size, uint32_t flags, void** ppData) {
+    LOG("vkMapMemory: dev=%p mem=0x%llx off=%llu size=%llu flags=0x%x\n",
+        device, (unsigned long long)memory, (unsigned long long)offset,
+        (unsigned long long)size, flags);
+    VkResult r = real_map_memory(device, memory, offset, size, flags, ppData);
+    LOG("vkMapMemory: result=%d ppData=%p\n", r, ppData ? *ppData : NULL);
+    return r;
+}
+
+static VkResult logged_AllocateMemory(void* device, const void* pAllocInfo,
+                                       const void* pAllocator, uint64_t* pMemory) {
+    /* VkMemoryAllocateInfo: sType(4) + pad(4) + pNext(8) + allocationSize(8) + memoryTypeIndex(4)
+     * On x86-64: offset 0=sType, 8=pNext(ptr), 16=allocationSize, 24=memoryTypeIndex */
+    uint64_t allocSize = 0;
+    uint32_t memTypeIdx = 0;
+    if (pAllocInfo) {
+        allocSize = *(const uint64_t*)((const char*)pAllocInfo + 16);
+        memTypeIdx = *(const uint32_t*)((const char*)pAllocInfo + 24);
+    }
+    LOG("vkAllocateMemory: dev=%p size=%llu typeIdx=%u\n",
+        device, (unsigned long long)allocSize, memTypeIdx);
+    VkResult r = real_alloc_memory(device, pAllocInfo, pAllocator, pMemory);
+    LOG("vkAllocateMemory: result=%d mem=0x%llx\n", r, pMemory ? (unsigned long long)*pMemory : 0);
+    return r;
+}
+
+static void logged_GetDeviceQueue(void* device, uint32_t qfi, uint32_t qi, void** pQueue) {
+    real_get_device_queue(device, qfi, qi, pQueue);
+    LOG("vkGetDeviceQueue: dev=%p qfi=%u qi=%u queue=%p dispatch=%p\n",
+        device, qfi, qi, pQueue ? *pQueue : NULL,
+        (pQueue && *pQueue) ? *(void**)*pQueue : NULL);
+}
+
+/* ---- Diagnostic: logged wrapper for vkAllocateCommandBuffers ---- */
+
+typedef VkResult (*PFN_vkAllocCmdBufs)(void* device, const void* pAllocInfo,
+                                        void** pCmdBufs);
+static PFN_vkAllocCmdBufs real_alloc_cmdbufs = NULL;
+
+static VkResult logged_AllocateCommandBuffers(void* device, const void* pAllocInfo,
+                                               void** pCmdBufs) {
+    /* VkCommandBufferAllocateInfo on x86-64:
+     * offset 0: sType(4), offset 8: pNext(8), offset 16: commandPool(8),
+     * offset 24: level(4), offset 28: commandBufferCount(4) */
+    uint64_t pool = 0;
+    uint32_t count = 0;
+    if (pAllocInfo) {
+        pool = *(const uint64_t*)((const char*)pAllocInfo + 16);
+        count = *(const uint32_t*)((const char*)pAllocInfo + 28);
+    }
+    LOG("vkAllocateCommandBuffers: dev=%p pool=0x%llx count=%u dispatch@0=%p\n",
+        device, (unsigned long long)pool, count,
+        device ? *(void**)device : NULL);
+    icd_marker("ICD_ACB_ENTER");
+    VkResult r = real_alloc_cmdbufs(device, pAllocInfo, pCmdBufs);
+    LOG("vkAllocateCommandBuffers: result=%d cmdBuf0=%p\n", r,
+        (pCmdBufs && count > 0) ? pCmdBufs[0] : NULL);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "ICD_ACB_RESULT=%d", r);
+    icd_marker(buf);
+    return r;
+}
+
+/* ---- Diagnostic: logged wrapper for vkCreateCommandPool ---- */
+
+typedef VkResult (*PFN_vkCreateCmdPool)(void* device, const void* pCreateInfo,
+                                         const void* pAllocator, uint64_t* pPool);
+static PFN_vkCreateCmdPool real_create_cmdpool = NULL;
+
+static VkResult logged_CreateCommandPool(void* device, const void* pCreateInfo,
+                                          const void* pAllocator, uint64_t* pPool) {
+    LOG("vkCreateCommandPool: dev=%p dispatch@0=%p\n",
+        device, device ? *(void**)device : NULL);
+    icd_marker("ICD_CCP_ENTER");
+    VkResult r = real_create_cmdpool(device, pCreateInfo, pAllocator, pPool);
+    LOG("vkCreateCommandPool: result=%d pool=0x%llx\n", r,
+        pPool ? (unsigned long long)*pPool : 0);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "ICD_CCP_RESULT=%d pool=0x%llx", r,
+             pPool ? (unsigned long long)*pPool : 0);
+    icd_marker(buf);
+    return r;
+}
+
 /* ---- Standard init ---- */
 
 static void ensure_init(void) {
@@ -528,6 +625,19 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         fn = (PFN_vkVoidFunction)dlsym(thunk_lib, pName);
     }
 
+    /* Block extensions that Wine misuses — placed memory mapping crashes through
+     * FEX thunks. Wine's wine_vkMapMemory checks if p_vkMapMemory2KHR is non-NULL
+     * (via GDPA), and if so, uses VK_MEMORY_MAP_PLACED_BIT_EXT for ALL mappings.
+     * Since our GIPA returns non-NULL for these (thunk exposes them), Wine thinks
+     * placed mapping is available, but it crashes because Vortek/thunks don't
+     * properly support VK_EXT_map_memory_placed. Returning NULL forces Wine to
+     * fall back to standard vkMapMemory, which works fine through our trampolines. */
+    if (strcmp(pName, "vkMapMemory2KHR") == 0 ||
+        strcmp(pName, "vkUnmapMemory2KHR") == 0) {
+        LOG("GDPA: %s -> NULL (blocked: placed memory not supported through thunks)\n", pName);
+        return NULL;
+    }
+
     /* Self-reference */
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         return (PFN_vkVoidFunction)wrapped_GDPA;
@@ -539,7 +649,18 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         return (PFN_vkVoidFunction)wrapped_DestroyDevice;
     }
 
-    if (!fn) return NULL;
+    if (!fn) {
+        /* Log NULL returns for important functions — thunk may not expose them */
+        if (strncmp(pName, "vkMap", 5) == 0 || strncmp(pName, "vkAlloc", 7) == 0 ||
+            strncmp(pName, "vkFree", 6) == 0 || strncmp(pName, "vkUnmap", 7) == 0 ||
+            strncmp(pName, "vkFlush", 7) == 0 || strncmp(pName, "vkInvalidate", 12) == 0 ||
+            strncmp(pName, "vkBind", 6) == 0 || strncmp(pName, "vkGet", 5) == 0 ||
+            strncmp(pName, "vkCreate", 8) == 0 || strncmp(pName, "vkDestroy", 9) == 0 ||
+            strncmp(pName, "vkQueue", 7) == 0) {
+            LOG("GDPA[%d]: %s -> NULL (thunk doesn't expose!)\n", gdpa_count, pName);
+        }
+        return NULL;
+    }
 
     /* VkCommandBuffer functions: need lock-free dispatch fixup (loader patches
      * *(void**)cmdBuf just like device/queue) + diagnostic logging for key ones. */
@@ -568,16 +689,46 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         return tramp;
     }
 
+    /* Diagnostic: logged wrappers for memory and queue operations */
+    if (strcmp(pName, "vkMapMemory") == 0) {
+        real_map_memory = (PFN_vkMapMemory)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline((PFN_vkVoidFunction)logged_MapMemory);
+        LOG("GDPA: vkMapMemory -> %p (logged tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (strcmp(pName, "vkAllocateMemory") == 0) {
+        real_alloc_memory = (PFN_vkAllocMemory)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline((PFN_vkVoidFunction)logged_AllocateMemory);
+        LOG("GDPA: vkAllocateMemory -> %p (logged tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (strcmp(pName, "vkGetDeviceQueue") == 0) {
+        real_get_device_queue = (PFN_vkGetDeviceQueue)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline((PFN_vkVoidFunction)logged_GetDeviceQueue);
+        LOG("GDPA: vkGetDeviceQueue -> %p (logged tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+
+    /* Diagnostic: logged wrappers for command buffer and pool operations */
+    if (strcmp(pName, "vkAllocateCommandBuffers") == 0) {
+        real_alloc_cmdbufs = (PFN_vkAllocCmdBufs)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline((PFN_vkVoidFunction)logged_AllocateCommandBuffers);
+        LOG("GDPA: vkAllocateCommandBuffers -> %p (logged tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+    if (strcmp(pName, "vkCreateCommandPool") == 0) {
+        real_create_cmdpool = (PFN_vkCreateCmdPool)fn;
+        PFN_vkVoidFunction tramp = make_dispatch_trampoline((PFN_vkVoidFunction)logged_CreateCommandPool);
+        LOG("GDPA: vkCreateCommandPool -> %p (logged tramp=%p)\n", (void*)fn, (void*)tramp);
+        return tramp;
+    }
+
     /* All other device/queue functions: generate dispatch-fixing trampoline.
      * VkQueue functions need this too — the loader patches *(void**)queue. */
     PFN_vkVoidFunction tramp = make_dispatch_trampoline(fn);
-    if (gdpa_count <= 10 ||
-        strncmp(pName, "vkQueue", 7) == 0 ||
-        strncmp(pName, "vkGetDeviceQueue", 16) == 0 ||
-        strncmp(pName, "vkCreate", 8) == 0) {
-        LOG("GDPA[%d]: %s -> %p (trampoline=%p)\n", gdpa_count, pName,
-            (void*)fn, (void*)tramp);
-    }
+    /* Log ALL GDPA lookups — essential for diagnosing PE→Unix assertion failures */
+    LOG("GDPA[%d]: %s -> %p (trampoline=%p)\n", gdpa_count, pName,
+        (void*)fn, (void*)tramp);
     return tramp;
 }
 
