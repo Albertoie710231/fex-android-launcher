@@ -89,8 +89,34 @@ typedef uint64_t VkDeviceSize;
 #define VK_SAMPLE_COUNT_1_BIT 1
 #define VK_IMAGE_TILING_LINEAR 1
 #define VK_SHARING_MODE_EXCLUSIVE 0
+#define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT 0x01
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 0x02
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 0x04
+#define VK_IMAGE_TILING_OPTIMAL 0
+#define VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO 12
+#define VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO 39
+#define VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO 40
+#define VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO 42
+#define VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER 46
+#define VK_BUFFER_USAGE_TRANSFER_DST_BIT 0x00000002
+#define VK_COMMAND_BUFFER_LEVEL_PRIMARY 0
+#define VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 0x00000002
+#define VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT 0x00000001
+#define VK_IMAGE_LAYOUT_UNDEFINED 0
+#define VK_IMAGE_LAYOUT_GENERAL 1
+#define VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL 6
+#define VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL 7
+#define VK_IMAGE_LAYOUT_PRESENT_SRC_KHR 1000001002
+#define VK_IMAGE_ASPECT_COLOR_BIT 0x00000001
+#define VK_ACCESS_TRANSFER_READ_BIT 0x00000800
+#define VK_ACCESS_TRANSFER_WRITE_BIT 0x00001000
+#define VK_ACCESS_MEMORY_READ_BIT 0x00008000
+#define VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT 0x00000100
+#define VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT 0x00000400
+#define VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT 0x00000001
+#define VK_PIPELINE_STAGE_TRANSFER_BIT 0x00001000
+#define VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT 0x00002000
+#define VK_QUEUE_FAMILY_IGNORED 0xFFFFFFFF
 
 typedef int VkResult;
 typedef void* VkInstance;
@@ -109,6 +135,55 @@ typedef void VkAllocationCallbacks;
 
 typedef void* VkCommandBuffer;
 typedef void* VkCommandPool;
+typedef uint64_t VkBuffer;
+
+/* Structures for staging buffer readback (OPTIMAL → CPU) */
+typedef struct VkBufferCreateInfo {
+    int sType; const void* pNext; VkFlags flags;
+    VkDeviceSize size; VkFlags usage; int sharingMode;
+    uint32_t queueFamilyIndexCount; const uint32_t* pQueueFamilyIndices;
+} VkBufferCreateInfo;
+
+typedef struct VkImageSubresourceLayers {
+    uint32_t aspectMask; uint32_t mipLevel;
+    uint32_t baseArrayLayer; uint32_t layerCount;
+} VkImageSubresourceLayers;
+
+typedef struct VkBufferImageCopy {
+    VkDeviceSize bufferOffset; uint32_t bufferRowLength; uint32_t bufferImageHeight;
+    VkImageSubresourceLayers imageSubresource;
+    struct { int32_t x, y, z; } imageOffset;
+    struct { uint32_t width, height, depth; } imageExtent;
+} VkBufferImageCopy;
+
+typedef struct VkImageSubresourceRange {
+    VkFlags aspectMask; uint32_t baseMipLevel; uint32_t levelCount;
+    uint32_t baseArrayLayer; uint32_t layerCount;
+} VkImageSubresourceRange;
+
+typedef struct VkImageMemoryBarrier {
+    int sType; const void* pNext;
+    VkFlags srcAccessMask; VkFlags dstAccessMask;
+    int oldLayout; int newLayout;
+    uint32_t srcQueueFamilyIndex; uint32_t dstQueueFamilyIndex;
+    VkImage image;
+    VkImageSubresourceRange subresourceRange;
+} VkImageMemoryBarrier;
+
+typedef struct VkCommandPoolCreateInfo_t {
+    int sType; const void* pNext; VkFlags flags;
+    uint32_t queueFamilyIndex;
+} VkCommandPoolCreateInfo_t;
+
+typedef struct VkCommandBufferAllocateInfo_t {
+    int sType; const void* pNext;
+    VkCommandPool commandPool; int level; uint32_t commandBufferCount;
+} VkCommandBufferAllocateInfo_t;
+
+typedef struct VkCommandBufferBeginInfo_t {
+    int sType; const void* pNext; VkFlags flags;
+    const void* pInheritanceInfo;
+} VkCommandBufferBeginInfo_t;
 
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char*);
 typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char*);
@@ -688,6 +763,12 @@ typedef struct SwapchainEntry {
     int format;
     uint32_t current_image;
     VkQueue signal_queue;           /* for signaling acquire semaphore/fence */
+    /* Staging buffer for OPTIMAL image → CPU readback */
+    VkBuffer staging_buf;
+    VkDeviceMemory staging_mem;
+    VkDeviceSize staging_size;
+    VkCommandPool copy_pool;
+    VkCommandBuffer copy_cmd;
     struct SwapchainEntry* next;
 } SwapchainEntry;
 
@@ -1358,6 +1439,20 @@ static uint32_t find_host_visible_mem(uint32_t typeBits) {
     return 0;
 }
 
+static uint32_t find_device_local_mem(uint32_t typeBits) {
+    query_mem_props();
+    uint32_t want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    for (uint32_t i = 0; i < g_mem_props.memoryTypeCount; i++) {
+        if ((typeBits & (1u << i)) && (g_mem_props.memoryTypes[i].propertyFlags & want) == want)
+            return i;
+    }
+    /* Fallback: first compatible type */
+    for (uint32_t i = 0; i < 32; i++) {
+        if (typeBits & (1u << i)) return i;
+    }
+    return 0;
+}
+
 static VkResult headless_CreateSwapchainKHR(
     VkDevice device,
     const VkSwapchainCreateInfoKHR* pCreateInfo,
@@ -1403,32 +1498,32 @@ static VkResult headless_CreateSwapchainKHR(
     sc->image_count = pCreateInfo->minImageCount;
     if (sc->image_count > MAX_SC_IMAGES) sc->image_count = MAX_SC_IMAGES;
 
-    /* Get Vulkan functions for image creation — use THIS device's dispatch */
+    /* Get Vulkan functions for image/buffer creation — use THIS device's dispatch */
     typedef VkResult (*PFN_CI)(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage*);
     typedef void (*PFN_GMR)(VkDevice, VkImage, VkMemoryRequirements*);
     typedef VkResult (*PFN_AM)(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory*);
     typedef VkResult (*PFN_BIM)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
-    typedef void (*PFN_GSL)(VkDevice, VkImage, const VkImageSubresource*, VkSubresourceLayout*);
+    typedef VkResult (*PFN_CB)(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer*);
+    typedef void (*PFN_GBMR)(VkDevice, VkBuffer, VkMemoryRequirements*);
+    typedef VkResult (*PFN_BBM)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
 
     layer_marker("SC_RESOLVE_FN_START");
     PFN_CI fn_ci = (PFN_CI)next_device_proc_for(device, "vkCreateImage");
-    layer_marker("SC_GOT_CI");
     PFN_GMR fn_gmr = (PFN_GMR)next_device_proc_for(device, "vkGetImageMemoryRequirements");
-    layer_marker("SC_GOT_GMR");
     PFN_AM fn_am = (PFN_AM)next_device_proc_for(device, "vkAllocateMemory");
-    layer_marker("SC_GOT_AM");
     PFN_BIM fn_bim = (PFN_BIM)next_device_proc_for(device, "vkBindImageMemory");
-    layer_marker("SC_GOT_BIM");
-    PFN_GSL fn_gsl = (PFN_GSL)next_device_proc_for(device, "vkGetImageSubresourceLayout");
+    PFN_CB fn_cb = (PFN_CB)next_device_proc_for(device, "vkCreateBuffer");
+    PFN_GBMR fn_gbmr = (PFN_GBMR)next_device_proc_for(device, "vkGetBufferMemoryRequirements");
+    PFN_BBM fn_bbm = (PFN_BBM)next_device_proc_for(device, "vkBindBufferMemory");
 
     char dbuf[256];
-    snprintf(dbuf, sizeof(dbuf), "SC_FNS ci=%p gmr=%p am=%p bim=%p gsl=%p",
-             (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim, (void*)fn_gsl);
+    snprintf(dbuf, sizeof(dbuf), "SC_FNS ci=%p gmr=%p am=%p bim=%p cb=%p",
+             (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim, (void*)fn_cb);
     layer_marker(dbuf);
 
     if (!fn_ci || !fn_gmr || !fn_am || !fn_bim) {
-        LOG("Missing core Vulkan functions! ci=%p gmr=%p am=%p bim=%p gsl=%p dev=%p gdpa=%p\n",
-            (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim, (void*)fn_gsl,
+        LOG("Missing core Vulkan functions! ci=%p gmr=%p am=%p bim=%p dev=%p gdpa=%p\n",
+            (void*)fn_ci, (void*)fn_gmr, (void*)fn_am, (void*)fn_bim,
             device, (void*)gdpa_for_device(device));
         layer_marker("SC_MISSING_FNS");
     }
@@ -1439,6 +1534,7 @@ static VkResult headless_CreateSwapchainKHR(
              g_mem_props.memoryTypeCount, g_physical_device);
     layer_marker(dbuf);
 
+    /* Create OPTIMAL images — LINEAR + COLOR_ATTACHMENT causes device loss on Mali */
     for (uint32_t i = 0; i < sc->image_count; i++) {
         if (!fn_ci || !fn_gmr || !fn_am || !fn_bim) {
             break;
@@ -1454,13 +1550,13 @@ static VkResult headless_CreateSwapchainKHR(
         ici.mipLevels = 1;
         ici.arrayLayers = pCreateInfo->imageArrayLayers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_LINEAR;
-        ici.usage = pCreateInfo->imageUsage;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = pCreateInfo->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = 0; /* UNDEFINED */
 
-        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_CREATE %ux%u fmt=%d usage=0x%x layers=%u",
-                 i, sc->width, sc->height, ici.format, ici.usage, ici.arrayLayers);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_CREATE %ux%u fmt=%d usage=0x%x tiling=OPTIMAL",
+                 i, sc->width, sc->height, ici.format, ici.usage);
         layer_marker(dbuf);
 
         VkResult res = fn_ci(device, &ici, NULL, &sc->images[i]);
@@ -1481,9 +1577,9 @@ static VkResult headless_CreateSwapchainKHR(
         VkMemoryAllocateInfo ai = {0};
         ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.allocationSize = memReq.size;
-        ai.memoryTypeIndex = find_host_visible_mem(memReq.memoryTypeBits);
+        ai.memoryTypeIndex = find_device_local_mem(memReq.memoryTypeBits);
 
-        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_ALLOC size=%lu typeIdx=%u",
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_ALLOC size=%lu typeIdx=%u (device-local)",
                  i, (unsigned long)ai.allocationSize, ai.memoryTypeIndex);
         layer_marker(dbuf);
 
@@ -1496,8 +1592,6 @@ static VkResult headless_CreateSwapchainKHR(
             continue;
         }
 
-        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_BIND", i);
-        layer_marker(dbuf);
         res = fn_bim(device, sc->images[i], sc->memory[i], 0);
         snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_BIND_RESULT res=%d", i, res);
         layer_marker(dbuf);
@@ -1506,20 +1600,97 @@ static VkResult headless_CreateSwapchainKHR(
             continue;
         }
 
-        if (fn_gsl) {
-            VkImageSubresource sub = { 1, 0, 0 }; /* COLOR_BIT */
-            VkSubresourceLayout layout = {0};
-            fn_gsl(device, sc->images[i], &sub, &layout);
-            sc->row_pitch[i] = layout.rowPitch;
-        } else {
-            sc->row_pitch[i] = sc->width * 4;
+        /* OPTIMAL images — tightly packed staging buffer, pitch = width * 4 */
+        sc->row_pitch[i] = sc->width * 4;
+
+        LOG("Image[%u]: 0x%lx, mem=0x%lx (OPTIMAL, device-local)\n",
+            i, (unsigned long)sc->images[i], (unsigned long)sc->memory[i]);
+        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_DONE tiling=OPTIMAL", i);
+        layer_marker(dbuf);
+    }
+
+    /* Create staging buffer for OPTIMAL→CPU readback during Present */
+    sc->staging_size = (VkDeviceSize)sc->width * sc->height * 4;
+    sc->staging_buf = 0;
+    sc->staging_mem = 0;
+    sc->copy_pool = NULL;
+    sc->copy_cmd = NULL;
+
+    if (fn_cb && fn_gbmr && fn_bbm) {
+        VkBufferCreateInfo bci = {0};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = sc->staging_size;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkResult bres = fn_cb(device, &bci, NULL, &sc->staging_buf);
+        LOG("Staging buffer: size=%lu result=%d buf=0x%lx\n",
+            (unsigned long)sc->staging_size, bres, (unsigned long)sc->staging_buf);
+
+        if (bres == VK_SUCCESS && sc->staging_buf) {
+            VkMemoryRequirements bmr = {0};
+            fn_gbmr(device, sc->staging_buf, &bmr);
+
+            VkMemoryAllocateInfo bai = {0};
+            bai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            bai.allocationSize = bmr.size;
+            bai.memoryTypeIndex = find_host_visible_mem(bmr.memoryTypeBits);
+
+            bres = fn_am(device, &bai, NULL, &sc->staging_mem);
+            LOG("Staging memory: size=%lu typeIdx=%u result=%d\n",
+                (unsigned long)bmr.size, bai.memoryTypeIndex, bres);
+
+            if (bres == VK_SUCCESS && sc->staging_mem) {
+                fn_bbm(device, sc->staging_buf, sc->staging_mem, 0);
+                /* Pre-fill staging buffer with sentinel pattern so we can tell
+                 * if CopyImageToBuffer actually executed (zeros = copy ran but
+                 * blank; 0xDE = copy never ran; other = real data) */
+                {
+                    typedef VkResult (*PFN_MM)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
+                    typedef void (*PFN_UM)(VkDevice, VkDeviceMemory);
+                    PFN_MM fmm = (PFN_MM)next_device_proc_for(device, "vkMapMemory");
+                    PFN_UM fum = (PFN_UM)next_device_proc_for(device, "vkUnmapMemory");
+                    if (fmm && fum) {
+                        void *p = NULL;
+                        if (fmm(device, sc->staging_mem, 0, sc->staging_size, 0, &p) == VK_SUCCESS && p) {
+                            memset(p, 0xDE, (size_t)sc->staging_size);
+                            fum(device, sc->staging_mem);
+                            LOG("Staging buffer pre-filled with 0xDE sentinel (%lu bytes)\n",
+                                (unsigned long)sc->staging_size);
+                        }
+                    }
+                }
+            }
         }
 
-        LOG("Image[%u]: 0x%lx, mem=0x%lx, pitch=%lu\n",
-            i, (unsigned long)sc->images[i], (unsigned long)sc->memory[i],
-            (unsigned long)sc->row_pitch[i]);
-        snprintf(dbuf, sizeof(dbuf), "SC_IMG%u_DONE pitch=%lu", i, (unsigned long)sc->row_pitch[i]);
-        layer_marker(dbuf);
+        /* Create command pool + command buffer for copy operations */
+        typedef VkResult (*PFN_CCP)(VkDevice, const VkCommandPoolCreateInfo_t*, const VkAllocationCallbacks*, VkCommandPool*);
+        typedef VkResult (*PFN_ACB)(VkDevice, const VkCommandBufferAllocateInfo_t*, VkCommandBuffer*);
+        PFN_CCP fn_ccp = (PFN_CCP)next_device_proc_for(device, "vkCreateCommandPool");
+        PFN_ACB fn_acb = (PFN_ACB)next_device_proc_for(device, "vkAllocateCommandBuffers");
+
+        if (fn_ccp && fn_acb) {
+            VkCommandPoolCreateInfo_t cpci = {0};
+            cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cpci.queueFamilyIndex = 0;
+
+            VkResult cpres = fn_ccp(device, &cpci, NULL, &sc->copy_pool);
+            LOG("Copy command pool: result=%d pool=%p\n", cpres, sc->copy_pool);
+
+            if (cpres == VK_SUCCESS && sc->copy_pool) {
+                VkCommandBufferAllocateInfo_t cbai = {0};
+                cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+                cbai.commandPool = sc->copy_pool;
+                cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbai.commandBufferCount = 1;
+
+                fn_acb(device, &cbai, &sc->copy_cmd);
+                LOG("Copy command buffer: cmd=%p\n", sc->copy_cmd);
+            }
+        }
+    } else {
+        LOG("WARNING: Missing buffer functions, no staging readback available\n");
     }
 
     /* Get a queue for signaling acquire semaphore/fence in AcquireNextImage.
@@ -1540,10 +1711,27 @@ static VkResult headless_CreateSwapchainKHR(
     pthread_mutex_unlock(&g_mutex);
 
     *pSwapchain = sc->handle;
-    snprintf(scbuf, sizeof(scbuf), "SC_OK handle=0x%lx images=%u",
-             (unsigned long)sc->handle, sc->image_count);
+
+    /* Health check: verify the device is not lost after all image/buffer creation */
+    {
+        typedef VkResult (*PFN_DWI)(VkDevice);
+        PFN_DWI fn_dwi = (PFN_DWI)next_device_proc_for(device, "vkDeviceWaitIdle");
+        if (fn_dwi) {
+            VkResult wires = fn_dwi(device);
+            LOG("Post-swapchain DeviceWaitIdle: %d\n", wires);
+            if (wires != VK_SUCCESS) {
+                LOG("WARNING: Device may be LOST after swapchain creation! result=%d\n", wires);
+            }
+        }
+    }
+
+    snprintf(scbuf, sizeof(scbuf), "SC_OK handle=0x%lx images=%u staging=%s",
+             (unsigned long)sc->handle, sc->image_count,
+             sc->staging_buf ? "YES" : "NO");
     layer_marker(scbuf);
-    LOG("Created swapchain 0x%lx with %u images\n", (unsigned long)sc->handle, sc->image_count);
+    LOG("Created swapchain 0x%lx with %u OPTIMAL images, staging=%s\n",
+        (unsigned long)sc->handle, sc->image_count,
+        sc->staging_buf ? "YES" : "NO");
     return VK_SUCCESS;
 }
 
@@ -1584,6 +1772,20 @@ static void headless_DestroySwapchainKHR(
     PFN_FM fn_fm = (PFN_FM)next_device_proc_for(dev, "vkFreeMemory");
 
     if (fn_wait) fn_wait(dev);
+
+    /* Destroy staging resources */
+    if (to_free->copy_pool) {
+        typedef void (*PFN_DCP)(VkDevice, VkCommandPool, const VkAllocationCallbacks*);
+        PFN_DCP fn_dcp = (PFN_DCP)next_device_proc_for(dev, "vkDestroyCommandPool");
+        if (fn_dcp) fn_dcp(dev, to_free->copy_pool, NULL);
+    }
+    if (to_free->staging_buf) {
+        typedef void (*PFN_DB)(VkDevice, VkBuffer, const VkAllocationCallbacks*);
+        PFN_DB fn_db = (PFN_DB)next_device_proc_for(dev, "vkDestroyBuffer");
+        if (fn_db) fn_db(dev, to_free->staging_buf, NULL);
+    }
+    if (to_free->staging_mem && fn_fm) fn_fm(dev, to_free->staging_mem, NULL);
+
     for (uint32_t i = 0; i < to_free->image_count; i++) {
         if (to_free->images[i] && fn_di) fn_di(dev, to_free->images[i], NULL);
         if (to_free->memory[i] && fn_fm) fn_fm(dev, to_free->memory[i], NULL);
@@ -1690,30 +1892,184 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
         }
 
         uint32_t idx = pPresentInfo->pImageIndices[i];
-        if (idx < sc->image_count && sc->memory[idx]) {
-            /* Wait for GPU */
-            typedef VkResult (*PFN_QWI)(VkQueue);
-            PFN_QWI fn_qwi = (PFN_QWI)next_device_proc_for(sc->device, "vkQueueWaitIdle");
-            if (fn_qwi && queue) fn_qwi(queue);
+        if (idx < sc->image_count && sc->images[idx] &&
+            sc->staging_buf && sc->copy_cmd && queue) {
 
-            /* Map and send */
+            /* Resolve command recording functions */
+            typedef VkResult (*PFN_BCB)(VkCommandBuffer, const VkCommandBufferBeginInfo_t*);
+            typedef VkResult (*PFN_ECB)(VkCommandBuffer);
+            typedef VkResult (*PFN_RCB)(VkCommandBuffer, VkFlags);
+            typedef void (*PFN_CPB)(VkCommandBuffer, VkFlags, VkFlags, VkFlags,
+                                    uint32_t, const void*, uint32_t, const void*,
+                                    uint32_t, const VkImageMemoryBarrier*);
+            typedef void (*PFN_CITB)(VkCommandBuffer, VkImage, int, VkBuffer,
+                                     uint32_t, const VkBufferImageCopy*);
+            typedef VkResult (*PFN_QS)(VkQueue, uint32_t, const VkSubmitInfo*, uint64_t);
+            typedef VkResult (*PFN_QWI)(VkQueue);
             typedef VkResult (*PFN_MM)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
             typedef void (*PFN_UM)(VkDevice, VkDeviceMemory);
 
+            PFN_RCB fn_rcb = (PFN_RCB)next_device_proc_for(sc->device, "vkResetCommandBuffer");
+            PFN_BCB fn_bcb = (PFN_BCB)next_device_proc_for(sc->device, "vkBeginCommandBuffer");
+            PFN_ECB fn_ecb = (PFN_ECB)next_device_proc_for(sc->device, "vkEndCommandBuffer");
+            PFN_CPB fn_cpb = (PFN_CPB)next_device_proc_for(sc->device, "vkCmdPipelineBarrier");
+            PFN_CITB fn_citb = (PFN_CITB)next_device_proc_for(sc->device, "vkCmdCopyImageToBuffer");
+            PFN_QS fn_qs = (PFN_QS)next_device_proc_for(sc->device, "vkQueueSubmit");
+            PFN_QWI fn_qwi = (PFN_QWI)next_device_proc_for(sc->device, "vkQueueWaitIdle");
             PFN_MM fn_map = (PFN_MM)next_device_proc_for(sc->device, "vkMapMemory");
             PFN_UM fn_unmap = (PFN_UM)next_device_proc_for(sc->device, "vkUnmapMemory");
 
-            if (fn_map && fn_unmap) {
-                void* mapped = NULL;
-                size_t pitch = sc->row_pitch[idx];
-                if (!pitch) pitch = sc->width * 4;
-                size_t map_size = pitch * sc->height;
+            if (fn_rcb && fn_bcb && fn_ecb && fn_citb && fn_cpb && fn_qs && fn_qwi) {
+                /* Record: barrier(PRESENT_SRC→TRANSFER_SRC) + CopyImageToBuffer
+                 * Barriers work on ARM64 host side (no handle wrapping issues) */
+                VkResult rcb_res = fn_rcb(sc->copy_cmd, 0);
+                LOG("[COPY] ResetCB=%d cmd=%p\n", rcb_res, sc->copy_cmd);
 
-                VkResult res = fn_map(sc->device, sc->memory[idx], 0, map_size, 0, &mapped);
-                if (res == VK_SUCCESS && mapped) {
-                    send_frame(sc->width, sc->height, mapped, pitch);
-                    fn_unmap(sc->device, sc->memory[idx]);
+                VkCommandBufferBeginInfo_t bi = {0};
+                bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                VkResult bcb_res = fn_bcb(sc->copy_cmd, &bi);
+                LOG("[COPY] BeginCB=%d\n", bcb_res);
+
+                /* Barrier: PRESENT_SRC → TRANSFER_SRC */
+                {
+                    VkImageMemoryBarrier imb = {0};
+                    imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    imb.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    imb.srcQueueFamilyIndex = 0xFFFFFFFF;
+                    imb.dstQueueFamilyIndex = 0xFFFFFFFF;
+                    imb.image = sc->images[idx];
+                    imb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    imb.subresourceRange.levelCount = 1;
+                    imb.subresourceRange.layerCount = 1;
+                    fn_cpb(sc->copy_cmd,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, NULL, 0, NULL, 1, &imb);
                 }
+
+                /* Copy image to staging buffer */
+                VkBufferImageCopy region = {0};
+                region.bufferRowLength = 0;      /* tightly packed */
+                region.bufferImageHeight = 0;
+                region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.layerCount = 1;
+                region.imageExtent.width = sc->width;
+                region.imageExtent.height = sc->height;
+                region.imageExtent.depth = 1;
+
+                LOG("[COPY] CopyImageToBuffer: img=0x%lx buf=0x%lx %ux%u\n",
+                    (unsigned long)sc->images[idx], (unsigned long)sc->staging_buf,
+                    sc->width, sc->height);
+                fn_citb(sc->copy_cmd, sc->images[idx],
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        sc->staging_buf, 1, &region);
+                LOG("[COPY] CopyImageToBuffer recorded\n");
+
+                /* Barrier: TRANSFER_SRC → PRESENT_SRC (restore for next frame) */
+                {
+                    VkImageMemoryBarrier rb = {0};
+                    rb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    rb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    rb.dstAccessMask = 0;
+                    rb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    rb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    rb.srcQueueFamilyIndex = 0xFFFFFFFF;
+                    rb.dstQueueFamilyIndex = 0xFFFFFFFF;
+                    rb.image = sc->images[idx];
+                    rb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    rb.subresourceRange.levelCount = 1;
+                    rb.subresourceRange.layerCount = 1;
+                    fn_cpb(sc->copy_cmd,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           0, 0, NULL, 0, NULL, 1, &rb);
+                }
+                LOG("[COPY] Barrier TRANSFER_SRC→PRESENT_SRC recorded\n");
+
+                VkResult ecb_res = fn_ecb(sc->copy_cmd);
+                LOG("[COPY] EndCB=%d\n", ecb_res);
+
+                /* Submit copy and wait.
+                 * CRITICAL: consume the present's wait semaphores here so
+                 * binary semaphores transition to unsignaled.  Otherwise the
+                 * next QueueSubmit that signals them hits a spec violation
+                 * (signaling an already-signaled binary sem) → DEVICE_LOST. */
+                VkSubmitInfo si;
+                memset(&si, 0, sizeof(si));
+                si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &sc->copy_cmd;
+                VkFlags wait_stages[8];
+                if (i == 0 && pPresentInfo->waitSemaphoreCount > 0) {
+                    uint32_t wc = pPresentInfo->waitSemaphoreCount;
+                    if (wc > 8) wc = 8;
+                    si.waitSemaphoreCount = wc;
+                    si.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+                    for (uint32_t w = 0; w < wc; w++)
+                        wait_stages[w] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    si.pWaitDstStageMask = wait_stages;
+                }
+                VkResult qs_res = fn_qs(queue, 1, &si, 0);
+                LOG("[COPY] QueueSubmit=%d (waitSems=%u)\n", qs_res, si.waitSemaphoreCount);
+                VkResult qwi_res = fn_qwi(queue);
+                LOG("[COPY] QueueWaitIdle=%d\n", qwi_res);
+
+                /* Map staging buffer and send frame */
+                if (fn_map && fn_unmap) {
+                    void* mapped = NULL;
+                    VkResult mres = fn_map(sc->device, sc->staging_mem, 0,
+                                           sc->staging_size, 0, &mapped);
+                    LOG("[COPY] MapMemory=%d ptr=%p\n", mres, mapped);
+                    if (mres == VK_SUCCESS && mapped) {
+                        /* Check first 16 bytes for sentinel vs real data */
+                        const uint8_t *px = (const uint8_t *)mapped;
+                        LOG("[COPY] First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x "
+                            "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7],
+                            px[8], px[9], px[10], px[11], px[12], px[13], px[14], px[15]);
+                        /* Check center pixel too */
+                        uint32_t center_off = (sc->height/2 * sc->width + sc->width/2) * 4;
+                        LOG("[COPY] Center pixel @%u: %02x %02x %02x %02x\n",
+                            center_off, px[center_off], px[center_off+1],
+                            px[center_off+2], px[center_off+3]);
+                        send_frame(sc->width, sc->height, mapped, sc->width * 4);
+
+                        /* Dump first frame to PPM if HEADLESS_DUMP_PPM is set */
+                        {
+                            static int dumped = 0;
+                            if (!dumped && getenv("HEADLESS_DUMP_PPM")) {
+                                dumped = 1;
+                                FILE *f = fopen("/tmp/frame_dump.ppm", "wb");
+                                if (f) {
+                                    fprintf(f, "P6\n%u %u\n255\n", sc->width, sc->height);
+                                    const uint8_t *px = (const uint8_t *)mapped;
+                                    for (uint32_t y = 0; y < sc->height; y++) {
+                                        for (uint32_t x = 0; x < sc->width; x++) {
+                                            uint32_t off = (y * sc->width + x) * 4;
+                                            /* B8G8R8A8 → RGB */
+                                            uint8_t rgb[3] = { px[off+2], px[off+1], px[off+0] };
+                                            fwrite(rgb, 1, 3, f);
+                                        }
+                                    }
+                                    fclose(f);
+                                    LOG("PPM frame dumped: /tmp/frame_dump.ppm (%ux%u)\n",
+                                        sc->width, sc->height);
+                                }
+                            }
+                        }
+
+                        fn_unmap(sc->device, sc->staging_mem);
+                    }
+                }
+            } else {
+                /* Fallback: just wait idle (no readback) */
+                typedef VkResult (*PFN_QWI2)(VkQueue);
+                PFN_QWI2 fn_qwi2 = (PFN_QWI2)next_device_proc_for(sc->device, "vkQueueWaitIdle");
+                if (fn_qwi2 && queue) fn_qwi2(queue);
             }
         }
 

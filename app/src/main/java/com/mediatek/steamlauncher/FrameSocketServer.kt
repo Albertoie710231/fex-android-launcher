@@ -112,6 +112,9 @@ class FrameSocketServer(private val port: Int = 19850) {
 
                 Log.i(TAG, "Frame client connected from ${newClient.inetAddress}")
 
+                // Reset frame save counter for new connection
+                receivedCount = 0
+
                 // Low-latency TCP settings
                 newClient.tcpNoDelay = true
                 newClient.receiveBufferSize = 4 * 1024 * 1024  // 4MB receive buffer
@@ -193,10 +196,17 @@ class FrameSocketServer(private val port: Int = 19850) {
                     bytesRead += n
                 }
 
-                // Save first frame to file for debugging
-                if (receivedCount == 0L) {
-                    saveDebugFrame(width, height, pixelBuffer)
+                // Log pixel data for first 3, every 50th, and always save last 3 (rotating)
+                val nonZero = pixelBuffer.take(1024).count { it != 0.toByte() }
+                if (receivedCount < 3L || receivedCount % 50L == 0L) {
+                    val hex = pixelBuffer.take(16).joinToString(" ") { "%02x".format(it) }
+                    val centerOff = (height / 2 * width + width / 2) * 4
+                    val centerHex = pixelBuffer.slice(centerOff until minOf(centerOff + 4, pixelSize))
+                        .joinToString(" ") { "%02x".format(it) }
+                    Log.i(TAG, "Frame ${receivedCount}: ${width}x${height} first16=[$hex] center=[$centerHex] nonZero1K=$nonZero")
                 }
+                // Always save rotating last 3 frames
+                saveDebugFrame(width, height, pixelBuffer, (receivedCount % 3L).toInt())
 
                 receivedCount++
 
@@ -281,19 +291,19 @@ class FrameSocketServer(private val port: Int = 19850) {
     /**
      * Save a frame for debugging.
      */
-    private fun saveDebugFrame(width: Int, height: Int, pixels: ByteArray) {
+    private fun saveDebugFrame(width: Int, height: Int, pixels: ByteArray, index: Int = 0) {
         try {
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels))
 
-            val file = java.io.File("/data/data/com.mediatek.steamlauncher/files/vkcube_frame.png")
+            val file = java.io.File("/data/data/com.mediatek.steamlauncher/files/frame_$index.png")
             java.io.FileOutputStream(file).use { out ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
-            Log.i(TAG, "Saved first frame to ${file.absolutePath}")
+            Log.i(TAG, "Saved frame $index to ${file.absolutePath} (${width}x${height})")
             bitmap.recycle()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to save frame: ${e.message}")
+            Log.e(TAG, "Failed to save frame $index: ${e.message}")
         }
     }
 

@@ -698,7 +698,7 @@ class ContainerManager(private val context: Context) {
         // LD_PRELOAD fails under FEX on Android (AT_SECURE/SELinux blocks it).
         // The Vulkan loader loads implicit layers via dlopen which works fine.
         val layerFiles = mapOf(
-            "libvulkan_headless_layer.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless_layer.so"),
+            "libvulkan_headless_layer_x86_64.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless_layer.so"),
             "VK_LAYER_HEADLESS_surface.json" to File(fexRootfsDir, "usr/share/vulkan/implicit_layer.d/VK_LAYER_HEADLESS_surface.json"),
             // Keep the LD_PRELOAD version too (for non-Wine commands like vkcube)
             "libvulkan_headless.so" to File(fexRootfsDir, "usr/lib/libvulkan_headless.so"),
@@ -767,7 +767,7 @@ class ContainerManager(private val context: Context) {
             { "name": "VK_KHR_swapchain", "spec_version": "70" }
         ],
         "disable_environment": {
-            "DISABLE_HEADLESS_LAYER": "1"
+            "DISABLE_HOST_HEADLESS": "1"
         }
     }
 }""")
@@ -889,6 +889,8 @@ class ContainerManager(private val context: Context) {
         copyAssetToFile("steam_api64.dll", File(stubsDir, "steam_api64.dll"))
         copyAssetToFile("xaudio2_7.dll", File(stubsDir, "xaudio2_7.dll"))
         copyAssetToFile("test_vk_cmdbuf.exe", File(stubsDir, "test_vk_cmdbuf.exe"))
+        copyAssetToFile("test_wine_vulkan.exe", File(stubsDir, "test_wine_vulkan.exe"))
+        copyAssetToFile("vkcube_wine.exe", File(stubsDir, "vkcube_wine.exe"))
 
         Log.i(TAG, "Stub DLLs deployed to Wine path and /opt/stubs/")
     }

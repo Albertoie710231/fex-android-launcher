@@ -12,10 +12,13 @@
  */
 
 #include <windows.h>
+#include <excpt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <setjmp.h>
 
 /* ===== Vulkan types (inline, no SDK headers) ===== */
 
@@ -30,6 +33,8 @@ typedef uint64_t VkSwapchainKHR;
 typedef uint64_t VkImage;
 typedef uint64_t VkSemaphore;
 typedef uint64_t VkFence;
+typedef uint64_t VkDeviceMemory;
+typedef uint64_t VkBuffer;
 typedef uint32_t VkFlags;
 typedef int32_t  VkResult;
 typedef uint32_t VkStructureType;
@@ -69,6 +74,8 @@ typedef uint64_t VkDeviceSize;
 #define VK_IMAGE_LAYOUT_UNDEFINED               0
 #define VK_IMAGE_LAYOUT_GENERAL                 1
 #define VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL 2
+#define VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL    7
+#define VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL    6
 #define VK_IMAGE_LAYOUT_PRESENT_SRC_KHR         1000001002
 
 /* Pipeline stage flags */
@@ -78,7 +85,9 @@ typedef uint64_t VkDeviceSize;
 #define VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT 0x00000400
 
 /* Access flags */
-#define VK_ACCESS_TRANSFER_WRITE_BIT            0x00000800
+#define VK_ACCESS_TRANSFER_READ_BIT             0x00000800
+#define VK_ACCESS_TRANSFER_WRITE_BIT            0x00001000
+#define VK_ACCESS_HOST_READ_BIT                 0x00002000
 #define VK_ACCESS_MEMORY_READ_BIT               0x00008000
 
 /* Image aspect */
@@ -99,8 +108,27 @@ typedef uint64_t VkDeviceSize;
 #define VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR      0x00000008
 
 /* Image usage */
+#define VK_IMAGE_USAGE_TRANSFER_SRC_BIT         0x00000001
+#define VK_IMAGE_USAGE_TRANSFER_DST_BIT         0x00000002
 #define VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT     0x00000010
-#define VK_IMAGE_USAGE_TRANSFER_DST_BIT         0x00000008
+
+/* Buffer usage */
+#define VK_BUFFER_USAGE_TRANSFER_DST_BIT        0x00000002
+
+/* Image/buffer creation sTypes */
+#define VK_STYPE_IMAGE_CREATE_INFO              14
+#define VK_STYPE_MEMORY_ALLOCATE_INFO           5
+#define VK_STYPE_BUFFER_CREATE_INFO             12
+
+/* Image type / tiling / samples */
+#define VK_IMAGE_TYPE_2D                        1
+#define VK_SAMPLE_COUNT_1_BIT                   1
+#define VK_IMAGE_TILING_OPTIMAL                 0
+
+/* Memory property flags */
+#define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT     0x01
+#define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT     0x02
+#define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT    0x04
 
 /* Sharing mode */
 #define VK_SHARING_MODE_EXCLUSIVE               0
@@ -311,6 +339,87 @@ typedef struct {
     uint32_t specVersion;
 } VkExtensionProperties;
 
+/* ===== Structures for stage 7 buffer dump ===== */
+
+typedef struct {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         flags;
+    uint32_t        imageType;
+    VkFormat        format;
+    uint32_t        width;
+    uint32_t        height;
+    uint32_t        depth;
+    uint32_t        mipLevels;
+    uint32_t        arrayLayers;
+    uint32_t        samples;
+    uint32_t        tiling;
+    VkFlags         usage;
+    uint32_t        sharingMode;
+    uint32_t        queueFamilyIndexCount;
+    const uint32_t* pQueueFamilyIndices;
+    uint32_t        initialLayout;
+} MyVkImageCreateInfo;
+
+typedef struct {
+    VkDeviceSize size;
+    VkDeviceSize alignment;
+    uint32_t     memoryTypeBits;
+} MyVkMemoryRequirements;
+
+typedef struct {
+    VkStructureType sType;
+    const void*     pNext;
+    VkDeviceSize    allocationSize;
+    uint32_t        memoryTypeIndex;
+} MyVkMemoryAllocateInfo;
+
+typedef struct {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         flags;
+    VkDeviceSize    size;
+    VkFlags         usage;
+    uint32_t        sharingMode;
+    uint32_t        queueFamilyIndexCount;
+    const uint32_t* pQueueFamilyIndices;
+} MyVkBufferCreateInfo;
+
+typedef struct {
+    VkFlags  propertyFlags;
+    uint32_t heapIndex;
+} MyVkMemoryType;
+
+typedef struct {
+    VkDeviceSize size;
+    VkFlags      flags;
+} MyVkMemoryHeap;
+
+typedef struct {
+    uint32_t       memoryTypeCount;
+    MyVkMemoryType memoryTypes[32];
+    uint32_t       memoryHeapCount;
+    MyVkMemoryHeap memoryHeaps[16];
+} MyVkPhysicalDeviceMemoryProperties;
+
+typedef struct {
+    VkDeviceSize bufferOffset;
+    uint32_t     bufferRowLength;
+    uint32_t     bufferImageHeight;
+    struct {
+        VkFlags  aspectMask;
+        uint32_t mipLevel;
+        uint32_t baseArrayLayer;
+        uint32_t layerCount;
+    } imageSubresource;
+    int32_t  imageOffsetX;
+    int32_t  imageOffsetY;
+    int32_t  imageOffsetZ;
+    uint32_t imageExtentW;
+    uint32_t imageExtentH;
+    uint32_t imageExtentD;
+} MyVkBufferImageCopy;
+
 /* ===== Function pointer types ===== */
 
 /* Instance-level (via GetProcAddress on vulkan-1.dll) */
@@ -356,6 +465,22 @@ typedef VkResult (WINAPI *PFN_vkResetFences)(VkDevice, uint32_t, const VkFence*)
 typedef void     (WINAPI *PFN_vkCmdPipelineBarrier)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const void*, uint32_t, const void*, uint32_t, const MyVkImageMemoryBarrier*);
 typedef void     (WINAPI *PFN_vkCmdClearColorImage)(VkCommandBuffer, VkImage, uint32_t, const MyVkClearColorValue*, uint32_t, const MyVkImageSubresourceRange*);
 
+/* Stage 7 buffer dump function pointers */
+typedef VkResult (WINAPI *PFN_vkCreateImage)(VkDevice, const MyVkImageCreateInfo*, const void*, VkImage*);
+typedef void     (WINAPI *PFN_vkDestroyImage)(VkDevice, VkImage, const void*);
+typedef void     (WINAPI *PFN_vkGetImageMemoryRequirements)(VkDevice, VkImage, MyVkMemoryRequirements*);
+typedef VkResult (WINAPI *PFN_vkAllocateMemory)(VkDevice, const MyVkMemoryAllocateInfo*, const void*, VkDeviceMemory*);
+typedef void     (WINAPI *PFN_vkFreeMemory)(VkDevice, VkDeviceMemory, const void*);
+typedef VkResult (WINAPI *PFN_vkBindImageMemory)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+typedef VkResult (WINAPI *PFN_vkCreateBuffer)(VkDevice, const MyVkBufferCreateInfo*, const void*, VkBuffer*);
+typedef void     (WINAPI *PFN_vkDestroyBuffer)(VkDevice, VkBuffer, const void*);
+typedef void     (WINAPI *PFN_vkGetBufferMemoryRequirements)(VkDevice, VkBuffer, MyVkMemoryRequirements*);
+typedef VkResult (WINAPI *PFN_vkBindBufferMemory)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+typedef VkResult (WINAPI *PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
+typedef void     (WINAPI *PFN_vkUnmapMemory)(VkDevice, VkDeviceMemory);
+typedef void     (WINAPI *PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, MyVkPhysicalDeviceMemoryProperties*);
+typedef void     (WINAPI *PFN_vkCmdCopyImageToBuffer)(VkCommandBuffer, VkImage, uint32_t, VkBuffer, uint32_t, const MyVkBufferImageCopy*);
+
 /* ===== Macros ===== */
 
 #define LOAD(name) do { \
@@ -386,6 +511,17 @@ typedef void     (WINAPI *PFN_vkCmdClearColorImage)(VkCommandBuffer, VkImage, ui
     if (max_stage < (n)) goto cleanup; \
     fprintf(stderr, "\n===== STAGE %d: %s =====\n", (n), (desc)); fflush(stderr); \
 } while(0)
+
+/* ===== SEH workaround for MinGW (stage 6 exception handling) ===== */
+
+static jmp_buf g_stage6_jmpbuf;
+static DWORD   g_stage6_exception_code = 0;
+
+static LONG WINAPI stage6_veh(EXCEPTION_POINTERS *ep) {
+    g_stage6_exception_code = ep->ExceptionRecord->ExceptionCode;
+    longjmp(g_stage6_jmpbuf, 1);
+    return EXCEPTION_CONTINUE_EXECUTION; /* unreachable */
+}
 
 /* ===== Multi-threaded ACB stress test (stage 5) ===== */
 
@@ -524,6 +660,28 @@ int main(int argc, char **argv) {
     PFN_vkCmdPipelineBarrier        pfn_vkCmdPipelineBarrier = NULL;
     PFN_vkCmdClearColorImage        pfn_vkCmdClearColorImage = NULL;
 
+    /* Stage 7 buffer dump function pointers */
+    PFN_vkCreateImage               pfn_vkCreateImage = NULL;
+    PFN_vkDestroyImage              pfn_vkDestroyImage = NULL;
+    PFN_vkGetImageMemoryRequirements pfn_vkGetImageMemoryRequirements = NULL;
+    PFN_vkAllocateMemory            pfn_vkAllocateMemory = NULL;
+    PFN_vkFreeMemory                pfn_vkFreeMemory = NULL;
+    PFN_vkBindImageMemory           pfn_vkBindImageMemory = NULL;
+    PFN_vkCreateBuffer              pfn_vkCreateBuffer = NULL;
+    PFN_vkDestroyBuffer             pfn_vkDestroyBuffer = NULL;
+    PFN_vkGetBufferMemoryRequirements pfn_vkGetBufferMemoryRequirements = NULL;
+    PFN_vkBindBufferMemory          pfn_vkBindBufferMemory = NULL;
+    PFN_vkMapMemory                 pfn_vkMapMemory = NULL;
+    PFN_vkUnmapMemory               pfn_vkUnmapMemory = NULL;
+    PFN_vkGetPhysicalDeviceMemoryProperties pfn_vkGetPhysicalDeviceMemoryProperties = NULL;
+    PFN_vkCmdCopyImageToBuffer      pfn_vkCmdCopyImageToBuffer = NULL;
+
+    /* Stage 7 resources */
+    VkImage        dumpImage = VK_NULL_HANDLE;
+    VkDeviceMemory dumpImageMem = VK_NULL_HANDLE;
+    VkBuffer       dumpBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory dumpBufferMem = VK_NULL_HANDLE;
+
     /* Load vulkan-1.dll */
     fprintf(stderr, "[test] Loading vulkan-1.dll...\n"); fflush(stderr);
     hVulkan = LoadLibraryA("vulkan-1.dll");
@@ -548,6 +706,7 @@ int main(int argc, char **argv) {
     LOAD_OPTIONAL(vkGetPhysicalDeviceSurfaceFormatsKHR);
     LOAD_OPTIONAL(vkGetPhysicalDeviceSurfacePresentModesKHR);
     LOAD_OPTIONAL(vkGetPhysicalDeviceSurfaceSupportKHR);
+    LOAD_OPTIONAL(vkGetPhysicalDeviceMemoryProperties);
     fprintf(stderr, "[test] Instance-level function pointers resolved\n"); fflush(stderr);
 
     /* Enumerate instance extensions to see what Wine exposes */
@@ -700,6 +859,21 @@ int main(int argc, char **argv) {
         DLOAD_OPTIONAL(vkAcquireNextImageKHR);
         DLOAD_OPTIONAL(vkQueuePresentKHR);
 
+        /* Stage 7 buffer dump functions */
+        DLOAD(vkCreateImage);
+        DLOAD(vkDestroyImage);
+        DLOAD(vkGetImageMemoryRequirements);
+        DLOAD(vkAllocateMemory);
+        DLOAD(vkFreeMemory);
+        DLOAD(vkBindImageMemory);
+        DLOAD(vkCreateBuffer);
+        DLOAD(vkDestroyBuffer);
+        DLOAD(vkGetBufferMemoryRequirements);
+        DLOAD(vkBindBufferMemory);
+        DLOAD(vkMapMemory);
+        DLOAD(vkUnmapMemory);
+        DLOAD(vkCmdCopyImageToBuffer);
+
         pfn_vkGetDeviceQueue(device, gfxQF, 0, &queue);
         fprintf(stderr, "[stage3] Queue: %p\n", queue); fflush(stderr);
 
@@ -833,313 +1007,444 @@ int main(int argc, char **argv) {
     STAGE(6, "Win32 surface + swapchain creation");
     {
         VkResult r;
+        int stage6_ok = 0;
 
-        /* Use the desktop window — CreateWindowExA triggers X_CreateWindow
-         * which fails with BadWindow on libXlorie. GetDesktopWindow() returns
-         * an already-existing HWND without creating X11 windows. */
-        hwnd = GetDesktopWindow();
-        fprintf(stderr, "[stage6] Desktop window: hwnd=%p\n", hwnd); fflush(stderr);
-        if (!hwnd) {
-            fprintf(stderr, "[stage6] SKIP — GetDesktopWindow() returned NULL\n");
-            fflush(stderr);
-            goto stage7;
-        }
+        /* Install vectored exception handler to catch Wine's assertion when
+         * X11 (libXlorie) is running but HWND→X11 Window mapping fails.
+         * Wine's UNIX_CALL assertion becomes a structured exception. */
+        void *veh = AddVectoredExceptionHandler(1, stage6_veh);
+        g_stage6_exception_code = 0;
 
-        /* Create Win32 surface */
-        if (!pfn_vkCreateWin32SurfaceKHR) {
-            fprintf(stderr, "[stage6] SKIP — vkCreateWin32SurfaceKHR not available\n");
-            fflush(stderr);
-            goto stage7;
-        }
-
-        MyVkWin32SurfaceCreateInfoKHR sci;
-        memset(&sci, 0, sizeof(sci));
-        sci.sType = VK_STYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-        sci.hinstance = GetModuleHandleA(NULL);
-        sci.hwnd = hwnd;
-
-        r = pfn_vkCreateWin32SurfaceKHR(instance, &sci, NULL, &surface);
-        fprintf(stderr, "[stage6] vkCreateWin32SurfaceKHR: result=%d surface=0x%llx\n",
-                r, (unsigned long long)surface);
-        fflush(stderr);
-        if (r != VK_SUCCESS) {
-            fprintf(stderr, "[stage6] FAIL — surface creation failed\n");
-            fflush(stderr);
-            goto stage7;
-        }
-
-        /* Check surface support */
-        if (pfn_vkGetPhysicalDeviceSurfaceSupportKHR) {
-            uint32_t supported = 0;
-            pfn_vkGetPhysicalDeviceSurfaceSupportKHR(gpu, gfxQF, surface, &supported);
-            fprintf(stderr, "[stage6] Surface support on QF %u: %s\n",
-                    gfxQF, supported ? "YES" : "NO");
-            fflush(stderr);
-        }
-
-        /* Query capabilities */
-        if (pfn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR) {
-            MyVkSurfaceCapabilitiesKHR caps;
-            memset(&caps, 0, sizeof(caps));
-            r = pfn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, surface, &caps);
-            fprintf(stderr, "[stage6] Surface caps: result=%d\n", r);
-            if (r == VK_SUCCESS) {
-                fprintf(stderr, "[stage6]   images: %u-%u  extent: %ux%u  usage: 0x%x\n",
-                        caps.minImageCount, caps.maxImageCount,
-                        caps.currentExtentW, caps.currentExtentH,
-                        caps.supportedUsageFlags);
+        if (setjmp(g_stage6_jmpbuf) == 0) {
+            /* Try CreateWindowExA first — creates a proper X11-backed window.
+             * Fall back to GetDesktopWindow if it fails. */
+            hwnd = CreateWindowExA(
+                0, "STATIC", "VulkanTest", WS_OVERLAPPEDWINDOW,
+                0, 0, 1280, 720, NULL, NULL, GetModuleHandleA(NULL), NULL);
+            if (!hwnd) {
+                fprintf(stderr, "[stage6] CreateWindowExA failed (err=%lu), trying GetDesktopWindow\n",
+                        GetLastError());
+                fflush(stderr);
+                hwnd = GetDesktopWindow();
             }
-            fflush(stderr);
-        }
+            fprintf(stderr, "[stage6] Window: hwnd=%p\n", hwnd); fflush(stderr);
+            if (!hwnd) {
+                fprintf(stderr, "[stage6] SKIP — no window available\n"); fflush(stderr);
+                RemoveVectoredExceptionHandler(veh);
+                goto stage7;
+            }
 
-        /* Query formats */
-        if (pfn_vkGetPhysicalDeviceSurfaceFormatsKHR) {
-            uint32_t fmtCount = 0;
-            pfn_vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &fmtCount, NULL);
-            fprintf(stderr, "[stage6] Surface format count: %u\n", fmtCount);
-            MyVkSurfaceFormatKHR fmts[16];
-            if (fmtCount > 16) fmtCount = 16;
-            if (fmtCount > 0) {
-                pfn_vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &fmtCount, fmts);
-                for (uint32_t i = 0; i < fmtCount; i++) {
-                    fprintf(stderr, "[stage6]   fmt[%u]: format=%u colorSpace=%u\n",
-                            i, fmts[i].format, fmts[i].colorSpace);
+            /* Create Win32 surface */
+            if (!pfn_vkCreateWin32SurfaceKHR) {
+                fprintf(stderr, "[stage6] SKIP — vkCreateWin32SurfaceKHR not available\n");
+                fflush(stderr);
+                RemoveVectoredExceptionHandler(veh);
+                goto stage7;
+            }
+
+            MyVkWin32SurfaceCreateInfoKHR sci;
+            memset(&sci, 0, sizeof(sci));
+            sci.sType = VK_STYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+            sci.hinstance = GetModuleHandleA(NULL);
+            sci.hwnd = hwnd;
+
+            r = pfn_vkCreateWin32SurfaceKHR(instance, &sci, NULL, &surface);
+            fprintf(stderr, "[stage6] vkCreateWin32SurfaceKHR: result=%d surface=0x%llx\n",
+                    r, (unsigned long long)surface);
+            fflush(stderr);
+            if (r != VK_SUCCESS) {
+                fprintf(stderr, "[stage6] Surface creation returned error %d, skipping\n", r);
+                fflush(stderr);
+                RemoveVectoredExceptionHandler(veh);
+                goto stage7;
+            }
+
+            /* Check surface support */
+            if (pfn_vkGetPhysicalDeviceSurfaceSupportKHR) {
+                uint32_t supported = 0;
+                pfn_vkGetPhysicalDeviceSurfaceSupportKHR(gpu, gfxQF, surface, &supported);
+                fprintf(stderr, "[stage6] Surface support on QF %u: %s\n",
+                        gfxQF, supported ? "YES" : "NO");
+                fflush(stderr);
+            }
+
+            /* Query capabilities */
+            if (pfn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR) {
+                MyVkSurfaceCapabilitiesKHR caps;
+                memset(&caps, 0, sizeof(caps));
+                r = pfn_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, surface, &caps);
+                fprintf(stderr, "[stage6] Surface caps: result=%d\n", r);
+                if (r == VK_SUCCESS) {
+                    fprintf(stderr, "[stage6]   images: %u-%u  extent: %ux%u  usage: 0x%x\n",
+                            caps.minImageCount, caps.maxImageCount,
+                            caps.currentExtentW, caps.currentExtentH,
+                            caps.supportedUsageFlags);
                 }
+                fflush(stderr);
             }
-            fflush(stderr);
-        }
 
-        /* Query present modes */
-        if (pfn_vkGetPhysicalDeviceSurfacePresentModesKHR) {
-            uint32_t modeCount = 0;
-            pfn_vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &modeCount, NULL);
-            fprintf(stderr, "[stage6] Present mode count: %u\n", modeCount);
-            VkPresentModeKHR modes[16];
-            if (modeCount > 16) modeCount = 16;
-            if (modeCount > 0) {
-                pfn_vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &modeCount, modes);
-                for (uint32_t i = 0; i < modeCount; i++)
-                    fprintf(stderr, "[stage6]   mode[%u]: %u\n", i, modes[i]);
+            /* Query formats */
+            if (pfn_vkGetPhysicalDeviceSurfaceFormatsKHR) {
+                uint32_t fmtCount = 0;
+                pfn_vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &fmtCount, NULL);
+                fprintf(stderr, "[stage6] Surface format count: %u\n", fmtCount);
+                MyVkSurfaceFormatKHR fmts[16];
+                if (fmtCount > 16) fmtCount = 16;
+                if (fmtCount > 0) {
+                    pfn_vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &fmtCount, fmts);
+                    for (uint32_t i = 0; i < fmtCount; i++) {
+                        fprintf(stderr, "[stage6]   fmt[%u]: format=%u colorSpace=%u\n",
+                                i, fmts[i].format, fmts[i].colorSpace);
+                    }
+                }
+                fflush(stderr);
             }
+
+            stage6_ok = 1;
+
+        } else {
+            /* Caught exception via VEH + longjmp */
+            fprintf(stderr, "[stage6] EXCEPTION caught (code=0x%lx) — Wine assertion in surface creation\n",
+                    (unsigned long)g_stage6_exception_code);
+            fprintf(stderr, "[stage6] This happens when X11 (libXlorie) is running.\n");
+            fprintf(stderr, "[stage6] Surface tests skipped, continuing to stage 7...\n");
             fflush(stderr);
+            surface = VK_NULL_HANDLE;
+            hwnd = NULL;
         }
 
-        /* Create swapchain */
-        if (!pfn_vkCreateSwapchainKHR) {
-            fprintf(stderr, "[stage6] SKIP swapchain — vkCreateSwapchainKHR not available\n");
-            fflush(stderr);
-            goto stage6_done;
-        }
+        RemoveVectoredExceptionHandler(veh);
 
-        MyVkSwapchainCreateInfoKHR swci;
-        memset(&swci, 0, sizeof(swci));
-        swci.sType            = VK_STYPE_SWAPCHAIN_CREATE_INFO_KHR;
-        swci.surface          = surface;
-        swci.minImageCount    = 3;
-        swci.imageFormat      = VK_FORMAT_B8G8R8A8_UNORM;
-        swci.imageColorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        swci.imageExtentW     = 1280;
-        swci.imageExtentH     = 720;
-        swci.imageArrayLayers = 1;
-        swci.imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        swci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        swci.preTransform     = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-        swci.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swci.presentMode      = VK_PRESENT_MODE_FIFO_KHR;
-        swci.clipped          = 1;
-        swci.oldSwapchain     = VK_NULL_HANDLE;
-
-        r = pfn_vkCreateSwapchainKHR(device, &swci, NULL, &swapchain);
-        fprintf(stderr, "[stage6] vkCreateSwapchainKHR: result=%d swapchain=0x%llx\n",
-                r, (unsigned long long)swapchain);
+        if (stage6_ok)
+            fprintf(stderr, "[stage6] PASS\n");
+        else
+            fprintf(stderr, "[stage6] SKIP (exception or error)\n");
         fflush(stderr);
-        if (r != VK_SUCCESS) {
-            fprintf(stderr, "[stage6] FAIL — swapchain creation failed\n");
-            fflush(stderr);
-            swapchain = VK_NULL_HANDLE;
-            goto stage6_done;
-        }
-
-        /* Get swapchain images */
-        if (pfn_vkGetSwapchainImagesKHR) {
-            swapImageCount = 8;
-            pfn_vkGetSwapchainImagesKHR(device, swapchain, &swapImageCount, swapImages);
-            fprintf(stderr, "[stage6] Swapchain images: %u\n", swapImageCount);
-            for (uint32_t i = 0; i < swapImageCount; i++)
-                fprintf(stderr, "[stage6]   image[%u]: 0x%llx\n", i, (unsigned long long)swapImages[i]);
-            fflush(stderr);
-        }
-
-stage6_done:
-        fprintf(stderr, "[stage6] PASS\n"); fflush(stderr);
     }
 
-    /* ===== STAGE 7: Render loop (10 frames) ===== */
+    /* ===== STAGE 7: Buffer dump (render to image, copy to host, write PPM) ===== */
 stage7:
-    STAGE(7, "Render loop (10 frames: acquire/record/submit/present)");
+    STAGE(7, "Buffer dump (ClearColorImage → CopyImageToBuffer → PPM file)");
     {
-        if (swapchain == VK_NULL_HANDLE || !pfn_vkAcquireNextImageKHR || !pfn_vkQueuePresentKHR) {
-            fprintf(stderr, "[stage7] SKIP — no swapchain or present functions\n");
+        #define DUMP_W 1280
+        #define DUMP_H 720
+        VkDeviceSize bufSize = (VkDeviceSize)DUMP_W * DUMP_H * 4;
+        VkResult r;
+
+        fprintf(stderr, "[stage7] Creating %dx%d test image + staging buffer...\n", DUMP_W, DUMP_H);
+        fflush(stderr);
+
+        /* Query memory properties */
+        MyVkPhysicalDeviceMemoryProperties memProps;
+        memset(&memProps, 0, sizeof(memProps));
+        if (!pfn_vkGetPhysicalDeviceMemoryProperties) {
+            fprintf(stderr, "[stage7] FAIL — vkGetPhysicalDeviceMemoryProperties not available\n");
             fflush(stderr);
             goto cleanup;
         }
-
-        /* Create sync objects */
-        MyVkSemaphoreCreateInfo semCI;
-        memset(&semCI, 0, sizeof(semCI));
-        semCI.sType = VK_STYPE_SEMAPHORE_CREATE_INFO;
-        OK_OR_DIE(pfn_vkCreateSemaphore(device, &semCI, NULL, &acquireSem), "CreateSemaphore(acquire)");
-        OK_OR_DIE(pfn_vkCreateSemaphore(device, &semCI, NULL, &renderSem),  "CreateSemaphore(render)");
-
-        MyVkFenceCreateInfo fCI;
-        memset(&fCI, 0, sizeof(fCI));
-        fCI.sType = VK_STYPE_FENCE_CREATE_INFO;
-        fCI.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        OK_OR_DIE(pfn_vkCreateFence(device, &fCI, NULL, &fence), "CreateFence");
-        fprintf(stderr, "[stage7] Sync objects: acquireSem=0x%llx renderSem=0x%llx fence=0x%llx\n",
-                (unsigned long long)acquireSem, (unsigned long long)renderSem,
-                (unsigned long long)fence);
+        pfn_vkGetPhysicalDeviceMemoryProperties(gpu, &memProps);
+        fprintf(stderr, "[stage7] Memory types: %u  heaps: %u\n",
+                memProps.memoryTypeCount, memProps.memoryHeapCount);
         fflush(stderr);
 
-        /* Create command pool + buffer for rendering */
-        MyVkCommandPoolCreateInfo cpci;
-        memset(&cpci, 0, sizeof(cpci));
-        cpci.sType = VK_STYPE_COMMAND_POOL_CREATE_INFO;
-        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        cpci.queueFamilyIndex = gfxQF;
-        OK_OR_DIE(pfn_vkCreateCommandPool(device, &cpci, NULL, &cmdPool), "CreateCommandPool");
+        /* Create OPTIMAL image (TRANSFER_SRC for copy + TRANSFER_DST for clear) */
+        MyVkImageCreateInfo ici;
+        memset(&ici, 0, sizeof(ici));
+        ici.sType = VK_STYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+        ici.width = DUMP_W;
+        ici.height = DUMP_H;
+        ici.depth = 1;
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        MyVkCommandBufferAllocateInfo cbai;
-        memset(&cbai, 0, sizeof(cbai));
-        cbai.sType = VK_STYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbai.commandPool = cmdPool;
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        OK_OR_DIE(pfn_vkAllocateCommandBuffers(device, &cbai, &cmdBuf), "AllocateCmdBuf");
+        r = pfn_vkCreateImage(device, &ici, NULL, &dumpImage);
+        fprintf(stderr, "[stage7] vkCreateImage: result=%d image=0x%llx\n",
+                r, (unsigned long long)dumpImage);
+        fflush(stderr);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[stage7] FAIL — CreateImage\n"); fflush(stderr);
+            goto cleanup;
+        }
 
-        fprintf(stderr, "[stage7] Beginning render loop...\n"); fflush(stderr);
+        /* Allocate + bind DEVICE_LOCAL memory for image */
+        MyVkMemoryRequirements imgReqs;
+        pfn_vkGetImageMemoryRequirements(device, dumpImage, &imgReqs);
+        fprintf(stderr, "[stage7] Image mem: size=%llu align=%llu typeBits=0x%x\n",
+                (unsigned long long)imgReqs.size, (unsigned long long)imgReqs.alignment,
+                imgReqs.memoryTypeBits);
+        fflush(stderr);
 
-        for (int frame = 0; frame < 10; frame++) {
-            LARGE_INTEGER t0, t1, freq;
-            QueryPerformanceCounter(&t0);
-            QueryPerformanceFrequency(&freq);
-
-            fprintf(stderr, "[stage7] Frame %d: ", frame); fflush(stderr);
-
-            /* Wait for previous frame's fence */
-            OK_OR_DIE(pfn_vkWaitForFences(device, 1, &fence, 1, 5000000000ULL), "WaitForFences");
-            OK_OR_DIE(pfn_vkResetFences(device, 1, &fence), "ResetFences");
-
-            /* Acquire next image */
-            uint32_t imageIdx = 0;
-            VkResult acqResult = pfn_vkAcquireNextImageKHR(
-                device, swapchain, 5000000000ULL, acquireSem, VK_NULL_HANDLE, &imageIdx);
-            if (acqResult != VK_SUCCESS && acqResult != VK_SUBOPTIMAL_KHR) {
-                fprintf(stderr, "AcquireNextImage FAILED (%d)\n", acqResult); fflush(stderr);
-                break;
-            }
-            fprintf(stderr, "img=%u ", imageIdx); fflush(stderr);
-
-            /* Reset and begin command buffer */
-            OK_OR_DIE(pfn_vkResetCommandBuffer(cmdBuf, 0), "ResetCmdBuf");
-            MyVkCommandBufferBeginInfo bi;
-            memset(&bi, 0, sizeof(bi));
-            bi.sType = VK_STYPE_COMMAND_BUFFER_BEGIN_INFO;
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            OK_OR_DIE(pfn_vkBeginCommandBuffer(cmdBuf, &bi), "BeginCmdBuf");
-
-            /* Barrier: UNDEFINED → GENERAL */
-            MyVkImageMemoryBarrier barrier;
-            memset(&barrier, 0, sizeof(barrier));
-            barrier.sType = VK_STYPE_IMAGE_MEMORY_BARRIER;
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.srcQueueFamilyIndex = 0xFFFFFFFF; /* VK_QUEUE_FAMILY_IGNORED */
-            barrier.dstQueueFamilyIndex = 0xFFFFFFFF;
-            barrier.image = swapImages[imageIdx];
-            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier.subresourceRange.baseMipLevel = 0;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.baseArrayLayer = 0;
-            barrier.subresourceRange.layerCount = 1;
-
-            pfn_vkCmdPipelineBarrier(cmdBuf,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, NULL, 0, NULL, 1, &barrier);
-
-            /* Clear with cycling R/G/B color */
-            MyVkClearColorValue clearColor;
-            memset(&clearColor, 0, sizeof(clearColor));
-            clearColor.float32[frame % 3] = 1.0f; /* R, G, B cycling */
-            clearColor.float32[3] = 1.0f;         /* Alpha */
-
-            MyVkImageSubresourceRange range;
-            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            range.baseMipLevel = 0;
-            range.levelCount = 1;
-            range.baseArrayLayer = 0;
-            range.layerCount = 1;
-
-            pfn_vkCmdClearColorImage(cmdBuf, swapImages[imageIdx],
-                VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
-
-            /* Barrier: GENERAL → PRESENT_SRC_KHR */
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-            pfn_vkCmdPipelineBarrier(cmdBuf,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                0, 0, NULL, 0, NULL, 1, &barrier);
-
-            OK_OR_DIE(pfn_vkEndCommandBuffer(cmdBuf), "EndCmdBuf");
-
-            /* Submit */
-            VkFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            MyVkSubmitInfo si;
-            memset(&si, 0, sizeof(si));
-            si.sType = VK_STYPE_SUBMIT_INFO;
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores = &acquireSem;
-            si.pWaitDstStageMask = &waitStage;
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &cmdBuf;
-            si.signalSemaphoreCount = 1;
-            si.pSignalSemaphores = &renderSem;
-
-            OK_OR_DIE(pfn_vkQueueSubmit(queue, 1, &si, fence), "QueueSubmit");
-
-            /* Present */
-            MyVkPresentInfoKHR pi;
-            memset(&pi, 0, sizeof(pi));
-            pi.sType = VK_STYPE_PRESENT_INFO_KHR;
-            pi.waitSemaphoreCount = 1;
-            pi.pWaitSemaphores = &renderSem;
-            pi.swapchainCount = 1;
-            pi.pSwapchains = &swapchain;
-            pi.pImageIndices = &imageIdx;
-
-            VkResult presResult = pfn_vkQueuePresentKHR(queue, &pi);
-
-            QueryPerformanceCounter(&t1);
-            double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-            fprintf(stderr, "present=%d  %.1fms\n", presResult, ms);
-            fflush(stderr);
-
-            if (presResult != VK_SUCCESS && presResult != VK_SUBOPTIMAL_KHR) {
-                fprintf(stderr, "[stage7] Present failed, stopping\n"); fflush(stderr);
+        uint32_t imgMemType = 0xFFFFFFFF;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((imgReqs.memoryTypeBits & (1u << i)) &&
+                (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                imgMemType = i;
                 break;
             }
         }
+        if (imgMemType == 0xFFFFFFFF) {
+            /* Fallback: any compatible type */
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+                if (imgReqs.memoryTypeBits & (1u << i)) { imgMemType = i; break; }
+            }
+        }
+        fprintf(stderr, "[stage7] Image memory type: %u\n", imgMemType); fflush(stderr);
 
-        /* Wait for all work to finish */
-        pfn_vkDeviceWaitIdle(device);
-        fprintf(stderr, "[stage7] PASS\n"); fflush(stderr);
+        MyVkMemoryAllocateInfo mai;
+        memset(&mai, 0, sizeof(mai));
+        mai.sType = VK_STYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = imgReqs.size;
+        mai.memoryTypeIndex = imgMemType;
+        OK_OR_DIE(pfn_vkAllocateMemory(device, &mai, NULL, &dumpImageMem), "AllocMem(image)");
+        OK_OR_DIE(pfn_vkBindImageMemory(device, dumpImage, dumpImageMem, 0), "BindImageMem");
+
+        /* Create HOST_VISIBLE staging buffer */
+        MyVkBufferCreateInfo bci;
+        memset(&bci, 0, sizeof(bci));
+        bci.sType = VK_STYPE_BUFFER_CREATE_INFO;
+        bci.size = bufSize;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        r = pfn_vkCreateBuffer(device, &bci, NULL, &dumpBuffer);
+        fprintf(stderr, "[stage7] vkCreateBuffer: result=%d buffer=0x%llx\n",
+                r, (unsigned long long)dumpBuffer);
+        fflush(stderr);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[stage7] FAIL — CreateBuffer\n"); fflush(stderr);
+            goto cleanup;
+        }
+
+        MyVkMemoryRequirements bufReqs;
+        pfn_vkGetBufferMemoryRequirements(device, dumpBuffer, &bufReqs);
+
+        uint32_t bufMemType = 0xFFFFFFFF;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+            if ((bufReqs.memoryTypeBits & (1u << i)) &&
+                (memProps.memoryTypes[i].propertyFlags &
+                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                bufMemType = i;
+                break;
+            }
+        }
+        if (bufMemType == 0xFFFFFFFF) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+                if ((bufReqs.memoryTypeBits & (1u << i)) &&
+                    (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                    bufMemType = i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[stage7] Buffer memory type: %u\n", bufMemType); fflush(stderr);
+
+        mai.allocationSize = bufReqs.size;
+        mai.memoryTypeIndex = bufMemType;
+        OK_OR_DIE(pfn_vkAllocateMemory(device, &mai, NULL, &dumpBufferMem), "AllocMem(buffer)");
+        OK_OR_DIE(pfn_vkBindBufferMemory(device, dumpBuffer, dumpBufferMem, 0), "BindBufferMem");
+
+        /* Create command pool + buffer */
+        if (!cmdPool) {
+            MyVkCommandPoolCreateInfo cpci;
+            memset(&cpci, 0, sizeof(cpci));
+            cpci.sType = VK_STYPE_COMMAND_POOL_CREATE_INFO;
+            cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cpci.queueFamilyIndex = gfxQF;
+            OK_OR_DIE(pfn_vkCreateCommandPool(device, &cpci, NULL, &cmdPool), "CreateCommandPool");
+
+            MyVkCommandBufferAllocateInfo cbai;
+            memset(&cbai, 0, sizeof(cbai));
+            cbai.sType = VK_STYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbai.commandPool = cmdPool;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 1;
+            OK_OR_DIE(pfn_vkAllocateCommandBuffers(device, &cbai, &cmdBuf), "AllocateCmdBuf");
+        }
+
+        /* Create fence */
+        if (fence == VK_NULL_HANDLE) {
+            MyVkFenceCreateInfo fCI;
+            memset(&fCI, 0, sizeof(fCI));
+            fCI.sType = VK_STYPE_FENCE_CREATE_INFO;
+            OK_OR_DIE(pfn_vkCreateFence(device, &fCI, NULL, &fence), "CreateFence");
+        }
+
+        /* Check device health */
+        {
+            VkResult dwi = pfn_vkDeviceWaitIdle(device);
+            fprintf(stderr, "[stage7] Pre-render DeviceWaitIdle: %d\n", dwi);
+            fflush(stderr);
+            if (dwi != VK_SUCCESS) {
+                fprintf(stderr, "[stage7] FAIL — device already lost!\n"); fflush(stderr);
+                goto cleanup;
+            }
+        }
+
+        /* Record command buffer:
+         *   1. Barrier: UNDEFINED → GENERAL (for ClearColorImage)
+         *   2. ClearColorImage (red)
+         *   3. Barrier: GENERAL → TRANSFER_SRC (for CopyImageToBuffer)
+         *   4. CopyImageToBuffer
+         */
+        fprintf(stderr, "[stage7] Recording command buffer...\n"); fflush(stderr);
+
+        OK_OR_DIE(pfn_vkResetCommandBuffer(cmdBuf, 0), "ResetCmdBuf");
+        MyVkCommandBufferBeginInfo bi;
+        memset(&bi, 0, sizeof(bi));
+        bi.sType = VK_STYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        OK_OR_DIE(pfn_vkBeginCommandBuffer(cmdBuf, &bi), "BeginCmdBuf");
+
+        /* Barrier: UNDEFINED → GENERAL */
+        MyVkImageMemoryBarrier barrier;
+        memset(&barrier, 0, sizeof(barrier));
+        barrier.sType = VK_STYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = 0xFFFFFFFF;
+        barrier.dstQueueFamilyIndex = 0xFFFFFFFF;
+        barrier.image = dumpImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        pfn_vkCmdPipelineBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, NULL, 0, NULL, 1, &barrier);
+
+        /* Clear with RED (B8G8R8A8: B=0, G=0, R=1.0, A=1.0) */
+        MyVkClearColorValue clearColor;
+        memset(&clearColor, 0, sizeof(clearColor));
+        clearColor.float32[0] = 1.0f; /* R */
+        clearColor.float32[3] = 1.0f; /* A */
+
+        MyVkImageSubresourceRange range;
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount = 1;
+
+        pfn_vkCmdClearColorImage(cmdBuf, dumpImage,
+            VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &range);
+
+        /* Barrier: GENERAL → TRANSFER_SRC_OPTIMAL */
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+        pfn_vkCmdPipelineBarrier(cmdBuf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, NULL, 0, NULL, 1, &barrier);
+
+        /* CopyImageToBuffer */
+        MyVkBufferImageCopy region;
+        memset(&region, 0, sizeof(region));
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;    /* tightly packed */
+        region.bufferImageHeight = 0;  /* tightly packed */
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtentW = DUMP_W;
+        region.imageExtentH = DUMP_H;
+        region.imageExtentD = 1;
+
+        pfn_vkCmdCopyImageToBuffer(cmdBuf, dumpImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dumpBuffer, 1, &region);
+
+        OK_OR_DIE(pfn_vkEndCommandBuffer(cmdBuf), "EndCmdBuf");
+
+        /* Submit + wait */
+        fprintf(stderr, "[stage7] Submitting GPU work...\n"); fflush(stderr);
+        OK_OR_DIE(pfn_vkResetFences(device, 1, &fence), "ResetFences");
+
+        MyVkSubmitInfo si;
+        memset(&si, 0, sizeof(si));
+        si.sType = VK_STYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmdBuf;
+
+        OK_OR_DIE(pfn_vkQueueSubmit(queue, 1, &si, fence), "QueueSubmit");
+        r = pfn_vkWaitForFences(device, 1, &fence, 1, 5000000000ULL);
+        fprintf(stderr, "[stage7] WaitForFences: %d\n", r); fflush(stderr);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[stage7] FAIL — WaitForFences = %d\n", r); fflush(stderr);
+            goto cleanup;
+        }
+
+        /* Map buffer and verify pixels */
+        void *mapped = NULL;
+        r = pfn_vkMapMemory(device, dumpBufferMem, 0, bufSize, 0, &mapped);
+        fprintf(stderr, "[stage7] MapMemory: result=%d mapped=%p\n", r, mapped);
+        fflush(stderr);
+        if (r != VK_SUCCESS || !mapped) {
+            fprintf(stderr, "[stage7] FAIL — MapMemory\n"); fflush(stderr);
+            goto cleanup;
+        }
+
+        /* Verify: B8G8R8A8_UNORM with red clear → each pixel should be (B=0, G=0, R=255, A=255)
+         * Byte layout: [B, G, R, A] = [0x00, 0x00, 0xFF, 0xFF] */
+        uint8_t *pixels = (uint8_t *)mapped;
+        int pixelOk = 1;
+        for (int check = 0; check < 16; check++) {
+            int px = check * (DUMP_W * DUMP_H / 16) * 4;
+            uint8_t b = pixels[px+0], g = pixels[px+1], rv = pixels[px+2], a = pixels[px+3];
+            if (check < 4) {
+                fprintf(stderr, "[stage7] Pixel[%d]: B=%u G=%u R=%u A=%u %s\n",
+                        check * (DUMP_W * DUMP_H / 16), b, g, rv, a,
+                        (b == 0 && g == 0 && rv == 255 && a == 255) ? "OK" : "WRONG");
+            }
+            if (rv < 250 || b > 5 || g > 5 || a < 250) pixelOk = 0;
+        }
+        fflush(stderr);
+
+        /* Write PPM file (P6 binary format) to /tmp/vulkan_dump.ppm */
+        {
+            const char *ppmPath = "Z:\\tmp\\vulkan_dump.ppm";
+            FILE *f = fopen(ppmPath, "wb");
+            if (f) {
+                fprintf(f, "P6\n%d %d\n255\n", DUMP_W, DUMP_H);
+                /* Convert B8G8R8A8 → R8G8B8 */
+                for (int y = 0; y < DUMP_H; y++) {
+                    for (int x = 0; x < DUMP_W; x++) {
+                        int off = (y * DUMP_W + x) * 4;
+                        uint8_t rgb[3] = { pixels[off+2], pixels[off+1], pixels[off+0] };
+                        fwrite(rgb, 1, 3, f);
+                    }
+                }
+                fclose(f);
+                fprintf(stderr, "[stage7] PPM written to /tmp/vulkan_dump.ppm (%dx%d)\n", DUMP_W, DUMP_H);
+            } else {
+                fprintf(stderr, "[stage7] WARNING: Could not write PPM (fopen failed: %d)\n", errno);
+            }
+            fflush(stderr);
+        }
+
+        pfn_vkUnmapMemory(device, dumpBufferMem);
+
+        if (pixelOk) {
+            fprintf(stderr, "[stage7] PASS — rendering verified (red clear, 16 sample pixels OK)\n");
+        } else {
+            fprintf(stderr, "[stage7] FAIL — pixel verification failed (expected red)\n");
+        }
+        fflush(stderr);
     }
 
     /* ===== Cleanup ===== */
@@ -1148,6 +1453,16 @@ cleanup:
 
     if (device) {
         pfn_vkDeviceWaitIdle(device);
+        /* Stage 7 resources */
+        if (dumpBuffer != VK_NULL_HANDLE && pfn_vkDestroyBuffer)
+            pfn_vkDestroyBuffer(device, dumpBuffer, NULL);
+        if (dumpBufferMem != VK_NULL_HANDLE && pfn_vkFreeMemory)
+            pfn_vkFreeMemory(device, dumpBufferMem, NULL);
+        if (dumpImage != VK_NULL_HANDLE && pfn_vkDestroyImage)
+            pfn_vkDestroyImage(device, dumpImage, NULL);
+        if (dumpImageMem != VK_NULL_HANDLE && pfn_vkFreeMemory)
+            pfn_vkFreeMemory(device, dumpImageMem, NULL);
+        /* General resources */
         if (cmdPool)                        pfn_vkDestroyCommandPool(device, cmdPool, NULL);
         if (fence != VK_NULL_HANDLE)        pfn_vkDestroyFence(device, fence, NULL);
         if (renderSem != VK_NULL_HANDLE)    pfn_vkDestroySemaphore(device, renderSem, NULL);
@@ -1163,6 +1478,6 @@ cleanup:
     if (hwnd)
         DestroyWindow(hwnd);
 
-    fprintf(stderr, "\n[test_wine_vulkan] === ALL STAGES PASSED ===\n"); fflush(stderr);
+    fprintf(stderr, "\n[test_wine_vulkan] === ALL STAGES COMPLETE ===\n"); fflush(stderr);
     return 0;
 }

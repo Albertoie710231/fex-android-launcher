@@ -177,7 +177,7 @@ class TerminalActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnVulkanInfo).setOnClickListener {
-            executeCommand("VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/vortek_icd.json vulkaninfo --summary 2>&1 | head -50")
+            executeCommand("VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json vulkaninfo --summary 2>&1 | head -50")
         }
 
         // vkcube: start X11 for xcb_connect(), switch to display mode, run with LD_PRELOAD
@@ -193,7 +193,7 @@ class TerminalActivity : AppCompatActivity() {
             }
             // Switch to display mode to show frames on SurfaceView
             if (!isDisplayMode) toggleDisplayMode()
-            executeCommand("export LD_PRELOAD=/lib/libvulkan_headless.so; vkcube 2>&1")
+            executeCommand("export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json; export LD_PRELOAD=/lib/libvulkan_headless.so; vkcube 2>&1")
         }
 
         findViewById<Button>(R.id.btnLs).setOnClickListener {
@@ -613,7 +613,7 @@ class TerminalActivity : AppCompatActivity() {
 
             // Vortek Vulkan configuration (guest paths — FEX maps /tmp → rootfs/tmp/)
             "VORTEK_SERVER_PATH" to "/tmp/vortek.sock",
-            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/vortek_icd.json"
+            "VK_ICD_FILENAMES" to "/usr/share/vulkan/icd.d/fex_thunk_icd.json"
         )
     }
 

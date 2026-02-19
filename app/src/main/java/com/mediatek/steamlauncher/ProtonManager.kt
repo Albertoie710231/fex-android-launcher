@@ -698,8 +698,9 @@ DXVKEOF
     }
 
     /**
-     * Test vkBeginCommandBuffer through Wine's winevulkan path.
-     * This isolates whether the hang is in Wine's Vulkan PE/unix bridge.
+     * Windows vkcube: renders a colored triangle through the full Wine Vulkan
+     * swapchain pipeline (window → surface → swapchain → render pass → shaders → draw → present).
+     * Headless layer captures frames via TCP and dumps first frame to PPM.
      */
     fun getVkCmdBufTestCommand(): String {
         return """
@@ -712,26 +713,34 @@ DXVKEOF
             export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
             export MALI_NO_ASYNC_COMPUTE=1
             export HEADLESS_LAYER=1
+            export HEADLESS_DUMP_PPM=1
             export PROTON_NO_FSYNC=1
             export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d"
             export WINEDEBUG=err+all
 
-            echo "=== Vulkan CmdBuf Test (FULL game env: HeadlessLayer + Proton winevulkan) ==="
-            echo "HEADLESS_LAYER=${'$'}HEADLESS_LAYER"
+            echo "=== Wine VkCube — Full Swapchain Render Test ==="
+            echo "HEADLESS_LAYER=${'$'}HEADLESS_LAYER  HEADLESS_DUMP_PPM=${'$'}HEADLESS_DUMP_PPM"
             echo "VK_ICD_FILENAMES=${'$'}VK_ICD_FILENAMES"
             echo ""
+            # Diagnostic: check what layer FEX sees
+            echo "Layer file inside FEX:"
+            md5sum /usr/lib/libvulkan_headless_layer.so 2>&1 || echo "(not found)"
+            strings /usr/lib/libvulkan_headless_layer.so 2>/dev/null | grep -E "COPY|OPTIMAL|pitch" | head -5
+            echo ""
 
-            # Run with 30s timeout — if it hangs on vkBeginCommandBuffer, timeout fires
-            timeout 30 wine64 /opt/stubs/test_vk_cmdbuf.exe 2>&1
+            # Render 300 frames (~10 seconds)
+            # Frames are captured on Android side by FrameSocketServer
+            timeout 30 wine64 /opt/stubs/vkcube_wine.exe 300 2>&1
             EXIT=${'$'}?
             echo ""
             if [ ${'$'}EXIT -eq 0 ]; then
-                echo "=== TEST PASSED: vkBeginCommandBuffer works through Wine ==="
+                echo "=== VKCUBE PASSED (300 frames rendered) ==="
             elif [ ${'$'}EXIT -eq 124 ]; then
-                echo "=== TEST FAILED: TIMEOUT (30s) — vkBeginCommandBuffer HANGS through Wine ==="
+                echo "=== VKCUBE TIMEOUT (30s) ==="
             else
-                echo "=== TEST FAILED: exit code ${'$'}EXIT ==="
+                echo "=== VKCUBE exit code ${'$'}EXIT ==="
             fi
+            echo "(Frames captured on Android side as frame_0/1/2.png)"
         """.trimIndent()
     }
 
