@@ -322,11 +322,9 @@ object VulkanBridge {
             "VKD3D_FEATURE_LEVEL" to "12_1",
             "VKD3D_DISABLE_EXTENSIONS" to "",
 
-            // Proton — esync/fsync MUST be disabled on Android:
-            // Android kernel lacks eventfd semaphore support (esync) and
-            // futex_waitv syscall (fsync) that Proton Wine needs.
+            // Proton — esync ENABLED (Android kernel supports eventfd, FEX passes syscalls through)
+            // fsync disabled: futex_waitv requires Linux 5.16+, not on Android 14 kernel
             "PROTON_USE_WINED3D" to "0",
-            "PROTON_NO_ESYNC" to "1",
             "PROTON_NO_FSYNC" to "1",
             "PROTON_ENABLE_NVAPI" to "0",
             "PROTON_HIDE_NVIDIA_GPU" to "0",

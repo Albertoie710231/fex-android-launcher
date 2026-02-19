@@ -130,11 +130,13 @@ export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
 export DISPLAY=:0
 export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 
-# Proton compatibility (Android kernel limitations)
-export PROTON_NO_ESYNC=1
+# Proton compatibility — esync ENABLED (Android kernel supports eventfd, FEX passes syscalls through)
 export PROTON_NO_FSYNC=1
 export PROTON_ENABLE_NVAPI=0
 export PROTON_HIDE_NVIDIA_GPU=0
+
+# Prevent Wine internal threads from creating extra Vulkan resources
+export WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER=1
 
 # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
 export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n"

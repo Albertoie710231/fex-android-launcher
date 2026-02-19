@@ -247,7 +247,7 @@ init_wineboot() {
     export WINELOADER="${PROTON_DIR}/files/bin/wine"
     export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
     export DISPLAY=localhost:0
-    export PROTON_NO_ESYNC=1
+    # esync ENABLED — Android kernel supports eventfd, FEX passes syscalls through
     export PROTON_NO_FSYNC=1
     export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 

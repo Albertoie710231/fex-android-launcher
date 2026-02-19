@@ -471,8 +471,6 @@ class ContainerManager(private val context: Context) {
         val configDir = File(fexHomeDir, ".fex-emu")
         configDir.mkdirs()
 
-        val nativeLibDir = context.applicationInfo.nativeLibraryDir
-
         // Point RootFS to the extracted rootfs directory
         // FEX looks in ~/.fex-emu/RootFS/<name>/ for the rootfs
         val rootfsSymlinkDir = File(configDir, "RootFS")
@@ -725,6 +723,55 @@ class ContainerManager(private val context: Context) {
         } catch (e: IOException) {
             Log.w(TAG, "Headless Vulkan wrapper install failed: ${e.message}")
         }
+
+        // Deploy ARM64 native headless layer for the HOST Vulkan loader.
+        // Wine's winevulkan.so calls the host ARM64 Vulkan loader via FEX thunks.
+        // The host loader can only load ARM64 layers, not x86-64 ones.
+        // The ARM64 layer SO is in jniLibs/arm64-v8a/ (nativeLibDir).
+        //
+        // CRITICAL: The layer must be an IMPLICIT layer so its instance extensions
+        // (VK_KHR_surface, VK_KHR_xlib_surface) are visible during
+        // vkEnumerateInstanceExtensionProperties. Explicit layers (loaded via
+        // VK_INSTANCE_LAYERS or VK_LAYER_PATH) don't advertise extensions until
+        // after vkCreateInstance, which is too late — Wine checks extensions first.
+        //
+        // FexExecutor sets XDG_DATA_HOME=$fexHomeDir/.fex-emu so the host Vulkan
+        // loader (version 1.3.283) scans $XDG_DATA_HOME/vulkan/implicit_layer.d/
+        // for implicit layer JSONs.
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+        val configDir = File(app.getFexHomeDir(), ".fex-emu")
+        // Clean up stale JSON from previous flat-path deployment
+        File(configDir, "VK_LAYER_HEADLESS_host.json").delete()
+        // Place JSON in vulkan/implicit_layer.d/ subdirectory so the host Vulkan loader
+        // finds it when scanning $XDG_DATA_HOME/vulkan/implicit_layer.d/ (loader 1.3.283+)
+        val implicitLayerDir = File(configDir, "vulkan/implicit_layer.d")
+        implicitLayerDir.mkdirs()
+        val layerJsonFile = File(implicitLayerDir, "VK_LAYER_HEADLESS_host.json")
+        val layerSoPath = "$nativeLibDir/libvulkan_headless_layer.so"
+        layerJsonFile.writeText("""{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_HEADLESS_surface",
+        "type": "GLOBAL",
+        "library_path": "$layerSoPath",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Headless surface bridge (ARM64 host-side) for Wine/DXVK on FEX-Emu",
+        "instance_extensions": [
+            { "name": "VK_KHR_surface", "spec_version": "25" },
+            { "name": "VK_KHR_xcb_surface", "spec_version": "6" },
+            { "name": "VK_KHR_xlib_surface", "spec_version": "6" },
+            { "name": "VK_EXT_headless_surface", "spec_version": "1" }
+        ],
+        "device_extensions": [
+            { "name": "VK_KHR_swapchain", "spec_version": "70" }
+        ],
+        "disable_environment": {
+            "DISABLE_HEADLESS_LAYER": "1"
+        }
+    }
+}""")
+        Log.i(TAG, "Host headless layer JSON: ${layerJsonFile.absolutePath} → $layerSoPath")
     }
 
     // ============================================================
@@ -840,6 +887,7 @@ class ContainerManager(private val context: Context) {
         copyAssetToFile("Galaxy64.dll", File(stubsDir, "Galaxy64.dll"))
         copyAssetToFile("GFSDK_SSAO_D3D11.win64.dll", File(stubsDir, "GFSDK_SSAO_D3D11.win64.dll"))
         copyAssetToFile("steam_api64.dll", File(stubsDir, "steam_api64.dll"))
+        copyAssetToFile("xaudio2_7.dll", File(stubsDir, "xaudio2_7.dll"))
         copyAssetToFile("test_vk_cmdbuf.exe", File(stubsDir, "test_vk_cmdbuf.exe"))
 
         Log.i(TAG, "Stub DLLs deployed to Wine path and /opt/stubs/")

@@ -175,6 +175,8 @@ class FexExecutor(private val context: Context) {
                 // Vulkan host-side ICD for thunks: host thunk → ICD loader → Vortek
                 append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
                 append("export VK_DRIVER_FILES='${baseEnv["VK_DRIVER_FILES"]}' && ")
+                append("export XDG_DATA_HOME='${baseEnv["XDG_DATA_HOME"]}' && ")
+                append("export VK_LOADER_DISABLE_INST_EXT_FILTER='1' && ")
                 append("export VORTEK_SERVER_PATH='${baseEnv["VORTEK_SERVER_PATH"]}' && ")
                 // FEX_SELF_LDSO/FEX_SELF_LIBPATH tell our patched FEX how to re-exec
                 // itself for child processes via ld.so wrapper (on Android, FEX's
@@ -309,9 +311,11 @@ class FexExecutor(private val context: Context) {
                 append("export FEX_THUNKCONFIG='$fexHomeDir/.fex-emu/thunks.json' && ")
                 append("export FEX_X87REDUCEDPRECISION=1 && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
-                // Vulkan host-side ICD for thunks
+                // Vulkan host-side ICD + layer path for thunks
                 append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
                 append("export VK_DRIVER_FILES='${baseEnv["VK_DRIVER_FILES"]}' && ")
+                append("export XDG_DATA_HOME='${baseEnv["XDG_DATA_HOME"]}' && ")
+                append("export VK_LOADER_DISABLE_INST_EXT_FILTER='1' && ")
                 append("export VORTEK_SERVER_PATH='${baseEnv["VORTEK_SERVER_PATH"]}' && ")
                 // Invoke FEXServer via ld.so wrapper (same as FEXLoader)
                 append("exec '$ldLinuxPath' --library-path '$fexLibPath' '$fexServerPath'")
@@ -586,6 +590,25 @@ class FexExecutor(private val context: Context) {
             // libvulkan_vortek.so (ARM64 glibc Vortek client).
             "VK_ICD_FILENAMES" to hostIcdJson,
             "VK_DRIVER_FILES" to hostIcdJson,
+
+            // Host-side implicit Vulkan layer for the ARM64 headless layer.
+            // Wine's winevulkan.so calls the host ARM64 Vulkan loader via FEX thunks.
+            // CRITICAL: Must be implicit (not explicit via VK_LAYER_PATH) because only
+            // implicit layers' instance extensions are visible in
+            // vkEnumerateInstanceExtensionProperties — Wine checks before vkCreateInstance.
+            // The host loader is version 1.3.283 which scans:
+            //   $XDG_DATA_HOME/vulkan/implicit_layer.d/
+            // We set XDG_DATA_HOME to a HOST filesystem path (not guest /home/user)
+            // so the loader can find our layer JSON on the real Android filesystem.
+            // ContainerManager places the JSON at $fexHomeDir/.fex-emu/vulkan/implicit_layer.d/
+            "XDG_DATA_HOME" to "$fexHomeDir/.fex-emu",
+
+            // The host Vulkan loader (1.3.283, compiled for Android) has a hardcoded list
+            // of "known" instance extensions (LOADER_INSTANCE_EXTENSIONS). Since it was
+            // built without X11 support, VK_KHR_xlib_surface is not in this list and gets
+            // rejected during loader_validate_instance_extensions() BEFORE checking layer
+            // or ICD extensions. This env var disables that hardcoded filter.
+            "VK_LOADER_DISABLE_INST_EXT_FILTER" to "1",
 
             // Vortek socket path for the Vortek client to connect to VortekRenderer
             "VORTEK_SERVER_PATH" to "$tmpDir/.vortek/V0",

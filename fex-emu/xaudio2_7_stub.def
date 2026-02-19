@@ -1,0 +1,7 @@
+LIBRARY xaudio2_7
+EXPORTS
+    DllCanUnloadNow
+    DllGetClassObject
+    DllRegisterServer
+    DllUnregisterServer
+    XAudio2Create

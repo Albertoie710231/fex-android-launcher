@@ -19,6 +19,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <signal.h>
 
 /* Forward-declare GetModuleHandleExA flags (mingw may lack them) */
 #ifndef GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -41,9 +42,12 @@
  * ======================================================================== */
 
 static long long mock_method(void) {
-    static int count = 0;
-    if (count++ < 10)
-        fprintf(stderr, "[Galaxy64] mock vtable method called (count=%d)\n", count);
+    static volatile LONG count = 0;
+    LONG c = InterlockedIncrement(&count);
+    /* Log first 10, then every 500th call to detect polling loops */
+    if (c <= 10 || (c % 500) == 0)
+        fprintf(stderr, "[Galaxy64] mock vtable method called (count=%ld, tid=%lu)\n",
+                c, GetCurrentThreadId());
     return 0;
 }
 
@@ -90,11 +94,14 @@ static void init_mocks(void)
  * .def file maps mangled C++ names to these
  * ======================================================================== */
 
-/* Interface getters — return mock objects (NOT NULL!) + trace first calls */
+/* Interface getters — return mock objects (NOT NULL!) + trace calls */
 static void trace(const char *fn) {
-    static int total = 0;
-    if (total++ < 20)
-        fprintf(stderr, "[Galaxy64] %s called\n", fn);
+    static volatile LONG total = 0;
+    LONG t = InterlockedIncrement(&total);
+    /* Log first 20, then every 200th call */
+    if (t <= 20 || (t % 200) == 0)
+        fprintf(stderr, "[Galaxy64] %s called (total=%ld, tid=%lu)\n",
+                fn, t, GetCurrentThreadId());
 }
 
 void *stub_get_user(void)              { trace("User()"); return &mock_user; }
@@ -118,7 +125,15 @@ void stub_void(void)                   { trace("Shutdown()"); }
 void stub_void_ptr(void *p)            { trace("Init()"); (void)p; }
 
 /* ProcessData — trace + sleep to prevent busy-spin */
-void stub_process_data(void)           { trace("ProcessData()"); Sleep(10); }
+void stub_process_data(void) {
+    static volatile LONG pd_count = 0;
+    LONG c = InterlockedIncrement(&pd_count);
+    /* Log first 5, then every 100th call */
+    if (c <= 5 || (c % 100) == 0)
+        fprintf(stderr, "[Galaxy64] ProcessData() count=%ld tid=%lu\n",
+                c, GetCurrentThreadId());
+    Sleep(10);
+}
 
 /* ========================================================================
  * VEH: SIGILL Trap — catches EXCEPTION_ILLEGAL_INSTRUCTION
@@ -179,10 +194,58 @@ static void analyze_instruction(const unsigned char *rip)
     }
 }
 
+/* Walk the stack by reading return addresses from RSP.
+ * x64 ABI: return addresses are at [RSP], [RSP+N*8] for some N.
+ * We scan stack slots for values that look like code addresses. */
+static void dump_stack_trace(CONTEXT *ctx)
+{
+    DWORD64 rsp = ctx->Rsp;
+    fprintf(stderr, "Stack trace (scanning RSP=0x%llx for return addresses):\n",
+            (unsigned long long)rsp);
+
+    /* RIP is the current instruction */
+    dump_module_for_addr(ctx->Rip, "  [0] RIP");
+
+    /* Scan stack for plausible return addresses */
+    int found = 0;
+    for (int i = 0; i < 128 && found < 16; i++) {
+        DWORD64 val = 0;
+        /* Read 8 bytes from stack safely */
+        if (!IsBadReadPtr((void*)(ULONG_PTR)(rsp + i*8), 8)) {
+            val = *(DWORD64*)(ULONG_PTR)(rsp + i*8);
+        } else {
+            continue;
+        }
+        /* Check if it looks like a code address (> 0x100000, < 0x800000000000) */
+        if (val > 0x100000 && val < 0x800000000000ULL) {
+            HMODULE mod = NULL;
+            if (GetModuleHandleExA(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCSTR)(ULONG_PTR)val, &mod)) {
+                char name[MAX_PATH];
+                GetModuleFileNameA(mod, name, MAX_PATH);
+                found++;
+                fprintf(stderr, "  [%d] RSP+0x%x: 0x%llx  %s +0x%llx\n",
+                        found, i*8, (unsigned long long)val, name,
+                        (unsigned long long)(val - (ULONG_PTR)mod));
+            }
+        }
+    }
+    if (found == 0)
+        fprintf(stderr, "  (no return addresses found on stack)\n");
+}
+
 static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
 
+    /* ONLY catch SIGILL and privileged instruction.
+     * DO NOT catch ACCESS_VIOLATION (c0000005) — Wine uses AVs legitimately
+     * for guard pages, copy-on-write, and other internal mechanisms.
+     * Catching AVs kills the process before Wine can handle them.
+     * DO NOT catch STACK_BUFFER_OVERRUN (c0000409) — non-deterministic,
+     * let Wine/OS handle it. */
     if (code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_PRIV_INSTRUCTION)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -194,18 +257,24 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
     fprintf(stderr, "=== SIGILL TRAP: Exception 0x%08lx ===\n", code);
     fprintf(stderr, "================================================\n");
     fprintf(stderr, "PID: %lu  TID: %lu\n", GetCurrentProcessId(), GetCurrentThreadId());
-    fprintf(stderr, "RIP: 0x%016llx  RSP: 0x%016llx\n",
-            (unsigned long long)ctx->Rip, (unsigned long long)ctx->Rsp);
+    fprintf(stderr, "RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n",
+            (unsigned long long)ctx->Rip, (unsigned long long)ctx->Rsp,
+            (unsigned long long)ctx->Rbp);
+    fprintf(stderr, "RAX: 0x%016llx  RCX: 0x%016llx  RDX: 0x%016llx\n",
+            (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rcx,
+            (unsigned long long)ctx->Rdx);
+    fprintf(stderr, "R8:  0x%016llx  R9:  0x%016llx  R10: 0x%016llx\n",
+            (unsigned long long)ctx->R8, (unsigned long long)ctx->R9,
+            (unsigned long long)ctx->R10);
 
     /* Instruction bytes */
     fprintf(stderr, "Bytes:");
     for (int i = 0; i < 16; i++)
         fprintf(stderr, " %02x", rip[i]);
     fprintf(stderr, "\n");
-
     analyze_instruction(rip);
 
-    /* Module lookup */
+    /* Module lookup for RIP */
     {
         HMODULE mod = NULL;
         if (GetModuleHandleExA(
@@ -223,6 +292,9 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
         }
     }
 
+    /* Stack trace */
+    dump_stack_trace(ctx);
+
     fprintf(stderr, "================================================\n");
     fflush(stderr);
 
@@ -231,7 +303,41 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
 }
 
 /* ========================================================================
- * DllMain — installs VEH + initializes mock interfaces
+ * CRT SIGABRT handler — prevents Wine assertion from killing the process.
+ *
+ * Wine's thread 0090 hits assert(!status) in winevulkan/loader.c:668.
+ * The call chain: _wassert → abort() → msvcrt raise(SIGABRT).
+ *
+ * Wine's msvcrt raise() checks the CRT signal handler table (NOT POSIX).
+ * With SIG_DFL it calls ExitProcess(3), killing ALL threads.
+ *
+ * Fix: Install a CRT handler via signal() that calls ExitThread(0),
+ * killing ONLY the asserting thread. The game thread survives.
+ *
+ * Note: msvcrt resets the handler to SIG_DFL before calling it,
+ * so we re-install inside the handler for subsequent assertions.
+ * ======================================================================== */
+
+static void abort_handler(int sig) {
+    /* Re-install immediately (msvcrt resets to SIG_DFL before calling us) */
+    signal(SIGABRT, abort_handler);
+    (void)sig;
+    DWORD tid = GetCurrentThreadId();
+    fprintf(stderr, "[Galaxy64] SIGABRT caught on thread %lu — suspending thread (not killing)\n", tid);
+    fflush(stderr);
+    /* SuspendThread instead of ExitThread:
+     * ExitThread triggers DLL_THREAD_DETACH and destroys the thread, which
+     * orphans any Wine critical sections/mutexes the thread holds → deadlock.
+     * SuspendThread freezes the thread in place — locks are still held but
+     * the thread isn't destroyed, so Wine's lock tracking remains consistent.
+     * The thread will never resume, but that's OK for an assertion-failed thread. */
+    SuspendThread(GetCurrentThread());
+    /* If SuspendThread somehow fails/returns, sleep forever as fallback */
+    for (;;) Sleep(60000);
+}
+
+/* ========================================================================
+ * DllMain — installs VEH + SIGABRT handler + initializes mock interfaces
  * ======================================================================== */
 
 BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
@@ -242,6 +348,9 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
 
         /* Initialize mock Galaxy interfaces */
         init_mocks();
+
+        /* Install CRT SIGABRT handler — prevents Wine assertion ExitProcess(3) */
+        signal(SIGABRT, abort_handler);
 
         /* Install VEH as FIRST handler */
         AddVectoredExceptionHandler(1, sigill_handler);

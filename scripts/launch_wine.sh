@@ -130,8 +130,7 @@ export WINESERVER="${PROTON_DIR}/files/bin/wineserver"
 export DISPLAY=localhost:0
 export LD_LIBRARY_PATH="${PROTON_DIR}/files/lib/wine/x86_64-unix:${PROTON_DIR}/files/lib:${LD_LIBRARY_PATH:-}"
 
-# Proton compatibility (Android kernel limitations)
-export PROTON_NO_ESYNC=1
+# Proton compatibility — esync ENABLED (Android kernel supports eventfd, FEX passes syscalls through)
 export PROTON_NO_FSYNC=1
 export PROTON_ENABLE_NVAPI=0
 export PROTON_HIDE_NVIDIA_GPU=0

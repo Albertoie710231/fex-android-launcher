@@ -40,6 +40,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <signal.h>
+#include <sys/syscall.h>
 
 /* ============================================================================
  * Section 1: Vulkan Types and Constants (inline, no SDK headers needed)
@@ -80,6 +81,7 @@ typedef uint64_t VkDeviceSize;
 #define VK_STRUCTURE_TYPE_PRESENT_INFO_KHR 1000001001
 
 /* Layer protocol sTypes */
+#define VK_STRUCTURE_TYPE_SUBMIT_INFO 4
 #define VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO 47
 #define VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO 48
 
@@ -220,6 +222,17 @@ typedef struct VkPresentInfoKHR {
     uint32_t swapchainCount; const VkSwapchainKHR* pSwapchains;
     const uint32_t* pImageIndices; VkResult* pResults;
 } VkPresentInfoKHR;
+
+typedef struct VkSubmitInfo {
+    int sType; const void* pNext;
+    uint32_t waitSemaphoreCount;
+    const VkSemaphore* pWaitSemaphores;
+    const VkFlags* pWaitDstStageMask;
+    uint32_t commandBufferCount;
+    const VkCommandBuffer* pCommandBuffers;
+    uint32_t signalSemaphoreCount;
+    const VkSemaphore* pSignalSemaphores;
+} VkSubmitInfo;
 
 typedef struct VkImageCreateInfo {
     int sType; const void* pNext; VkFlags flags;
@@ -452,24 +465,43 @@ static volatile int g_call_seq = 0;
 #define TRACE_FN(name) do { \
     g_last_fn = name; \
     int _seq = __sync_add_and_fetch(&g_call_seq, 1); \
-    char _tb[128]; snprintf(_tb, sizeof(_tb), "[%d] " name, _seq); \
+    long _tid = syscall(SYS_gettid); \
+    char _tb[160]; snprintf(_tb, sizeof(_tb), "[%d] T%ld " name, _seq, _tid); \
     layer_marker(_tb); \
 } while(0)
 
 /* SIGABRT handler — Wine's _wassert calls abort() which raises SIGABRT.
- * We log the last known function to help identify which PE→Unix call failed. */
+ *
+ * Wine 10's loader.c has assert(!status) after every UNIX_CALL. If the
+ * unix-side Vulkan handler crashes (e.g. from a driver issue), status is
+ * non-zero and the assert fires. This is a known issue (Proton #7323)
+ * that kills the entire process even though only one thread is affected.
+ *
+ * FIX: Use syscall(SYS_exit, 0) to terminate ONLY the offending thread.
+ * SYS_exit (60) kills just the calling thread; SYS_exit_group (231) would
+ * kill the whole process. The DXVK rendering thread survives and the game
+ * can continue.
+ *
+ * Risk: Thread 0090 might hold Wine locks. If so, other threads will
+ * deadlock on those locks. But empirically, the game progresses further
+ * than it does with the assertion killing the whole process. */
 static void sigabrt_handler(int sig) {
     (void)sig;
-    FILE* f = fopen("/tmp/vk_abort_info.log", "w");
+    long tid = syscall(SYS_gettid);
+    FILE* f = fopen("/tmp/vk_abort_info.log", "a");
     if (f) {
-        fprintf(f, "SIGABRT caught!\n");
+        fprintf(f, "SIGABRT caught on thread %ld! Killing ONLY this thread.\n", tid);
         fprintf(f, "Last Vulkan function: %s\n", (const char*)g_last_fn);
         fprintf(f, "Call sequence: %d\n", g_call_seq);
         fclose(f);
     }
-    /* Re-raise to allow default abort behavior */
-    signal(SIGABRT, SIG_DFL);
-    raise(SIGABRT);
+    /* Log to stderr too */
+    fprintf(stderr, LOG_TAG "SIGABRT on T%ld — killing thread only (last fn: %s)\n",
+            tid, (const char*)g_last_fn);
+    fflush(stderr);
+    /* Kill ONLY this thread, not the whole process.
+     * SYS_exit = 60 on x86-64. Does NOT call atexit handlers or _exit(). */
+    syscall(SYS_exit, 0);
 }
 
 /* ============================================================================
@@ -655,6 +687,7 @@ typedef struct SwapchainEntry {
     uint32_t width, height;
     int format;
     uint32_t current_image;
+    VkQueue signal_queue;           /* for signaling acquire semaphore/fence */
     struct SwapchainEntry* next;
 } SwapchainEntry;
 
@@ -1231,8 +1264,24 @@ static VkResult headless_GetPhysicalDeviceSurfaceCapabilities2KHR(
     VkSurfaceCapabilities2KHR* pSurfaceCapabilities)
 {
     TRACE_FN("vkGetPhysicalDeviceSurfaceCapabilities2KHR");
-    LOG("vkGetPhysicalDeviceSurfaceCapabilities2KHR: surface=0x%llx\n",
-        (unsigned long long)(pSurfaceInfo ? pSurfaceInfo->surface : 0));
+    LOG("vkGetPhysicalDeviceSurfaceCapabilities2KHR: surface=0x%llx pNext=%p\n",
+        (unsigned long long)(pSurfaceInfo ? pSurfaceInfo->surface : 0),
+        pSurfaceCapabilities ? pSurfaceCapabilities->pNext : NULL);
+
+    /* Log pNext chain for diagnostics — Wine 10's win32u may pass extension structs */
+    if (pSurfaceCapabilities && pSurfaceCapabilities->pNext) {
+        const struct { int sType; void* pNext; } *chain = pSurfaceCapabilities->pNext;
+        int depth = 0;
+        while (chain && depth < 8) {
+            char pbuf[128];
+            snprintf(pbuf, sizeof(pbuf), "SC2KHR_pNext[%d] sType=%d ptr=%p next=%p",
+                     depth, chain->sType, (void*)chain, chain->pNext);
+            layer_marker(pbuf);
+            LOG("  pNext[%d]: sType=%d\n", depth, chain->sType);
+            chain = chain->pNext;
+            depth++;
+        }
+    }
 
     if (pSurfaceInfo) {
         /* Delegate to our existing capabilities handler */
@@ -1473,6 +1522,18 @@ static VkResult headless_CreateSwapchainKHR(
         layer_marker(dbuf);
     }
 
+    /* Get a queue for signaling acquire semaphore/fence in AcquireNextImage.
+     * Without this, DXVK's vkQueueSubmit waits forever on the unsignaled semaphore. */
+    sc->signal_queue = NULL;
+    {
+        typedef void (*PFN_GDQ)(VkDevice, uint32_t, uint32_t, VkQueue*);
+        PFN_GDQ fn_gdq = (PFN_GDQ)next_device_proc_for(device, "vkGetDeviceQueue");
+        if (fn_gdq) {
+            fn_gdq(device, 0, 0, &sc->signal_queue);
+            LOG("Got signal_queue=%p for acquire sync\n", sc->signal_queue);
+        }
+    }
+
     pthread_mutex_lock(&g_mutex);
     sc->next = g_swapchains;
     g_swapchains = sc;
@@ -1563,6 +1624,46 @@ static VkResult headless_AcquireNextImageKHR(
     }
     *pImageIndex = sc->current_image;
     sc->current_image = (sc->current_image + 1) % sc->image_count;
+
+    /* Signal the acquire semaphore and/or fence via a no-op queue submit.
+     * Without this, DXVK's vkQueueSubmit waits forever on the unsignaled
+     * semaphore — the headless "presentation engine" is always ready. */
+    {
+        char abuf[256];
+        snprintf(abuf, sizeof(abuf), "ANI img=%u sem=0x%llx fence=0x%llx queue=%p dev=%p",
+                 pImageIndex ? *pImageIndex : 99,
+                 (unsigned long long)sem, (unsigned long long)fence,
+                 sc->signal_queue, device);
+        layer_marker(abuf);
+    }
+
+    if ((sem || fence) && sc->signal_queue) {
+        VkSubmitInfo si;
+        memset(&si, 0, sizeof(si));
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (sem) {
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &sem;
+        }
+        typedef VkResult (*PFN_QS)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+        PFN_QS fn_qs = (PFN_QS)next_device_proc_for(device, "vkQueueSubmit");
+        {
+            char abuf[128];
+            snprintf(abuf, sizeof(abuf), "ANI_SIGNAL fn_qs=%p", (void*)fn_qs);
+            layer_marker(abuf);
+        }
+        if (fn_qs) {
+            VkResult r = fn_qs(sc->signal_queue, 1, &si, fence);
+            {
+                char abuf[128];
+                snprintf(abuf, sizeof(abuf), "ANI_SIGNAL_RESULT=%d", r);
+                layer_marker(abuf);
+            }
+        }
+    } else {
+        layer_marker("ANI_NO_SIGNAL");
+    }
+
     return VK_SUCCESS;
 }
 
@@ -1656,12 +1757,69 @@ static VkResult headless_EnumerateInstanceExtensionProperties(
         return n < 4 ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    /* For other layer names or NULL (global), forward to next layer */
+    /* Forward to next layer/ICD */
     typedef VkResult (*PFN)(const char*, uint32_t*, VkExtensionProperties*);
     PFN fn = NULL;
     if (g_next_gipa) fn = (PFN)g_next_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
-    if (fn) return fn(pLayerName, pCount, pProps);
-    return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* If querying a specific other layer, just forward */
+    if (pLayerName) return fn(pLayerName, pCount, pProps);
+
+    /* Global query (pLayerName == NULL): merge our extensions into the ICD list.
+     * Loader 1.3.283 doesn't merge implicit layer extensions into the global
+     * list, so we must do it ourselves for VK_KHR_xlib_surface etc. to be
+     * visible during vkCreateInstance extension validation. */
+    static const VkExtensionProperties layer_exts[] = {
+        { "VK_KHR_surface", 25 },
+        { "VK_KHR_xcb_surface", 6 },
+        { "VK_KHR_xlib_surface", 6 },
+        { "VK_EXT_headless_surface", 1 }
+    };
+    static const uint32_t layer_ext_count = sizeof(layer_exts) / sizeof(layer_exts[0]);
+
+    /* Get ICD/next-layer extension count */
+    uint32_t icd_count = 0;
+    VkResult res = fn(NULL, &icd_count, NULL);
+    if (res != VK_SUCCESS) return res;
+
+    /* Count how many of our extensions are NOT already in the ICD list */
+    VkExtensionProperties icd_exts[64];
+    uint32_t tmp_count = icd_count < 64 ? icd_count : 64;
+    fn(NULL, &tmp_count, icd_exts);
+
+    uint32_t new_count = 0;
+    for (uint32_t i = 0; i < layer_ext_count; i++) {
+        int found = 0;
+        for (uint32_t j = 0; j < tmp_count; j++) {
+            if (strcmp(layer_exts[i].extensionName, icd_exts[j].extensionName) == 0) {
+                found = 1; break;
+            }
+        }
+        if (!found) new_count++;
+    }
+
+    uint32_t total = icd_count + new_count;
+    if (!pProps) { *pCount = total; return VK_SUCCESS; }
+
+    /* Fill: ICD extensions first, then our unique ones */
+    uint32_t avail = *pCount;
+    uint32_t filled = avail < icd_count ? avail : icd_count;
+    res = fn(NULL, &filled, pProps);
+
+    uint32_t pos = filled;
+    for (uint32_t i = 0; i < layer_ext_count && pos < avail; i++) {
+        int found = 0;
+        for (uint32_t j = 0; j < filled; j++) {
+            if (strcmp(layer_exts[i].extensionName, pProps[j].extensionName) == 0) {
+                found = 1; break;
+            }
+        }
+        if (!found) pProps[pos++] = layer_exts[i];
+    }
+
+    *pCount = pos;
+    return pos < total ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static VkResult headless_EnumerateDeviceExtensionProperties(
@@ -2423,9 +2581,8 @@ static int gdpa_log_count = 0;
 
 static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char* pName)
 {
-    /* Log ALL GDPA lookups to trace file for diagnostics */
     gdpa_log_count++;
-    if (gdpa_log_count <= 500) {
+    if (gdpa_log_count <= 50) {
         char tbuf[256];
         snprintf(tbuf, sizeof(tbuf), "GDPA[%d] dev=%p %s", gdpa_log_count, device, pName ? pName : "(null)");
         layer_marker(tbuf);
@@ -2439,39 +2596,13 @@ static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char
     /* NOTE: Do NOT intercept vkBeginCommandBuffer/vkEndCommandBuffer here!
      * Dispatchable handle (VkCommandBuffer) dispatch through GDPA causes
      * recursive PE↔unix call that triggers Wine assertion crash.
-     * Only intercept non-dispatchable or device-level functions. */
-    if (strcmp(pName, "vkAllocateCommandBuffers") == 0) {
-        if (!g_real_AllocCmdBufs && g_next_gdpa)
-            g_real_AllocCmdBufs = (PFN_vkAllocateCommandBuffers)g_next_gdpa(device, pName);
-        if (g_real_AllocCmdBufs)
-            return (PFN_vkVoidFunction)headless_AllocateCommandBuffers;
-    }
-    if (strcmp(pName, "vkQueueSubmit") == 0) {
-        if (!g_real_QueueSubmit && g_next_gdpa)
-            g_real_QueueSubmit = (PFN_vkQueueSubmit)g_next_gdpa(device, pName);
-        if (g_real_QueueSubmit)
-            return (PFN_vkVoidFunction)headless_QueueSubmit;
-    }
-    if (strcmp(pName, "vkCreateCommandPool") == 0) {
-        if (!g_real_CreateCmdPool && g_next_gdpa)
-            g_real_CreateCmdPool = (PFN_vkCreateCommandPool)g_next_gdpa(device, pName);
-        if (g_real_CreateCmdPool)
-            return (PFN_vkVoidFunction)headless_CreateCommandPool;
-    }
-
-    /* Device function call tracing — intercept common create functions */
-    if (strcmp(pName, "vkCreateFence") == 0) {
-        if (!g_real_CreateFence && g_next_gdpa)
-            g_real_CreateFence = (PFN_vkCreateFence)g_next_gdpa(device, pName);
-        if (g_real_CreateFence)
-            return (PFN_vkVoidFunction)headless_wrap_CreateFence;
-    }
-    if (strcmp(pName, "vkCreateSemaphore") == 0) {
-        if (!g_real_CreateSemaphore && g_next_gdpa)
-            g_real_CreateSemaphore = (PFN_vkCreateSemaphore)g_next_gdpa(device, pName);
-        if (g_real_CreateSemaphore)
-            return (PFN_vkVoidFunction)headless_wrap_CreateSemaphore;
-    }
+     *
+     * ALSO: Do NOT intercept vkAllocateCommandBuffers, vkCreateCommandPool,
+     * vkQueueSubmit, vkCreateFence, vkCreateSemaphore here. Wrapping these
+     * with global function pointers corrupts the dispatch chain for Wine
+     * internal threads (thread 0090), causing UNIX_CALL to crash and
+     * assert(!status) at loader.c:668. Let them pass through to the ICD's
+     * dispatch-fixing trampolines instead. */
 
     /* Swapchain */
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
@@ -2485,12 +2616,14 @@ static PFN_vkVoidFunction headless_GetDeviceProcAddr(VkDevice device, const char
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)headless_QueuePresentKHR;
 
-    /* Use GDPA only — the ICD's GDPA uses dlsym() for safe dispatch.
+    /* Use per-device GDPA — the ICD's GDPA uses dlsym() for safe dispatch.
      * NEVER use GIPA here: it creates dev_ext_trampolines that cause
-     * infinite thunk recursion in FEX. */
+     * infinite thunk recursion in FEX.
+     * Use per-device lookup to ensure correct dispatch for each device. */
+    PFN_vkGetDeviceProcAddr dev_gdpa = gdpa_for_device(device);
     PFN_vkVoidFunction fn = NULL;
-    if (g_next_gdpa)
-        fn = g_next_gdpa(device, pName);
+    if (dev_gdpa && device)
+        fn = dev_gdpa(device, pName);
 
     return fn;
 }

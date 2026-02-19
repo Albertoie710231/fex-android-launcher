@@ -185,8 +185,8 @@ class ProtonManager(private val context: Context) {
             "VKD3D_FEATURE_LEVEL" to "12_1",
 
             // Proton compatibility flags
-            "PROTON_NO_ESYNC" to "1",     // eventfd may not work on Android
-            "PROTON_NO_FSYNC" to "1",     // futex_waitv not available on Android
+            // esync ENABLED — Android kernel supports eventfd(), FEX passes syscalls through
+            "PROTON_NO_FSYNC" to "1",     // futex_waitv requires Linux 5.16+, not on Android 14 kernel
             "PROTON_USE_WINED3D" to "0",  // Use DXVK (Vulkan), not OpenGL
             "PROTON_ENABLE_NVAPI" to "0",
             "PROTON_HIDE_NVIDIA_GPU" to "0",
@@ -203,9 +203,10 @@ class ProtonManager(private val context: Context) {
             // Disable VR in Proton
             "PROTON_ENABLE_NVAPI" to "0",
 
-            // DLL overrides: use DXVK (native) for D3D, disable wined3d (SIGILL),
-            // use our stub DLLs for d3dcompiler_47, and disable mscoree/mshtml (.NET/IE)
-            "WINEDLLOVERRIDES" to "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d",
+            // DLL overrides: use DXVK (native) for D3D, disable wined3d (SIGILL)
+            // d3dcompiler_47=n: our stub with working D3DReflect (game needs 229 shader reflections)
+            // xaudio2_7=n: our stub (mock COM server) — FAudio crashes under FEX
+            "WINEDLLOVERRIDES" to "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d",
             "WINEDEBUG" to "err+all",
 
             // Misc
@@ -306,7 +307,6 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
             export DISPLAY=:0
-            export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
 
@@ -444,8 +444,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export DXVK_LOG_LEVEL=trace
             export DXVK_HUD=fps,devinfo
 
-            # Proton compatibility
-            export PROTON_NO_ESYNC=1
+            # Proton compatibility — esync ENABLED (Android kernel supports eventfd)
             export PROTON_NO_FSYNC=1
             export PROTON_USE_WINED3D=0
 
@@ -458,7 +457,12 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export HEADLESS_LAYER=1
 
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
-            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;xaudio2_0=d;xaudio2_1=d;xaudio2_2=d;xaudio2_3=d;xaudio2_4=d;xaudio2_5=d;xaudio2_6=d;xaudio2_7=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d;quartz=d;wmvcore=d"
+            # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
+            # d3dcompiler_47=n: our stub with working D3DReflect (game needs 229 shader reflections)
+            # xaudio2_7=n: our stub (mock COM server) — FAudio's version crashes under FEX
+            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
+            # Trace wineserver calls to find what the main thread blocks on
+            # +server goes to file to avoid SIGPIPE from pipe flooding
             export WINEDEBUG=err+all
 
             # Misc
@@ -494,9 +498,12 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
                     cp "${'$'}DXVK_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
                 fi
             done
-            # d3dcompiler_47 stub
+            # d3dcompiler_47 stub (with working D3DReflect — game needs 229 shader reflections)
             [ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "${'$'}SYS32/d3dcompiler_47.dll"
-            echo "DXVK standalone DLLs installed to system32"
+            # xaudio2_7 stub — FAudio's xaudio2_7.dll crashes under FEX, our stub provides
+            # mock IXAudio2 COM objects so the game's audio init succeeds (no-op audio)
+            [ -f "/opt/stubs/xaudio2_7.dll" ] && cp "/opt/stubs/xaudio2_7.dll" "${'$'}SYS32/xaudio2_7.dll"
+            echo "DXVK standalone DLLs + stubs installed to system32"
 
             # Create DXVK config to disable OpenVR/OpenXR (no VR hardware, avoids extension query crash)
             cat > "$exeDir/dxvk.conf" << 'DXVKEOF'
@@ -530,13 +537,33 @@ DXVKEOF
             wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
             echo "Disabled XRandR/XVidMode in Wine registry"
 
+            # Enable virtual desktop via registry — CRITICAL for headless rendering.
+            # Without virtual desktop, Wine tries to go fullscreen via X11
+            # (ChangeDisplaySettings → XRandR), which libXlorie doesn't support.
+            # The game's message pump then blocks forever waiting for X11 events.
+            #
+            # Wine virtual desktop needs TWO registry keys:
+            #   1. Explorer\Desktops\<name> = WxH  → defines the desktop size
+            #   2. Explorer\Desktop = <name>        → activates it
+            # Without key #2, Wine ignores the desktop definition entirely!
+            wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
+            echo "Virtual desktop: 1280x720 (ACTIVATED)"
+
+            # Verify both keys were written
+            echo "--- Registry verification ---"
+            wine64 reg query 'HKCU\Software\Wine\Explorer' 2>/dev/null | grep -i desktop || echo "(Explorer key query failed)"
+            wine64 reg query 'HKCU\Software\Wine\Explorer\Desktops' 2>/dev/null | grep -i default || echo "(Desktops key query failed)"
+            echo "---"
+
             echo "=== Launching: $exePath ==="
             echo "Working dir: $exeDir"
             echo "Wine prefix: $winePrefix"
             echo ""
 
-            # Clear old layer trace log for this run
+            # Clear old trace logs for this run
             rm -f /tmp/layer_trace.log
+            rm -f /tmp/icd_trace.log
 
             cd "$exeDir"
 
@@ -548,10 +575,13 @@ DXVKEOF
             objdump -p "$exePath" 2>/dev/null | grep "DLL Name" | head -30 || echo "(objdump not available)"
             echo "=== END PE IMPORTS ==="
 
-            # Launch wine in background so we can inspect its threads
-            wine64 "$exePath" $extraArgs 2>&1 &
+            # Launch directly (virtual desktop configured via registry above).
+            # +server trace goes to file (too verbose for pipe — would SIGPIPE)
+            START_TIME=${'$'}(date +%s)
+            WINEDEBUG=+server,err+all wine64 "$exePath" $extraArgs 2>/tmp/wine_server_trace.log &
             WINE_PID=${'$'}!
             echo "Wine PID: ${'$'}WINE_PID"
+            echo "Server trace: /tmp/wine_server_trace.log"
 
             # Thread diagnostic — sample at t+15s and t+45s to see if CPU increases
             dump_threads() {
@@ -569,6 +599,11 @@ DXVKEOF
                         MINFLT=${'$'}(awk '{print ${'$'}10}' ${'$'}tp/stat 2>/dev/null)
                         MAJFLT=${'$'}(awk '{print ${'$'}12}' ${'$'}tp/stat 2>/dev/null)
                         echo "  TID ${'$'}tid: ${'$'}STATE wchan=${'$'}WCHAN u=${'$'}UT s=${'$'}ST minflt=${'$'}MINFLT majflt=${'$'}MAJFLT sys=${'$'}SYSCALL"
+                        # Kernel stack trace — shows exact syscall/futex blocking point
+                        KSTACK=${'$'}(cat ${'$'}tp/stack 2>/dev/null | head -5)
+                        if [ -n "${'$'}KSTACK" ]; then
+                            echo "    stack: ${'$'}(echo "${'$'}KSTACK" | tr '\n' ' | ')"
+                        fi
                     done
                 else
                     echo "  Wine PID ${'$'}WINE_PID no longer exists!"
@@ -576,22 +611,75 @@ DXVKEOF
                 echo "=== END DIAGNOSTIC ==="
             }
 
+            # Background diagnostics — check X11 windows and rendering progress
+            (
+                sleep 8
+                echo ""
+                echo "=== X11 WINDOW TREE (t+8s) ==="
+                xwininfo -root -tree 2>/dev/null | head -40 || echo "(xwininfo not available)"
+                echo "=== END X11 TREE ==="
+
+                echo ""
+                echo "=== WINE PROCESS MAP (t+8s) ==="
+                # Show what Wine processes are running
+                ps -eo pid,comm,args 2>/dev/null | grep -i wine | head -20
+                echo "---"
+                # Check if explorer.exe is running (virtual desktop)
+                ps -eo pid,comm,args 2>/dev/null | grep -i explorer | head -5
+                echo "=== END PROCESS MAP ==="
+            ) &
+
             sleep 15
             dump_threads "t+15s"
 
-            # Dump memory maps (raw, first 40 lines + last 20)
+            # Early layer trace snapshot
             echo ""
-            echo "=== PROC MAPS (head) ==="
-            head -40 /proc/${'$'}WINE_PID/maps 2>/dev/null || echo "(maps not readable)"
-            echo "..."
-            echo "=== PROC MAPS (named regions) ==="
-            grep -v '^\S* \S* \S* \S* 0 ' /proc/${'$'}WINE_PID/maps 2>/dev/null | tail -30
-            echo "=== END MAPS ==="
+            echo "=== /tmp/layer_trace.log (t+15s snapshot) ==="
+            tail -30 /tmp/layer_trace.log 2>/dev/null || echo "(no layer_trace.log yet)"
+            echo "=== end snapshot ==="
 
-            sleep 15
-            dump_threads "t+30s"
+            # Periodic checks — game may need several minutes to load under FEX
+            for checkpoint in 30 60 120 180 240 300; do
+                sleep_dur=${'$'}((checkpoint - ${'$'}(( ${'$'}(date +%s) - ${'$'}START_TIME )) ))
+                [ ${'$'}sleep_dur -gt 0 ] && sleep ${'$'}sleep_dur
 
-            # Wait for wine to finish
+                # Check if game process is still alive
+                if [ ! -d /proc/${'$'}WINE_PID ]; then
+                    echo "Wine PID ${'$'}WINE_PID exited before t+${'$'}{checkpoint}s"
+                    break
+                fi
+
+                dump_threads "t+${'$'}{checkpoint}s"
+
+                # Check for rendering activity (new Vulkan calls since last check)
+                echo "=== layer_trace check (t+${'$'}{checkpoint}s) ==="
+                PRESENT_COUNT=${'$'}(grep -c "vkQueuePresentKHR" /tmp/layer_trace.log 2>/dev/null); PRESENT_COUNT=${'$'}{PRESENT_COUNT:-0}
+                ACQUIRE_COUNT=${'$'}(grep -c "vkAcquireNextImageKHR" /tmp/layer_trace.log 2>/dev/null); ACQUIRE_COUNT=${'$'}{ACQUIRE_COUNT:-0}
+                echo "  AcquireNextImage calls: ${'$'}ACQUIRE_COUNT"
+                echo "  QueuePresent calls: ${'$'}PRESENT_COUNT"
+                if [ "${'$'}PRESENT_COUNT" -gt 0 ]; then
+                    echo "  >>> RENDERING ACTIVE! <<<"
+                    tail -10 /tmp/layer_trace.log 2>/dev/null
+                fi
+                # Dump last wineserver calls for the main thread (first Wine TID = 0024)
+                if [ "${'$'}checkpoint" -eq 60 ]; then
+                    echo "=== SERVER TRACE (last 50 lines, t+60s) ==="
+                    tail -50 /tmp/wine_server_trace.log 2>/dev/null || echo "(no server trace)"
+                    echo "=== end server trace ==="
+                    echo ""
+                    echo "=== SERVER TRACE: grep NtWait/select (blocked calls) ==="
+                    grep -E "NtWait|select|poll_user_apc" /tmp/wine_server_trace.log 2>/dev/null | tail -30
+                    echo "=== end blocked calls ==="
+                    echo ""
+                    echo "=== SERVER TRACE SIZE ==="
+                    wc -l /tmp/wine_server_trace.log 2>/dev/null || echo "(no file)"
+                    ls -la /tmp/wine_server_trace.log 2>/dev/null
+                    echo "=== end size ==="
+                fi
+                echo "=== end check ==="
+            done
+
+            # Wait for wine to finish (timeout after 3 minutes total)
             wait ${'$'}WINE_PID 2>/dev/null
             WINE_EXIT=${'$'}?
             echo ""
@@ -624,7 +712,6 @@ DXVKEOF
             export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
             export MALI_NO_ASYNC_COMPUTE=1
             export HEADLESS_LAYER=1
-            export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d"
             export WINEDEBUG=err+all
@@ -677,7 +764,6 @@ DXVKEOF
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export PROTON_NO_ESYNC=1
             export PROTON_NO_FSYNC=1
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
 
