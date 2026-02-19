@@ -728,15 +728,15 @@ DXVKEOF
             strings /usr/lib/libvulkan_headless_layer.so 2>/dev/null | grep -E "COPY|OPTIMAL|pitch" | head -5
             echo ""
 
-            # Render 300 frames (~10 seconds)
+            # Render 3000 frames (~100 seconds)
             # Frames are captured on Android side by FrameSocketServer
-            timeout 30 wine64 /opt/stubs/vkcube_wine.exe 300 2>&1
+            timeout 120 wine64 /opt/stubs/vkcube_wine.exe 3000 2>&1
             EXIT=${'$'}?
             echo ""
             if [ ${'$'}EXIT -eq 0 ]; then
-                echo "=== VKCUBE PASSED (300 frames rendered) ==="
+                echo "=== VKCUBE PASSED (3000 frames rendered) ==="
             elif [ ${'$'}EXIT -eq 124 ]; then
-                echo "=== VKCUBE TIMEOUT (30s) ==="
+                echo "=== VKCUBE TIMEOUT (120s) ==="
             else
                 echo "=== VKCUBE exit code ${'$'}EXIT ==="
             fi

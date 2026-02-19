@@ -234,6 +234,7 @@ class TerminalActivity : AppCompatActivity() {
 
         // Wine version test: verify wine64 binary works under FEX
         findViewById<Button>(R.id.btnWineTest).setOnClickListener {
+            if (!isDisplayMode) toggleDisplayMode()
             executeCommand(protonManager.getVkCmdBufTestCommand())
         }
 

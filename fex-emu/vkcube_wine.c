@@ -594,10 +594,10 @@ static uint32_t find_mem_type(const VkPhysDevMemProps *p, uint32_t bits, VkFlags
 
 /* ===== Main ===== */
 int main(int argc, char **argv) {
-    int num_frames = 300;
+    int num_frames = 3000;
     if (argc > 1) num_frames = atoi(argv[1]);
     if (num_frames < 1) num_frames = 1;
-    if (num_frames > 9999) num_frames = 9999;
+    if (num_frames > 99999) num_frames = 99999;
 
     P("\n[vkcube] === Spinning 3D Cube (%d frames) ===", num_frames);
 
