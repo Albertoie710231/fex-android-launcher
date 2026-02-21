@@ -512,6 +512,9 @@ dxgi.enableOpenVR = False
 dxgi.enableOpenXR = False
 dxgi.maxFrameLatency = 1
 dxvk.logLevel = trace
+dxvk.numCompilerThreads = 1
+dxvk.enableAsync = False
+d3d11.reproducibleCommandStream = True
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
@@ -638,8 +641,8 @@ DXVKEOF
             tail -30 /tmp/layer_trace.log 2>/dev/null || echo "(no layer_trace.log yet)"
             echo "=== end snapshot ==="
 
-            # Periodic checks — game may need several minutes to load under FEX
-            for checkpoint in 30 60 120 180 240 300; do
+            # Periodic checks — monitor game for up to 3 minutes
+            for checkpoint in 30 60 120 180; do
                 sleep_dur=${'$'}((checkpoint - ${'$'}(( ${'$'}(date +%s) - ${'$'}START_TIME )) ))
                 [ ${'$'}sleep_dur -gt 0 ] && sleep ${'$'}sleep_dur
 
@@ -679,7 +682,13 @@ DXVKEOF
                 echo "=== end check ==="
             done
 
-            # Wait for wine to finish (timeout after 3 minutes total)
+            # Kill Wine after 3-minute monitoring window
+            if [ -d /proc/${'$'}WINE_PID ]; then
+                echo "=== Killing Wine after 3-minute timeout ==="
+                kill ${'$'}WINE_PID 2>/dev/null
+                sleep 2
+                kill -9 ${'$'}WINE_PID 2>/dev/null
+            fi
             wait ${'$'}WINE_PID 2>/dev/null
             WINE_EXIT=${'$'}?
             echo ""
@@ -694,6 +703,232 @@ DXVKEOF
                 echo "=== SIGILL CRASH — FEX debug log (last 100 lines) ==="
                 tail -100 /tmp/fex-debug.log 2>/dev/null || echo "(no FEX log at /tmp)"
             fi
+        """.trimIndent()
+    }
+
+    /**
+     * Launch a game in dump mode: write first N presented frames as PPM files to /tmp/.
+     * Bypasses TCP entirely (no FrameSocketServer needed).
+     * Used to verify the GPU is producing correct rendered frames.
+     *
+     * @param exePath Path to the .exe inside the rootfs
+     * @param dumpFrames Number of frames to capture
+     * @param winePrefix Wine prefix path
+     */
+    fun getDumpModeLaunchCommand(
+        exePath: String,
+        dumpFrames: Int = 10,
+        winePrefix: String = "/home/user/.wine"
+    ): String {
+        val exeDir = File(exePath).parent ?: "/home/user/games"
+
+        return """
+            export WINEPREFIX="$winePrefix"
+            export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
+            export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
+            export DISPLAY=:0
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # DXVK settings
+            export DXVK_ASYNC=1
+            export DXVK_STATE_CACHE=1
+            export DXVK_LOG_LEVEL=trace
+            export DXVK_HUD=fps,devinfo
+
+            # Proton compatibility — disable both fsync AND esync, use plain wineserver sync
+            export PROTON_NO_FSYNC=1
+            export PROTON_NO_ESYNC=1
+            export PROTON_USE_WINED3D=0
+
+            # Wine debug — trace exceptions to find crash cause
+            export WINEDEBUG=+seh,err+all
+
+            # Vulkan ICD
+            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
+            export MALI_NO_ASYNC_COMPUTE=1
+
+            # Headless layer + DUMP MODE (skip TCP, write PPMs)
+            export HEADLESS_LAYER=1
+            export HEADLESS_DUMP_FRAMES=$dumpFrames
+
+            # DLL overrides (same as normal launch)
+            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
+            export WINEDEBUG=err+all
+
+            # Misc
+            export XDG_RUNTIME_DIR=/tmp
+            export TMPDIR=/tmp
+
+            # Fix Z: drive
+            if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
+                rm -f "${'$'}WINEPREFIX/dosdevices/z:"
+                ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
+            fi
+
+            # Ensure critical EXEs in prefix
+            PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
+            SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
+            WINDIR="${'$'}WINEPREFIX/drive_c/windows"
+            if [ ! -f "${'$'}SYS32/explorer.exe" ] || [ ! -f "${'$'}SYS32/winex11.drv" ]; then
+                cp "${'$'}PROTON_WIN64"/*.exe "${'$'}SYS32/" 2>/dev/null || true
+                cp "${'$'}PROTON_WIN64"/*.drv "${'$'}SYS32/" 2>/dev/null || true
+                for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
+                    [ -f "${'$'}PROTON_WIN64/${'$'}exe" ] && cp "${'$'}PROTON_WIN64/${'$'}exe" "${'$'}WINDIR/${'$'}exe"
+                done
+            fi
+
+            # DXVK standalone DLLs + stubs
+            DXVK_DIR="$PROTON_INSTALL_DIR/files/lib/wine/dxvk/x86_64-windows"
+            mkdir -p "${'$'}SYS32"
+            for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
+                [ -f "${'$'}DXVK_DIR/${'$'}dll" ] && cp "${'$'}DXVK_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
+            done
+            [ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "${'$'}SYS32/d3dcompiler_47.dll"
+            [ -f "/opt/stubs/xaudio2_7.dll" ] && cp "/opt/stubs/xaudio2_7.dll" "${'$'}SYS32/xaudio2_7.dll"
+
+            # DXVK config
+            cat > "$exeDir/dxvk.conf" << 'DXVKEOF'
+dxgi.enableOpenVR = False
+dxgi.enableOpenXR = False
+dxgi.maxFrameLatency = 1
+dxvk.logLevel = trace
+dxvk.numCompilerThreads = 1
+dxvk.enableAsync = False
+d3d11.reproducibleCommandStream = True
+DXVKEOF
+
+            # Game-specific stub DLLs
+            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll steam_api64.dll; do
+                if [ -f "/opt/stubs/${'$'}stub" ]; then
+                    if [ -f "$exeDir/${'$'}stub" ] && [ ! -f "$exeDir/${'$'}{stub}.orig" ]; then
+                        cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
+                    fi
+                    cp "/opt/stubs/${'$'}stub" "$exeDir/${'$'}stub"
+                fi
+            done
+
+            # Wine registry (XRandR off, virtual desktop)
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
+
+            echo "=== Ys IX DUMP MODE ==="
+            echo "Capturing $dumpFrames frames as PPM to /tmp/"
+            echo "Exe: $exePath"
+            echo ""
+
+            # Clean old dump files
+            rm -f /tmp/frame_*.ppm /tmp/frame_summary.txt
+            rm -f /tmp/layer_trace.log /tmp/icd_trace.log
+            rm -f /tmp/wine_debug.log
+            echo "Cleaned old dump files"
+
+            cd "$exeDir"
+            echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
+
+            # Launch Wine — redirect debug spew to file, show only important lines on terminal
+            wine64 "$exePath" > /tmp/wine_debug.log 2>&1 &
+            WINE_PID=${'$'}!
+            echo "Wine PID: ${'$'}WINE_PID"
+            echo ""
+            echo "Monitoring for dumped frames..."
+
+            # Monitor loop: check for PPM files every 10 seconds
+            MAX_WAIT=300
+            ELAPSED=0
+            while [ ${'$'}ELAPSED -lt ${'$'}MAX_WAIT ]; do
+                sleep 10
+                ELAPSED=${'$'}((ELAPSED + 10))
+
+                # Count dumped frames
+                FRAME_COUNT=${'$'}(ls /tmp/frame_*.ppm 2>/dev/null | wc -l)
+
+                # Check layer trace for Vulkan activity
+                TRACE_INFO=""
+                if [ -f /tmp/layer_trace.log ]; then
+                    TRACE_LINES=${'$'}(wc -l < /tmp/layer_trace.log 2>/dev/null)
+                    PRESENT_COUNT=${'$'}(grep -c "QueuePresent" /tmp/layer_trace.log 2>/dev/null); PRESENT_COUNT=${'$'}{PRESENT_COUNT:-0}
+                    TRACE_INFO=" trace=${'$'}TRACE_LINES present=${'$'}PRESENT_COUNT"
+                fi
+
+                echo "[t+${'$'}{ELAPSED}s] frames=${'$'}FRAME_COUNT/$dumpFrames${'$'}TRACE_INFO"
+
+                # Detailed diagnostics at key checkpoints
+                if [ ${'$'}ELAPSED -eq 20 ] || [ ${'$'}ELAPSED -eq 40 ] || [ ${'$'}ELAPSED -eq 60 ]; then
+                    echo "--- Diagnostic (t+${'$'}{ELAPSED}s) ---"
+                    if [ -d /proc/${'$'}WINE_PID ]; then
+                        WCHAN=${'$'}(cat /proc/${'$'}WINE_PID/wchan 2>/dev/null)
+                        THREADS=${'$'}(ls /proc/${'$'}WINE_PID/task/ 2>/dev/null | wc -l)
+                        echo "  Wine PID ${'$'}WINE_PID: wchan=${'$'}WCHAN threads=${'$'}THREADS"
+                        # Show wchan for ALL threads (find who's stuck)
+                        echo "  Thread wchans:"
+                        for tid in ${'$'}(ls /proc/${'$'}WINE_PID/task/ 2>/dev/null); do
+                            tw=${'$'}(cat /proc/${'$'}WINE_PID/task/${'$'}tid/wchan 2>/dev/null)
+                            echo "    TID ${'$'}tid: ${'$'}tw"
+                        done
+                    fi
+                    # Show wine debug log tail (thread/sync messages)
+                    echo "  Wine debug (last 20 lines):"
+                    tail -20 /tmp/wine_debug.log 2>/dev/null | head -20
+                    echo "  Wine debug total lines: ${'$'}(wc -l < /tmp/wine_debug.log 2>/dev/null || echo 0)"
+                    echo "---"
+                fi
+
+                # All frames captured?
+                if [ ${'$'}FRAME_COUNT -ge $dumpFrames ]; then
+                    echo ""
+                    echo "=== ALL $dumpFrames FRAMES CAPTURED! ==="
+                    break
+                fi
+
+                # Wine died?
+                if [ ! -d /proc/${'$'}WINE_PID ]; then
+                    echo "Wine process exited at t+${'$'}{ELAPSED}s"
+                    break
+                fi
+            done
+
+            # Kill Wine if still running
+            if [ -d /proc/${'$'}WINE_PID ]; then
+                echo "Killing Wine (PID ${'$'}WINE_PID)..."
+                kill ${'$'}WINE_PID 2>/dev/null
+                sleep 2
+                kill -9 ${'$'}WINE_PID 2>/dev/null
+            fi
+            # Kill wineserver too
+            killall -9 wineserver 2>/dev/null
+
+            echo ""
+            echo "=== DUMP RESULTS ==="
+
+            # Print summary
+            if [ -f /tmp/frame_summary.txt ]; then
+                echo "--- frame_summary.txt ---"
+                cat /tmp/frame_summary.txt
+                echo "--- end summary ---"
+            else
+                echo "(no frame_summary.txt — no frames were presented)"
+            fi
+
+            echo ""
+            echo "PPM files:"
+            ls -la /tmp/frame_*.ppm 2>/dev/null || echo "  (none)"
+
+            echo ""
+            echo "Layer trace (last 30 lines):"
+            tail -30 /tmp/layer_trace.log 2>/dev/null || echo "  (no layer_trace.log)"
+
+            echo ""
+            echo "Wine debug log (last 50 lines):"
+            tail -50 /tmp/wine_debug.log 2>/dev/null || echo "  (no wine_debug.log)"
+            echo "Wine debug total: ${'$'}(wc -l < /tmp/wine_debug.log 2>/dev/null || echo 0) lines"
+
+            echo ""
+            echo "To pull full wine debug: adb shell run-as com.mediatek.steamlauncher cat files/fex-rootfs/Ubuntu_22_04/tmp/wine_debug.log > wine_debug.log"
+            echo "To pull frames: adb shell run-as com.mediatek.steamlauncher cat files/fex-rootfs/Ubuntu_22_04/tmp/frame_0000.ppm > frame.ppm"
         """.trimIndent()
     }
 

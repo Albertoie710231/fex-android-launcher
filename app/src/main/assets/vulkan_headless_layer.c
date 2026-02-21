@@ -595,6 +595,12 @@ static size_t g_pending_cap = 0;
 static size_t g_pending_total = 0;
 static size_t g_pending_sent = 0;
 
+/* Dump mode: write first N presented frames as PPM files to /tmp/ */
+static int g_dump_max_frames = 0;   /* 0=disabled, >0=dump first N frames */
+static int g_dump_frame_count = 0;  /* frames dumped so far */
+static int g_dump_mode = 0;         /* 1=active (skip TCP) */
+static FILE* g_dump_summary = NULL; /* /tmp/frame_summary.txt */
+
 static uint64_t get_time_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1075,18 +1081,13 @@ static void headless_GetPhysicalDeviceFeatures2(
             (VkPhysicalDeviceRobustness2FeaturesEXT*)find_pnext(pFeatures,
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
         if (rb2) {
-            if (!rb2->robustBufferAccess2) {
-                rb2->robustBufferAccess2 = VK_TRUE;
-                LOG("Spoofed robustBufferAccess2 = VK_TRUE\n");
-            }
-            if (!rb2->robustImageAccess2) {
-                rb2->robustImageAccess2 = VK_TRUE;
-                LOG("Spoofed robustImageAccess2 = VK_TRUE\n");
-            }
-            if (!rb2->nullDescriptor) {
-                rb2->nullDescriptor = VK_TRUE;
-                LOG("Spoofed nullDescriptor = VK_TRUE\n");
-            }
+            /* DISABLED: Don't spoof robustness2/nullDescriptor.
+             * These cause DXVK to take code paths that may crash when the
+             * real driver doesn't support them. DXVK falls back gracefully
+             * when these are FALSE (creates dummy resources instead of
+             * using VK_NULL_HANDLE descriptors). */
+            LOG("robustness2: robustBuf=%d robustImg=%d nullDesc=%d (NOT spoofed)\n",
+                rb2->robustBufferAccess2, rb2->robustImageAccess2, rb2->nullDescriptor);
         }
 
         VkPhysicalDeviceMaintenance5FeaturesKHR* m5 =
@@ -1869,11 +1870,97 @@ static VkResult headless_AcquireNextImageKHR(
     return VK_SUCCESS;
 }
 
+static void dump_frame_ppm(int frame_num, uint32_t width, uint32_t height, const void* mapped) {
+    const uint8_t *px = (const uint8_t *)mapped;
+    uint32_t total_pixels = width * height;
+    uint32_t nonzero = 0;
+
+    /* Count non-zero pixels for diagnostics */
+    for (uint32_t i = 0; i < total_pixels; i++) {
+        uint32_t off = i * 4;
+        if (px[off] || px[off+1] || px[off+2])
+            nonzero++;
+    }
+
+    /* Sample first + center pixel */
+    uint32_t center_off = (height/2 * width + width/2) * 4;
+    LOG("[DUMP] Frame %04d: %ux%u, nonzero=%u/%u (%.1f%%)\n",
+        frame_num, width, height, nonzero, total_pixels,
+        total_pixels ? (100.0f * nonzero / total_pixels) : 0.0f);
+    LOG("[DUMP]   pixel[0,0] BGRA=%02x,%02x,%02x,%02x  center BGRA=%02x,%02x,%02x,%02x\n",
+        px[0], px[1], px[2], px[3],
+        px[center_off], px[center_off+1], px[center_off+2], px[center_off+3]);
+
+    /* Write PPM file */
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/frame_%04d.ppm", frame_num);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%u %u\n255\n", width, height);
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                uint32_t off = (y * width + x) * 4;
+                /* B8G8R8A8 → RGB */
+                uint8_t rgb[3] = { px[off+2], px[off+1], px[off+0] };
+                fwrite(rgb, 1, 3, f);
+            }
+        }
+        fclose(f);
+        LOG("[DUMP] Wrote %s\n", path);
+    } else {
+        LOG("[DUMP] ERROR: fopen(%s) failed: %s\n", path, strerror(errno));
+    }
+
+    /* Append to summary */
+    if (g_dump_summary) {
+        fprintf(g_dump_summary, "frame=%04d size=%ux%u nonzero=%u/%u (%.1f%%) "
+                "px0=(%02x,%02x,%02x,%02x) center=(%02x,%02x,%02x,%02x) file=%s\n",
+                frame_num, width, height, nonzero, total_pixels,
+                total_pixels ? (100.0f * nonzero / total_pixels) : 0.0f,
+                px[0], px[1], px[2], px[3],
+                px[center_off], px[center_off+1], px[center_off+2], px[center_off+3],
+                path);
+        fflush(g_dump_summary);
+    }
+
+    g_dump_frame_count++;
+    if (g_dump_frame_count >= g_dump_max_frames) {
+        LOG("[DUMP] All %d frames captured! Done.\n", g_dump_max_frames);
+        if (g_dump_summary) {
+            fprintf(g_dump_summary, "=== DUMP COMPLETE: %d frames ===\n", g_dump_max_frames);
+            fclose(g_dump_summary);
+            g_dump_summary = NULL;
+        }
+    }
+}
+
 static int g_present_count = 0;
 
 static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
     TRACE_FN("vkQueuePresentKHR");
+
+    /* Lazy init: check env var here in case constructor missed it
+     * (FEX child process re-exec may not run constructors with full env) */
+    if (!g_dump_mode && !g_dump_max_frames) {
+        const char *dump_env = getenv("HEADLESS_DUMP_FRAMES");
+        if (dump_env) {
+            g_dump_max_frames = atoi(dump_env);
+            if (g_dump_max_frames > 0) {
+                g_dump_mode = 1;
+                g_dump_frame_count = 0;
+                if (!g_dump_summary) {
+                    g_dump_summary = fopen("/tmp/frame_summary.txt", "w");
+                    if (g_dump_summary) {
+                        fprintf(g_dump_summary, "=== DUMP MODE (lazy init): capturing %d frames ===\n", g_dump_max_frames);
+                        fflush(g_dump_summary);
+                    }
+                }
+                LOG("DUMP MODE enabled (lazy init in QueuePresent): %d frames\n", g_dump_max_frames);
+            }
+        }
+    }
+
     if (g_present_count < 3) {
         char pbuf[128];
         snprintf(pbuf, sizeof(pbuf), "QueuePresent #%d swapchains=%u", g_present_count, pPresentInfo->swapchainCount);
@@ -2036,28 +2123,35 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                         LOG("[COPY] Center pixel @%u: %02x %02x %02x %02x\n",
                             center_off, px[center_off], px[center_off+1],
                             px[center_off+2], px[center_off+3]);
-                        send_frame(sc->width, sc->height, mapped, sc->width * 4);
 
-                        /* Dump first frame to PPM if HEADLESS_DUMP_PPM is set */
-                        {
-                            static int dumped = 0;
-                            if (!dumped && getenv("HEADLESS_DUMP_PPM")) {
-                                dumped = 1;
-                                FILE *f = fopen("/tmp/frame_dump.ppm", "wb");
-                                if (f) {
-                                    fprintf(f, "P6\n%u %u\n255\n", sc->width, sc->height);
-                                    const uint8_t *px = (const uint8_t *)mapped;
-                                    for (uint32_t y = 0; y < sc->height; y++) {
-                                        for (uint32_t x = 0; x < sc->width; x++) {
-                                            uint32_t off = (y * sc->width + x) * 4;
-                                            /* B8G8R8A8 → RGB */
-                                            uint8_t rgb[3] = { px[off+2], px[off+1], px[off+0] };
-                                            fwrite(rgb, 1, 3, f);
+                        if (g_dump_mode) {
+                            /* Dump mode: write PPM files, skip TCP */
+                            if (g_dump_frame_count < g_dump_max_frames) {
+                                dump_frame_ppm(g_dump_frame_count, sc->width, sc->height, mapped);
+                            }
+                        } else {
+                            /* Normal mode: send via TCP */
+                            send_frame(sc->width, sc->height, mapped, sc->width * 4);
+
+                            /* Legacy single-frame dump (backward compat) */
+                            {
+                                static int dumped = 0;
+                                if (!dumped && getenv("HEADLESS_DUMP_PPM")) {
+                                    dumped = 1;
+                                    FILE *f = fopen("/tmp/frame_dump.ppm", "wb");
+                                    if (f) {
+                                        fprintf(f, "P6\n%u %u\n255\n", sc->width, sc->height);
+                                        for (uint32_t y = 0; y < sc->height; y++) {
+                                            for (uint32_t x = 0; x < sc->width; x++) {
+                                                uint32_t off = (y * sc->width + x) * 4;
+                                                uint8_t rgb[3] = { px[off+2], px[off+1], px[off+0] };
+                                                fwrite(rgb, 1, 3, f);
+                                            }
                                         }
+                                        fclose(f);
+                                        LOG("PPM frame dumped: /tmp/frame_dump.ppm (%ux%u)\n",
+                                            sc->width, sc->height);
                                     }
-                                    fclose(f);
-                                    LOG("PPM frame dumped: /tmp/frame_dump.ppm (%ux%u)\n",
-                                        sc->width, sc->height);
                                 }
                             }
                         }
@@ -3016,4 +3110,20 @@ __attribute__((constructor))
 static void layer_init(void) {
     LOG("Vulkan headless surface layer loaded (pid=%d)\n", getpid());
     signal(SIGABRT, sigabrt_handler);
+
+    /* Dump mode: HEADLESS_DUMP_FRAMES=N writes first N frames as PPM to /tmp/ */
+    const char *dump_env = getenv("HEADLESS_DUMP_FRAMES");
+    if (dump_env) {
+        g_dump_max_frames = atoi(dump_env);
+        if (g_dump_max_frames > 0) {
+            g_dump_mode = 1;
+            g_dump_frame_count = 0;
+            g_dump_summary = fopen("/tmp/frame_summary.txt", "w");
+            if (g_dump_summary) {
+                fprintf(g_dump_summary, "=== DUMP MODE: capturing %d frames ===\n", g_dump_max_frames);
+                fflush(g_dump_summary);
+            }
+            LOG("DUMP MODE enabled: will capture %d frames to /tmp/frame_NNNN.ppm\n", g_dump_max_frames);
+        }
+    }
 }

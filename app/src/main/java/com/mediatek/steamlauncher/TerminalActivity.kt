@@ -305,6 +305,22 @@ class TerminalActivity : AppCompatActivity() {
                 "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
             ))
         }
+
+        // Ys IX Dump Mode: capture frames as PPM files (no TCP/FrameSocketServer)
+        findViewById<Button>(R.id.btnDumpGame).setOnClickListener {
+            // Start X11 if needed (Wine still needs it for CreateWindowExA)
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for dump mode]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            // Do NOT start FrameSocketServer or toggle display mode
+            executeCommand(protonManager.getDumpModeLaunchCommand(
+                "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
+            ))
+        }
     }
 
     private fun toggleDisplayMode() {

@@ -240,15 +240,22 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
 
-    /* ONLY catch SIGILL and privileged instruction.
-     * DO NOT catch ACCESS_VIOLATION (c0000005) — Wine uses AVs legitimately
-     * for guard pages, copy-on-write, and other internal mechanisms.
-     * Catching AVs kills the process before Wine can handle them.
-     * DO NOT catch STACK_BUFFER_OVERRUN (c0000409) — non-deterministic,
-     * let Wine/OS handle it. */
+    /* Catch SIGILL, privileged instruction, AND ACCESS_VIOLATION.
+     * For AV: only log + dump, then CONTINUE_SEARCH so Wine/game can handle it.
+     * This gives us the register state at the actual crash point. */
+    int is_av = (code == EXCEPTION_ACCESS_VIOLATION);
     if (code != EXCEPTION_ILLEGAL_INSTRUCTION &&
-        code != EXCEPTION_PRIV_INSTRUCTION)
+        code != EXCEPTION_PRIV_INSTRUCTION &&
+        !is_av)
         return EXCEPTION_CONTINUE_SEARCH;
+
+    /* For AV: use a one-shot flag so we only dump the FIRST one
+     * (Wine generates many AVs for guard pages, copy-on-write, etc.) */
+    static volatile LONG av_count = 0;
+    if (is_av) {
+        LONG c = InterlockedIncrement(&av_count);
+        if (c > 3) return EXCEPTION_CONTINUE_SEARCH; /* only dump first 3 AVs */
+    }
 
     CONTEXT *ctx = ep->ContextRecord;
     unsigned char *rip = (unsigned char *)(ULONG_PTR)ctx->Rip;
@@ -260,12 +267,38 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
     fprintf(stderr, "RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n",
             (unsigned long long)ctx->Rip, (unsigned long long)ctx->Rsp,
             (unsigned long long)ctx->Rbp);
-    fprintf(stderr, "RAX: 0x%016llx  RCX: 0x%016llx  RDX: 0x%016llx\n",
-            (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rcx,
-            (unsigned long long)ctx->Rdx);
+    fprintf(stderr, "RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n",
+            (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rbx,
+            (unsigned long long)ctx->Rcx);
+    fprintf(stderr, "RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n",
+            (unsigned long long)ctx->Rdx, (unsigned long long)ctx->Rsi,
+            (unsigned long long)ctx->Rdi);
     fprintf(stderr, "R8:  0x%016llx  R9:  0x%016llx  R10: 0x%016llx\n",
             (unsigned long long)ctx->R8, (unsigned long long)ctx->R9,
             (unsigned long long)ctx->R10);
+    fprintf(stderr, "R11: 0x%016llx  R12: 0x%016llx  R13: 0x%016llx\n",
+            (unsigned long long)ctx->R11, (unsigned long long)ctx->R12,
+            (unsigned long long)ctx->R13);
+    fprintf(stderr, "R14: 0x%016llx  R15: 0x%016llx\n",
+            (unsigned long long)ctx->R14, (unsigned long long)ctx->R15);
+
+    /* Exception params */
+    fprintf(stderr, "ExceptionAddress: 0x%016llx\n",
+            (unsigned long long)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress);
+    fprintf(stderr, "NumberParameters: %lu\n", ep->ExceptionRecord->NumberParameters);
+    for (DWORD p = 0; p < ep->ExceptionRecord->NumberParameters && p < 4; p++)
+        fprintf(stderr, "  Param[%lu]: 0x%016llx\n", p,
+                (unsigned long long)ep->ExceptionRecord->ExceptionInformation[p]);
+
+    /* Stack dump — print first 16 QWORDs from RSP */
+    fprintf(stderr, "Stack dump (RSP=0x%016llx):\n", (unsigned long long)ctx->Rsp);
+    {
+        DWORD64 *sp = (DWORD64 *)(ULONG_PTR)ctx->Rsp;
+        for (int i = 0; i < 16; i++) {
+            if (!IsBadReadPtr(&sp[i], 8))
+                fprintf(stderr, "  [RSP+%02x] 0x%016llx\n", i*8, (unsigned long long)sp[i]);
+        }
+    }
 
     /* Instruction bytes */
     fprintf(stderr, "Bytes:");
@@ -297,6 +330,11 @@ static LONG CALLBACK sigill_handler(EXCEPTION_POINTERS *ep)
 
     fprintf(stderr, "================================================\n");
     fflush(stderr);
+
+    if (is_av) {
+        /* Let Wine/game handle AV — we just logged it */
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     ExitProcess(0xDEAD);
     return EXCEPTION_CONTINUE_SEARCH;
