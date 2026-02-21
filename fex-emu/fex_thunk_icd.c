@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
 
 typedef void (*PFN_vkVoidFunction)(void);
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
@@ -31,7 +33,22 @@ static PFN_vkGetInstanceProcAddr real_gipa = NULL;
 static int init_done = 0;
 static void* saved_instance = NULL;
 
-#define LOG(...) do { fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); } while(0)
+/* File-based logging: stderr may not be captured, so also write to /tmp/icd_debug.txt */
+static FILE* g_icd_log = NULL;
+static void icd_log_init(void) {
+    if (!g_icd_log) {
+        g_icd_log = fopen("/tmp/icd_debug.txt", "a");
+        if (g_icd_log) {
+            fprintf(g_icd_log, "=== ICD LOG START (pid=%d) ===\n", getpid());
+            fflush(g_icd_log);
+        }
+    }
+}
+#define LOG(...) do { \
+    fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); \
+    icd_log_init(); \
+    if (g_icd_log) { fprintf(g_icd_log, "fex_thunk_icd: " __VA_ARGS__); fflush(g_icd_log); } \
+} while(0)
 
 /* ==== Handle Wrapper ====
  *
@@ -150,6 +167,92 @@ static void ensure_init(void) {
     LOG("Init OK: gipa=%p\n", (void*)real_gipa);
 }
 
+/* ==== Memory heap cap ====
+ *
+ * Vortek/FEX thunks have a limited host-visible mapping region (~174MB observed).
+ * After that, vkMapMemory returns VK_ERROR_MEMORY_MAP_FAILED, which cascades to
+ * VK_ERROR_DEVICE_LOST and crashes the Mali internal thread.
+ *
+ * Cap HOST_VISIBLE heaps to 128MB so DXVK's allocator stays within limits.
+ */
+
+#define HOST_VISIBLE_HEAP_CAP (512ULL * 1024 * 1024)  /* 512 MiB — soft safety net */
+
+/* VkPhysicalDeviceMemoryProperties layout (x86-64):
+ * offset 0:   memoryTypeCount (uint32_t)
+ * offset 4:   memoryTypes[32] (each 8 bytes: propertyFlags(4) + heapIndex(4))
+ * offset 260: memoryHeapCount (uint32_t)
+ * offset 264: memoryHeaps[16] (each 16 bytes: size(8) + flags(4) + pad(4))
+ *
+ * VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x02
+ * VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x01
+ */
+
+typedef void (*PFN_vkGetPhysDeviceMemProps)(void*, void*);
+static PFN_vkGetPhysDeviceMemProps real_get_mem_props = NULL;
+
+static void wrapped_GetPhysicalDeviceMemoryProperties(void* physDev, void* pProps) {
+    real_get_mem_props(physDev, pProps);
+    if (!pProps) return;
+
+    uint8_t* p = (uint8_t*)pProps;
+    uint32_t typeCount = *(uint32_t*)(p + 0);
+    uint32_t heapCount = *(uint32_t*)(p + 260);
+
+    /* Find which heaps back HOST_VISIBLE memory types */
+    uint32_t host_visible_heaps = 0;
+    for (uint32_t i = 0; i < typeCount && i < 32; i++) {
+        uint32_t flags = *(uint32_t*)(p + 4 + i * 8);
+        uint32_t heapIdx = *(uint32_t*)(p + 4 + i * 8 + 4);
+        if (flags & 0x02) /* HOST_VISIBLE_BIT */
+            host_visible_heaps |= (1u << heapIdx);
+    }
+
+    /* Cap those heaps */
+    for (uint32_t i = 0; i < heapCount && i < 16; i++) {
+        uint64_t* heapSize = (uint64_t*)(p + 264 + i * 16);
+        uint32_t heapFlags = *(uint32_t*)(p + 264 + i * 16 + 8);
+        if (host_visible_heaps & (1u << i)) {
+            uint64_t orig = *heapSize;
+            if (orig > HOST_VISIBLE_HEAP_CAP) {
+                *heapSize = HOST_VISIBLE_HEAP_CAP;
+                LOG("MemProps: heap[%u] capped %lluMB -> %lluMB (flags=0x%x)\n",
+                    i, (unsigned long long)(orig / (1024*1024)),
+                    (unsigned long long)(HOST_VISIBLE_HEAP_CAP / (1024*1024)),
+                    heapFlags);
+            }
+        }
+    }
+}
+
+/* Also intercept vkGetPhysicalDeviceMemoryProperties2 */
+typedef void (*PFN_vkGetPhysDeviceMemProps2)(void*, void*);
+static PFN_vkGetPhysDeviceMemProps2 real_get_mem_props2 = NULL;
+
+static void wrapped_GetPhysicalDeviceMemoryProperties2(void* physDev, void* pProps2) {
+    real_get_mem_props2(physDev, pProps2);
+    if (!pProps2) return;
+    /* VkPhysicalDeviceMemoryProperties2: sType(4) + pad(4) + pNext(8) + memoryProperties
+     * memoryProperties starts at offset 16 */
+    uint8_t* inner = (uint8_t*)pProps2 + 16;
+    /* Reuse the same capping logic */
+    uint32_t typeCount = *(uint32_t*)(inner + 0);
+    uint32_t heapCount = *(uint32_t*)(inner + 260);
+
+    uint32_t host_visible_heaps = 0;
+    for (uint32_t i = 0; i < typeCount && i < 32; i++) {
+        uint32_t flags = *(uint32_t*)(inner + 4 + i * 8);
+        uint32_t heapIdx = *(uint32_t*)(inner + 4 + i * 8 + 4);
+        if (flags & 0x02)
+            host_visible_heaps |= (1u << heapIdx);
+    }
+    for (uint32_t i = 0; i < heapCount && i < 16; i++) {
+        uint64_t* heapSize = (uint64_t*)(inner + 264 + i * 16);
+        if ((host_visible_heaps & (1u << i)) && *heapSize > HOST_VISIBLE_HEAP_CAP)
+            *heapSize = HOST_VISIBLE_HEAP_CAP;
+    }
+}
+
 /* ==== Instance-level wrappers ==== */
 
 typedef VkResult (*PFN_vkCreateInstance)(const void*, const void*, void**);
@@ -192,13 +295,18 @@ static int g_device_count = 0;  /* track device creation order for tracing */
 typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(void*, const char*);
 static PFN_vkGetDeviceProcAddr real_gdpa = NULL;
 
-/* Shared-device: reuse the same real VkDevice for all CreateDevice calls.
- * DXVK's dxvk-submit thread crashes (NULL deref in SRWLOCK release) when
- * two REAL VkDevices coexist under FEX-Emu. By sharing the underlying device,
- * each DXVK D3D11Device gets its own wrapper but they all use the same
- * VkDevice/VkQueue at the thunk level. */
+/* Shared-device with queue mutex: one real VkDevice for all CreateDevice calls.
+ *
+ * Mali/Vortek crashes (SIGSEGV in libGLES_mali.so) when two real VkDevices
+ * coexist. Ys IX needs TWO D3D11 devices (both for real work), so we share
+ * one real VkDevice but give each caller its own HandleWrapper.
+ *
+ * Queue serialization: Two dxvk-submit threads race on the same real VkQueue.
+ * VkQueue requires external synchronization for submit/wait ops. We use a
+ * pthread mutex around all queue operations to prevent DEVICE_LOST. */
 static void* shared_real_device = NULL;
 static int device_ref_count = 0;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
                                      const void* pAllocator, void** pDevice) {
@@ -213,11 +321,19 @@ static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
     g_device_count++;
 
     if (shared_real_device) {
-        /* Reject second CreateDevice — shared-device model causes DEVICE_LOST.
-         * DXVK creates D2 (feat 11_1 probe) then destroys it; returning -3
-         * makes it fall back to D1 only, which is the real rendering device. */
-        LOG("CreateDevice #%d REJECTED: already have device, returning -3\n", g_device_count);
-        return -3; /* VK_ERROR_INITIALIZATION_FAILED */
+        /* Reuse the existing real VkDevice for subsequent CreateDevice calls.
+         * Each gets its own wrapper so DXVK sees separate VkDevices, but they
+         * all map to the same underlying device + queue. */
+        device_ref_count++;
+        HandleWrapper* w = wrap_handle(shared_real_device);
+        if (!w) {
+            device_ref_count--;
+            return -1;
+        }
+        *pDevice = w;
+        LOG("CreateDevice #%d SHARED: real=%p wrapper=%p refcount=%d\n",
+            g_device_count, shared_real_device, (void*)w, device_ref_count);
+        return 0;
     }
 
     VkResult res = real_create_device(physDev, pCreateInfo, pAllocator, pDevice);
@@ -250,7 +366,7 @@ static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
     return res;
 }
 
-/* ---- vkDestroyDevice: unwrap + free wrapper ---- */
+/* ---- vkDestroyDevice: unwrap + free wrapper, ref-count real device ---- */
 
 typedef void (*PFN_vkDestroyDevice)(void*, const void*);
 static PFN_vkDestroyDevice real_destroy_device = NULL;
@@ -258,11 +374,16 @@ static PFN_vkDestroyDevice real_destroy_device = NULL;
 static void wrapper_DestroyDevice(void* device, const void* pAllocator) {
     if (!device) return;
     void* real = unwrap(device);
-    LOG("DestroyDevice: wrapper=%p real=%p\n", device, real);
-    if (real_destroy_device) real_destroy_device(real, pAllocator);
-    shared_real_device = NULL;
-    device_ref_count = 0;
+    LOG("DestroyDevice: wrapper=%p real=%p refcount=%d\n",
+        device, real, device_ref_count);
     free_wrapper(device);
+    device_ref_count--;
+    if (device_ref_count <= 0) {
+        LOG("DestroyDevice: last ref, destroying real device %p\n", real);
+        if (real_destroy_device) real_destroy_device(real, pAllocator);
+        shared_real_device = NULL;
+        device_ref_count = 0;
+    }
 }
 
 /* ---- vkGetDeviceQueue: unwrap device, wrap returned queue ---- */
@@ -381,16 +502,24 @@ static VkResult wrapper_QueueSubmit(void* queue, uint32_t submitCount,
                                     uint64_t fence) {
     void* real_queue = unwrap(queue);
 
-    if (submitCount == 0 || !pSubmits)
-        return real_queue_submit(real_queue, submitCount, pSubmits, fence);
+    if (submitCount == 0 || !pSubmits) {
+        pthread_mutex_lock(&queue_mutex);
+        VkResult r = real_queue_submit(real_queue, submitCount, pSubmits, fence);
+        pthread_mutex_unlock(&queue_mutex);
+        return r;
+    }
 
     /* Count total cmdBufs to unwrap */
     uint32_t total = 0;
     for (uint32_t s = 0; s < submitCount; s++)
         total += pSubmits[s].commandBufferCount;
 
-    if (total == 0)
-        return real_queue_submit(real_queue, submitCount, pSubmits, fence);
+    if (total == 0) {
+        pthread_mutex_lock(&queue_mutex);
+        VkResult r = real_queue_submit(real_queue, submitCount, pSubmits, fence);
+        pthread_mutex_unlock(&queue_mutex);
+        return r;
+    }
 
     /* Create temp copies with unwrapped cmdBuf arrays */
     ICD_VkSubmitInfo* tmp = (ICD_VkSubmitInfo*)alloca(
@@ -411,7 +540,10 @@ static VkResult wrapper_QueueSubmit(void* queue, uint32_t submitCount,
     LOG("[D%d] vkQueueSubmit #%d: queue=%p submits=%u cmdBufs=%u\n",
         g_device_count, sn, real_queue, submitCount, total);
 
+    /* Serialize queue operations — shared device means shared queue */
+    pthread_mutex_lock(&queue_mutex);
     VkResult res = real_queue_submit(real_queue, submitCount, tmp, fence);
+    pthread_mutex_unlock(&queue_mutex);
     if (res != 0)
         LOG("[D%d] vkQueueSubmit #%d FAILED: %d\n", g_device_count, sn, res);
 
@@ -468,16 +600,24 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
                                      uint64_t fence) {
     void* real_queue = unwrap(queue);
 
-    if (submitCount == 0 || !pSubmits)
-        return real_queue_submit2(real_queue, submitCount, pSubmits, fence);
+    if (submitCount == 0 || !pSubmits) {
+        pthread_mutex_lock(&queue_mutex);
+        VkResult r = real_queue_submit2(real_queue, submitCount, pSubmits, fence);
+        pthread_mutex_unlock(&queue_mutex);
+        return r;
+    }
 
     /* Count total cmdBufs to unwrap */
     uint32_t total = 0;
     for (uint32_t s = 0; s < submitCount; s++)
         total += pSubmits[s].commandBufferInfoCount;
 
-    if (total == 0)
-        return real_queue_submit2(real_queue, submitCount, pSubmits, fence);
+    if (total == 0) {
+        pthread_mutex_lock(&queue_mutex);
+        VkResult r = real_queue_submit2(real_queue, submitCount, pSubmits, fence);
+        pthread_mutex_unlock(&queue_mutex);
+        return r;
+    }
 
     /* Create temp copies with unwrapped cmdBuf handles */
     ICD_VkSubmitInfo2* tmp = (ICD_VkSubmitInfo2*)alloca(
@@ -502,10 +642,25 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
     LOG("[D%d] vkQueueSubmit2 #%d: queue=%p submits=%u cmdBufs=%u\n",
         g_device_count, sn, real_queue, submitCount, total);
 
+    pthread_mutex_lock(&queue_mutex);
     VkResult res = real_queue_submit2(real_queue, submitCount, tmp, fence);
+    pthread_mutex_unlock(&queue_mutex);
     if (res != 0)
         LOG("[D%d] vkQueueSubmit2 #%d FAILED: %d\n", g_device_count, sn, res);
 
+    return res;
+}
+
+/* ---- vkQueueWaitIdle: mutex-protected (shared queue) ---- */
+
+typedef VkResult (*PFN_vkQueueWaitIdle)(void*);
+static PFN_vkQueueWaitIdle real_queue_wait_idle = NULL;
+
+static VkResult wrapper_QueueWaitIdle(void* queue) {
+    void* real_queue = unwrap(queue);
+    pthread_mutex_lock(&queue_mutex);
+    VkResult res = real_queue_wait_idle(real_queue);
+    pthread_mutex_unlock(&queue_mutex);
     return res;
 }
 
@@ -860,6 +1015,10 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         real_queue_submit = (PFN_vkQueueSubmit)fn;
         return (PFN_vkVoidFunction)wrapper_QueueSubmit;
     }
+    if (strcmp(pName, "vkQueueWaitIdle") == 0) {
+        real_queue_wait_idle = (PFN_vkQueueWaitIdle)fn;
+        return (PFN_vkVoidFunction)wrapper_QueueWaitIdle;
+    }
     if (strcmp(pName, "vkCmdExecuteCommands") == 0) {
         real_cmd_exec_cmds = (PFN_vkCmdExecCmds)fn;
         return (PFN_vkVoidFunction)wrapper_CmdExecuteCommands;
@@ -970,6 +1129,17 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
         LOG("GIPA: vkGetDeviceProcAddr -> wrapped_GDPA\n");
         return (PFN_vkVoidFunction)wrapped_GDPA;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0) {
+        real_get_mem_props = (PFN_vkGetPhysDeviceMemProps)real_gipa(instance, pName);
+        LOG("GIPA: vkGetPhysicalDeviceMemoryProperties -> capped wrapper\n");
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0) {
+        real_get_mem_props2 = (PFN_vkGetPhysDeviceMemProps2)real_gipa(instance, pName);
+        LOG("GIPA: %s -> capped wrapper\n", pName);
+        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties2;
     }
 
     return real_gipa(instance, pName);

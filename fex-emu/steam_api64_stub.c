@@ -470,11 +470,14 @@ static void in_process_vulkan_test(void) {
 /* Watchdog thread: reports call counts + thread IPs + profile spinning thread */
 static DWORD WINAPI watchdog_thread(LPVOID arg) {
     (void)arg;
-    /* Run in-process Vulkan test IMMEDIATELY (t+2s) — before DXVK initializes (~t+5s) */
+    /* DISABLED: in_process_vulkan_test() creates+destroys a VkDevice at t+2s.
+     * Hypothesis: Mali/Vortek's internal thread (Thread-6) survives device destroy
+     * and crashes (SIGSEGV at 0xb8) when DXVK creates its device at ~t+5s.
+     * Disabling to test if the crash goes away. */
     Sleep(2000);
-    fprintf(stderr, "\n[steam_api64] === WATCHDOG t+2s (EARLY Vulkan test) ===\n");
+    fprintf(stderr, "\n[steam_api64] === WATCHDOG t+2s (Vulkan test DISABLED) ===\n");
     fflush(stderr);
-    in_process_vulkan_test();
+    /* in_process_vulkan_test(); */
     fprintf(stderr, "[steam_api64] === END EARLY TEST ===\n");
     fflush(stderr);
 

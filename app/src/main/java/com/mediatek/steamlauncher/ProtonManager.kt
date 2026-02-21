@@ -515,6 +515,10 @@ dxvk.logLevel = trace
 dxvk.numCompilerThreads = 1
 dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
+
+# Memory limits: Vortek/FEX thunks have ~174MB host-visible mapping limit.
+# Reduce chunk sizes so DXVK creates smaller allocations (16MB instead of 64MB).
+dxvk.maxChunkSize = 16
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
@@ -797,6 +801,7 @@ dxvk.logLevel = trace
 dxvk.numCompilerThreads = 1
 dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
+dxvk.maxChunkSize = 16
 DXVKEOF
 
             # Game-specific stub DLLs
