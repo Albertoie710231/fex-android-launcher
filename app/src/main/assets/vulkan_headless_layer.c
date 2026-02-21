@@ -1023,10 +1023,15 @@ static void headless_GetPhysicalDeviceFeatures2(
         physicalDevice, pFeatures, (void*)g_real_get_features2);
     layer_marker("CALL_GetFeatures2");
 
-    if (g_real_get_features2)
+    if (g_real_get_features2) {
+        LOG(">>> Calling g_real_get_features2=%p ...\n", (void*)g_real_get_features2);
         g_real_get_features2(physicalDevice, pFeatures);
-    else
+        LOG(">>> g_real_get_features2 RETURNED\n");
+        layer_marker("RETURNED_GetFeatures2");
+    } else {
         LOG("!!! GetPhysicalDeviceFeatures2: g_real_get_features2 is NULL!\n");
+        layer_marker("GetFeatures2_NULL_REAL");
+    }
 
     if (pFeatures) {
         LOG("    BC before spoof: %d\n", pFeatures->features.textureCompressionBC);
@@ -1133,6 +1138,8 @@ static void headless_GetPhysicalDeviceFeatures2(
             LOG("  pNext chain total: %d structs\n", idx);
         }
     }
+    layer_marker("GetFeatures2_DONE");
+    LOG(">>> GetPhysicalDeviceFeatures2 COMPLETE\n");
 }
 
 static void headless_GetPhysicalDeviceFormatProperties(

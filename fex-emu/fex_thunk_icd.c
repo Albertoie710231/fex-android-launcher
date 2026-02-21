@@ -167,89 +167,170 @@ static void ensure_init(void) {
     LOG("Init OK: gipa=%p\n", (void*)real_gipa);
 }
 
-/* ==== Memory heap cap ====
+/* ==== Virtual Heap Split ====
  *
- * Vortek/FEX thunks have a limited host-visible mapping region (~174MB observed).
- * After that, vkMapMemory returns VK_ERROR_MEMORY_MAP_FAILED, which cascades to
- * VK_ERROR_DEVICE_LOST and crashes the Mali internal thread.
+ * Mali unified memory: the single heap is both DEVICE_LOCAL and HOST_VISIBLE.
+ * Vortek/FEX thunks have a mapping limit (~174MB observed for vkMapMemory).
  *
- * Cap HOST_VISIBLE heaps to 128MB so DXVK's allocator stays within limits.
- */
-
-#define HOST_VISIBLE_HEAP_CAP (512ULL * 1024 * 1024)  /* 512 MiB — soft safety net */
-
-/* VkPhysicalDeviceMemoryProperties layout (x86-64):
+ * Problem: capping the heap size makes DXVK think there's not enough VRAM
+ * and it refuses to create a D3D11 device.
+ *
+ * Solution: split the unified heap into two virtual heaps:
+ *   - Big heap (original size): for DEVICE_LOCAL-only allocations (textures)
+ *   - Small heap (capped): for HOST_VISIBLE allocations (staging buffers)
+ *
+ * On fully-unified GPUs where ALL memory types are HOST_VISIBLE, we also add
+ * a new DEVICE_LOCAL-only memory type pointing to the big heap. Memory
+ * requirements are patched to include this type, and AllocateMemory remaps
+ * the virtual type index back to the original for the real driver.
+ *
+ * VkPhysicalDeviceMemoryProperties layout (x86-64):
  * offset 0:   memoryTypeCount (uint32_t)
  * offset 4:   memoryTypes[32] (each 8 bytes: propertyFlags(4) + heapIndex(4))
  * offset 260: memoryHeapCount (uint32_t)
  * offset 264: memoryHeaps[16] (each 16 bytes: size(8) + flags(4) + pad(4))
  *
  * VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x02
+ * VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x04
+ * VK_MEMORY_PROPERTY_HOST_CACHED_BIT = 0x08
  * VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x01
  */
+
+#define STAGING_HEAP_CAP (256ULL * 1024 * 1024)  /* 256 MiB for mappable memory */
+
+/* Tracks the virtual type we added so other wrappers can patch accordingly */
+static int g_added_type_index = -1;    /* index of added DEVICE_LOCAL-only type, -1 if none */
+static int g_remap_to_type = -1;       /* real type index to use for virtual type allocations */
+
+static void split_unified_heaps(uint8_t* p) {
+    uint32_t* pTypeCount = (uint32_t*)(p + 0);
+    uint32_t typeCount = *pTypeCount;
+    uint32_t* pHeapCount = (uint32_t*)(p + 260);
+    uint32_t heapCount = *pHeapCount;
+
+    if (typeCount == 0 || heapCount == 0) return;
+
+    for (uint32_t h = 0; h < heapCount; h++) {
+        uint64_t heapSize = *(uint64_t*)(p + 264 + h * 16);
+        uint32_t heapFlags = *(uint32_t*)(p + 264 + h * 16 + 8);
+
+        if (!(heapFlags & 0x01)) continue;  /* skip non-DEVICE_LOCAL heaps */
+        if (heapSize <= STAGING_HEAP_CAP) continue;  /* already small enough */
+
+        /* Count HOST_VISIBLE vs non-HOST_VISIBLE types for this heap */
+        int hv_count = 0, non_hv_count = 0;
+        int first_hv_type = -1;
+        for (uint32_t i = 0; i < typeCount && i < 32; i++) {
+            uint32_t tflags = *(uint32_t*)(p + 4 + i * 8);
+            uint32_t theap = *(uint32_t*)(p + 4 + i * 8 + 4);
+            if (theap != h) continue;
+            if (tflags & 0x02) {  /* HOST_VISIBLE_BIT */
+                hv_count++;
+                if (first_hv_type < 0) first_hv_type = (int)i;
+            } else {
+                non_hv_count++;
+            }
+        }
+
+        if (hv_count == 0) continue;  /* no HOST_VISIBLE types on this heap */
+        if (*pHeapCount >= 16) continue;  /* can't add more heaps */
+
+        /* Create new capped heap for HOST_VISIBLE (staging) allocations */
+        uint32_t stagingHeap = *pHeapCount;
+        *(uint64_t*)(p + 264 + stagingHeap * 16) = STAGING_HEAP_CAP;
+        *(uint32_t*)(p + 264 + stagingHeap * 16 + 8) = heapFlags;
+        (*pHeapCount)++;
+
+        /* Redirect all HOST_VISIBLE types to the new capped heap */
+        for (uint32_t i = 0; i < typeCount && i < 32; i++) {
+            uint32_t tflags = *(uint32_t*)(p + 4 + i * 8);
+            uint32_t* theap = (uint32_t*)(p + 4 + i * 8 + 4);
+            if (*theap == h && (tflags & 0x02)) {
+                *theap = stagingHeap;
+                LOG("HeapSplit: type[%u] flags=0x%x -> staging heap %u (%lluMB)\n",
+                    i, tflags, stagingHeap,
+                    (unsigned long long)(STAGING_HEAP_CAP / (1024*1024)));
+            }
+        }
+
+        if (non_hv_count == 0 && *pTypeCount < 32) {
+            /* ALL types are HOST_VISIBLE (fully unified memory).
+             * Add a pure DEVICE_LOCAL type so DXVK can allocate textures
+             * from the big heap without the HOST_VISIBLE flag.
+             * DXVK prefers non-HOST_VISIBLE types for device images. */
+            uint32_t newIdx = *pTypeCount;
+            uint32_t origFlags = *(uint32_t*)(p + 4 + first_hv_type * 8);
+            uint32_t newFlags = origFlags & ~(0x02 | 0x04 | 0x08);
+            *(uint32_t*)(p + 4 + newIdx * 8) = newFlags;
+            *(uint32_t*)(p + 4 + newIdx * 8 + 4) = h;  /* original big heap */
+            (*pTypeCount)++;
+
+            g_added_type_index = (int)newIdx;
+            g_remap_to_type = first_hv_type;
+
+            LOG("HeapSplit: added type[%u] flags=0x%x -> heap %u (%lluMB) [DEVICE_LOCAL only]\n",
+                newIdx, newFlags, h,
+                (unsigned long long)(heapSize / (1024*1024)));
+        }
+
+        LOG("HeapSplit: heap[%u]=%lluMB (textures), heap[%u]=%lluMB (staging)\n",
+            h, (unsigned long long)(heapSize / (1024*1024)),
+            stagingHeap, (unsigned long long)(STAGING_HEAP_CAP / (1024*1024)));
+        break;  /* only split the first unified heap */
+    }
+}
 
 typedef void (*PFN_vkGetPhysDeviceMemProps)(void*, void*);
 static PFN_vkGetPhysDeviceMemProps real_get_mem_props = NULL;
 
 static void wrapped_GetPhysicalDeviceMemoryProperties(void* physDev, void* pProps) {
     real_get_mem_props(physDev, pProps);
-    if (!pProps) return;
-
-    uint8_t* p = (uint8_t*)pProps;
-    uint32_t typeCount = *(uint32_t*)(p + 0);
-    uint32_t heapCount = *(uint32_t*)(p + 260);
-
-    /* Find which heaps back HOST_VISIBLE memory types */
-    uint32_t host_visible_heaps = 0;
-    for (uint32_t i = 0; i < typeCount && i < 32; i++) {
-        uint32_t flags = *(uint32_t*)(p + 4 + i * 8);
-        uint32_t heapIdx = *(uint32_t*)(p + 4 + i * 8 + 4);
-        if (flags & 0x02) /* HOST_VISIBLE_BIT */
-            host_visible_heaps |= (1u << heapIdx);
-    }
-
-    /* Cap those heaps */
-    for (uint32_t i = 0; i < heapCount && i < 16; i++) {
-        uint64_t* heapSize = (uint64_t*)(p + 264 + i * 16);
-        uint32_t heapFlags = *(uint32_t*)(p + 264 + i * 16 + 8);
-        if (host_visible_heaps & (1u << i)) {
-            uint64_t orig = *heapSize;
-            if (orig > HOST_VISIBLE_HEAP_CAP) {
-                *heapSize = HOST_VISIBLE_HEAP_CAP;
-                LOG("MemProps: heap[%u] capped %lluMB -> %lluMB (flags=0x%x)\n",
-                    i, (unsigned long long)(orig / (1024*1024)),
-                    (unsigned long long)(HOST_VISIBLE_HEAP_CAP / (1024*1024)),
-                    heapFlags);
-            }
-        }
-    }
+    if (pProps) split_unified_heaps((uint8_t*)pProps);
 }
 
-/* Also intercept vkGetPhysicalDeviceMemoryProperties2 */
 typedef void (*PFN_vkGetPhysDeviceMemProps2)(void*, void*);
 static PFN_vkGetPhysDeviceMemProps2 real_get_mem_props2 = NULL;
 
 static void wrapped_GetPhysicalDeviceMemoryProperties2(void* physDev, void* pProps2) {
     real_get_mem_props2(physDev, pProps2);
-    if (!pProps2) return;
-    /* VkPhysicalDeviceMemoryProperties2: sType(4) + pad(4) + pNext(8) + memoryProperties
-     * memoryProperties starts at offset 16 */
-    uint8_t* inner = (uint8_t*)pProps2 + 16;
-    /* Reuse the same capping logic */
-    uint32_t typeCount = *(uint32_t*)(inner + 0);
-    uint32_t heapCount = *(uint32_t*)(inner + 260);
+    if (pProps2) split_unified_heaps((uint8_t*)pProps2 + 16);
+}
 
-    uint32_t host_visible_heaps = 0;
-    for (uint32_t i = 0; i < typeCount && i < 32; i++) {
-        uint32_t flags = *(uint32_t*)(inner + 4 + i * 8);
-        uint32_t heapIdx = *(uint32_t*)(inner + 4 + i * 8 + 4);
-        if (flags & 0x02)
-            host_visible_heaps |= (1u << heapIdx);
+/* ==== GetPhysicalDeviceFeatures2 diagnostic wrapper ====
+ *
+ * DXVK sends a large pNext chain (Vulkan11/12/13 features + extensions).
+ * FEX thunks need to marshal each struct. If a struct is unknown or the
+ * chain is too deep, the thunk could hang or crash. This wrapper logs
+ * entry/exit to detect hangs in the thunk layer. */
+
+typedef void (*PFN_vkGetPhysDeviceFeatures2)(void*, void*);
+static PFN_vkGetPhysDeviceFeatures2 real_get_features2 = NULL;
+
+static void wrapped_GetPhysicalDeviceFeatures2(void* physDev, void* pFeatures) {
+    LOG("GetFeatures2 ENTER: pd=%p pF=%p\n", physDev, pFeatures);
+
+    /* Walk pNext chain BEFORE the call to log what DXVK is requesting */
+    if (pFeatures) {
+        typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } BaseS;
+        BaseS* s = (BaseS*)((uint8_t*)pFeatures + 16); /* pNext at offset 16 in VkPhysicalDeviceFeatures2 */
+        /* Actually: VkPhysicalDeviceFeatures2 = sType(4)+pad(4)+pNext(8)+features(VkPhysicalDeviceFeatures)
+         * pNext is at offset 8 */
+        s = (BaseS*)(*(void**)((uint8_t*)pFeatures + 8)); /* read pNext pointer */
+        int idx = 0;
+        while (s && idx < 50) {
+            LOG("  pNext[%d] sType=%u (0x%x)\n", idx, s->sType, s->sType);
+            s = (BaseS*)s->pNext;
+            idx++;
+        }
+        LOG("  pNext chain: %d structs\n", idx);
     }
-    for (uint32_t i = 0; i < heapCount && i < 16; i++) {
-        uint64_t* heapSize = (uint64_t*)(inner + 264 + i * 16);
-        if ((host_visible_heaps & (1u << i)) && *heapSize > HOST_VISIBLE_HEAP_CAP)
-            *heapSize = HOST_VISIBLE_HEAP_CAP;
+
+    if (real_get_features2) {
+        LOG("GetFeatures2: calling thunk %p...\n", (void*)real_get_features2);
+        real_get_features2(physDev, pFeatures);
+        LOG("GetFeatures2 RETURNED OK\n");
+    } else {
+        LOG("GetFeatures2: real function is NULL!\n");
     }
 }
 
@@ -697,16 +778,38 @@ static PFN_vkAllocateMemory real_alloc_memory = NULL;
 static VkResult trace_AllocateMemory(void* device, const void* pAllocInfo,
                                      const void* pAllocator, uint64_t* pMemory) {
     void* real = unwrap(device);
-    /* VkMemoryAllocateInfo: sType(4) + pNext(8) + allocationSize(8) + memoryTypeIndex(4) */
+    /* VkMemoryAllocateInfo layout (x86-64):
+     * offset 0:  sType (4) + pad (4)
+     * offset 8:  pNext (8)
+     * offset 16: allocationSize (8)
+     * offset 24: memoryTypeIndex (4) + pad (4)
+     * Total: 32 bytes */
     uint64_t alloc_size = 0;
     uint32_t mem_type = 0;
     if (pAllocInfo) {
         alloc_size = *(const uint64_t*)((const char*)pAllocInfo + 16);
         mem_type = *(const uint32_t*)((const char*)pAllocInfo + 24);
     }
-    VkResult res = real_alloc_memory(real, pAllocInfo, pAllocator, pMemory);
-    LOG("[D%d] vkAllocateMemory: dev=%p size=%llu type=%u result=%d mem=0x%llx\n",
-        g_device_count, real, (unsigned long long)alloc_size, mem_type, res,
+
+    /* Remap virtual DEVICE_LOCAL-only type to the real type index.
+     * The real driver doesn't know about our added type — it only knows
+     * the original types. The remapped type (HOST_VISIBLE+DEVICE_LOCAL)
+     * allocates from the same physical unified memory. */
+    const void* alloc_info = pAllocInfo;
+    uint32_t real_type = mem_type;
+    uint8_t local_info[32];
+    if (g_added_type_index >= 0 && mem_type == (uint32_t)g_added_type_index && pAllocInfo) {
+        memcpy(local_info, pAllocInfo, 32);
+        *(uint32_t*)(local_info + 24) = (uint32_t)g_remap_to_type;
+        real_type = (uint32_t)g_remap_to_type;
+        alloc_info = local_info;
+        LOG("[D%d] vkAllocateMemory: REMAP type %u -> %u (virtual DEVICE_LOCAL -> real)\n",
+            g_device_count, mem_type, real_type);
+    }
+
+    VkResult res = real_alloc_memory(real, alloc_info, pAllocator, pMemory);
+    LOG("[D%d] vkAllocateMemory: dev=%p size=%llu type=%u(%u) result=%d mem=0x%llx\n",
+        g_device_count, real, (unsigned long long)alloc_size, mem_type, real_type, res,
         pMemory ? (unsigned long long)*pMemory : 0);
     return res;
 }
@@ -935,6 +1038,68 @@ static VkResult trace_CreateShaderModule(void* device, const void* pCreateInfo,
     return res;
 }
 
+/* ==== Memory requirements patching ====
+ *
+ * When we add a virtual DEVICE_LOCAL-only type (g_added_type_index >= 0),
+ * we must patch memoryTypeBits in all memory requirements queries so DXVK
+ * knows it can use our virtual type for allocations.
+ *
+ * VkMemoryRequirements layout (x86-64):
+ *   offset 0:  size (uint64_t)
+ *   offset 8:  alignment (uint64_t)
+ *   offset 16: memoryTypeBits (uint32_t)
+ *
+ * VkMemoryRequirements2 wraps it at offset 16 (after sType+pNext).
+ */
+
+typedef void (*PFN_vkGetBufMemReqs)(void*, uint64_t, void*);
+static PFN_vkGetBufMemReqs real_get_buf_mem_reqs = NULL;
+
+static void wrapped_GetBufferMemoryRequirements(void* device, uint64_t buffer, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_buf_mem_reqs(real, buffer, pReqs);
+    if (pReqs && g_added_type_index >= 0) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 16);
+        *bits |= (1u << g_added_type_index);
+    }
+}
+
+typedef void (*PFN_vkGetImgMemReqs)(void*, uint64_t, void*);
+static PFN_vkGetImgMemReqs real_get_img_mem_reqs = NULL;
+
+static void wrapped_GetImageMemoryRequirements(void* device, uint64_t image, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_img_mem_reqs(real, image, pReqs);
+    if (pReqs && g_added_type_index >= 0) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 16);
+        *bits |= (1u << g_added_type_index);
+    }
+}
+
+typedef void (*PFN_vkGetBufMemReqs2)(void*, const void*, void*);
+static PFN_vkGetBufMemReqs2 real_get_buf_mem_reqs2 = NULL;
+
+static void wrapped_GetBufferMemoryRequirements2(void* device, const void* pInfo, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_buf_mem_reqs2(real, pInfo, pReqs);
+    if (pReqs && g_added_type_index >= 0) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
+        *bits |= (1u << g_added_type_index);
+    }
+}
+
+typedef void (*PFN_vkGetImgMemReqs2)(void*, const void*, void*);
+static PFN_vkGetImgMemReqs2 real_get_img_mem_reqs2 = NULL;
+
+static void wrapped_GetImageMemoryRequirements2(void* device, const void* pInfo, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_img_mem_reqs2(real, pInfo, pReqs);
+    if (pReqs && g_added_type_index >= 0) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
+        *bits |= (1u << g_added_type_index);
+    }
+}
+
 /* ==== vkGetDeviceProcAddr: GIPA + thunk GDPA fallback + unwrap trampolines ==== */
 
 static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
@@ -1022,6 +1187,26 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
     if (strcmp(pName, "vkCmdExecuteCommands") == 0) {
         real_cmd_exec_cmds = (PFN_vkCmdExecCmds)fn;
         return (PFN_vkVoidFunction)wrapper_CmdExecuteCommands;
+    }
+
+    /* Memory requirements patching: add virtual DEVICE_LOCAL type bit */
+    if (strcmp(pName, "vkGetBufferMemoryRequirements") == 0) {
+        real_get_buf_mem_reqs = (PFN_vkGetBufMemReqs)fn;
+        return (PFN_vkVoidFunction)wrapped_GetBufferMemoryRequirements;
+    }
+    if (strcmp(pName, "vkGetImageMemoryRequirements") == 0) {
+        real_get_img_mem_reqs = (PFN_vkGetImgMemReqs)fn;
+        return (PFN_vkVoidFunction)wrapped_GetImageMemoryRequirements;
+    }
+    if (strcmp(pName, "vkGetBufferMemoryRequirements2") == 0 ||
+        strcmp(pName, "vkGetBufferMemoryRequirements2KHR") == 0) {
+        real_get_buf_mem_reqs2 = (PFN_vkGetBufMemReqs2)fn;
+        return (PFN_vkVoidFunction)wrapped_GetBufferMemoryRequirements2;
+    }
+    if (strcmp(pName, "vkGetImageMemoryRequirements2") == 0 ||
+        strcmp(pName, "vkGetImageMemoryRequirements2KHR") == 0) {
+        real_get_img_mem_reqs2 = (PFN_vkGetImgMemReqs2)fn;
+        return (PFN_vkVoidFunction)wrapped_GetImageMemoryRequirements2;
     }
 
     /* Trace wrappers: log VkResult for key init-time functions.
@@ -1132,14 +1317,24 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
     }
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0) {
         real_get_mem_props = (PFN_vkGetPhysDeviceMemProps)real_gipa(instance, pName);
-        LOG("GIPA: vkGetPhysicalDeviceMemoryProperties -> capped wrapper\n");
+        LOG("GIPA: vkGetPhysicalDeviceMemoryProperties -> heap-split wrapper\n");
         return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties;
     }
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
         strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0) {
-        real_get_mem_props2 = (PFN_vkGetPhysDeviceMemProps2)real_gipa(instance, pName);
-        LOG("GIPA: %s -> capped wrapper\n", pName);
-        return (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties2;
+        PFN_vkGetPhysDeviceMemProps2 fn2 = (PFN_vkGetPhysDeviceMemProps2)real_gipa(instance, pName);
+        if (fn2) real_get_mem_props2 = fn2;  /* don't clobber valid ptr with NULL */
+        LOG("GIPA: %s -> heap-split wrapper (thunk=%p, stored=%p)\n",
+            pName, (void*)fn2, (void*)real_get_mem_props2);
+        return real_get_mem_props2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties2 : NULL;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {
+        PFN_vkGetPhysDeviceFeatures2 fn2 = (PFN_vkGetPhysDeviceFeatures2)real_gipa(instance, pName);
+        if (fn2) real_get_features2 = fn2;  /* don't clobber valid ptr with NULL */
+        LOG("GIPA: %s -> diagnostic wrapper (thunk=%p, stored=%p)\n",
+            pName, (void*)fn2, (void*)real_get_features2);
+        return real_get_features2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFeatures2 : NULL;
     }
 
     return real_gipa(instance, pName);
