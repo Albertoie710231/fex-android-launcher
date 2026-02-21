@@ -23,6 +23,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 typedef void (*PFN_vkVoidFunction)(void);
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
@@ -44,10 +45,17 @@ static void icd_log_init(void) {
         }
     }
 }
+static void log_timestamp(FILE* f) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "[%02d:%02d:%02d.%03ld] ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+}
 #define LOG(...) do { \
-    fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); \
+    log_timestamp(stderr); fprintf(stderr, "fex_thunk_icd: " __VA_ARGS__); fflush(stderr); \
     icd_log_init(); \
-    if (g_icd_log) { fprintf(g_icd_log, "fex_thunk_icd: " __VA_ARGS__); fflush(g_icd_log); } \
+    if (g_icd_log) { log_timestamp(g_icd_log); fprintf(g_icd_log, "fex_thunk_icd: " __VA_ARGS__); fflush(g_icd_log); } \
 } while(0)
 
 /* ==== Handle Wrapper ====
@@ -196,7 +204,9 @@ static void ensure_init(void) {
  * VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x01
  */
 
-#define STAGING_HEAP_CAP (256ULL * 1024 * 1024)  /* 256 MiB for mappable memory */
+#define STAGING_HEAP_CAP (512ULL * 1024 * 1024)  /* 512 MiB — generous; real limit is Vortek/Mali, not memory */
+#define MAP_BYTE_LIMIT  (512ULL * 1024 * 1024)  /* 512 MiB — no artificial limit */
+#define ALLOC_BYTE_CAP  (512ULL * 1024 * 1024)  /* 512 MiB — no artificial limit */
 
 /* Tracks the virtual type we added so other wrappers can patch accordingly */
 static int g_added_type_index = -1;    /* index of added DEVICE_LOCAL-only type, -1 if none */
@@ -210,6 +220,18 @@ static void split_unified_heaps(uint8_t* p) {
 
     if (typeCount == 0 || heapCount == 0) return;
 
+    LOG("HeapSplit: ENTRY typeCount=%u heapCount=%u\n", typeCount, heapCount);
+    for (uint32_t i = 0; i < typeCount && i < 32; i++) {
+        uint32_t tf = *(uint32_t*)(p + 4 + i * 8);
+        uint32_t th = *(uint32_t*)(p + 4 + i * 8 + 4);
+        LOG("  type[%u] flags=0x%x heap=%u\n", i, tf, th);
+    }
+    for (uint32_t h2 = 0; h2 < heapCount; h2++) {
+        uint64_t hs = *(uint64_t*)(p + 264 + h2 * 16);
+        uint32_t hf = *(uint32_t*)(p + 264 + h2 * 16 + 8);
+        LOG("  heap[%u] size=%lluMB flags=0x%x\n", h2, (unsigned long long)(hs/(1024*1024)), hf);
+    }
+
     for (uint32_t h = 0; h < heapCount; h++) {
         uint64_t heapSize = *(uint64_t*)(p + 264 + h * 16);
         uint32_t heapFlags = *(uint32_t*)(p + 264 + h * 16 + 8);
@@ -217,8 +239,10 @@ static void split_unified_heaps(uint8_t* p) {
         if (!(heapFlags & 0x01)) continue;  /* skip non-DEVICE_LOCAL heaps */
         if (heapSize <= STAGING_HEAP_CAP) continue;  /* already small enough */
 
-        /* Count HOST_VISIBLE vs non-HOST_VISIBLE types for this heap */
-        int hv_count = 0, non_hv_count = 0;
+        /* Count HOST_VISIBLE vs non-HOST_VISIBLE types for this heap.
+         * LAZILY_ALLOCATED (0x10) types are NOT usable for regular allocations
+         * (only for transient framebuffer attachments), so don't count them. */
+        int hv_count = 0, usable_non_hv_count = 0;
         int first_hv_type = -1;
         for (uint32_t i = 0; i < typeCount && i < 32; i++) {
             uint32_t tflags = *(uint32_t*)(p + 4 + i * 8);
@@ -227,8 +251,8 @@ static void split_unified_heaps(uint8_t* p) {
             if (tflags & 0x02) {  /* HOST_VISIBLE_BIT */
                 hv_count++;
                 if (first_hv_type < 0) first_hv_type = (int)i;
-            } else {
-                non_hv_count++;
+            } else if (!(tflags & 0x10)) {  /* not LAZILY_ALLOCATED */
+                usable_non_hv_count++;
             }
         }
 
@@ -253,7 +277,10 @@ static void split_unified_heaps(uint8_t* p) {
             }
         }
 
-        if (non_hv_count == 0 && *pTypeCount < 32) {
+        LOG("HeapSplit: usable_non_hv=%d hv=%d typeCount=%u first_hv=%d\n",
+            usable_non_hv_count, hv_count, *pTypeCount, first_hv_type);
+
+        if (usable_non_hv_count == 0 && *pTypeCount < 32) {
             /* ALL types are HOST_VISIBLE (fully unified memory).
              * Add a pure DEVICE_LOCAL type so DXVK can allocate textures
              * from the big heap without the HOST_VISIBLE flag.
@@ -332,6 +359,22 @@ static void wrapped_GetPhysicalDeviceFeatures2(void* physDev, void* pFeatures) {
     } else {
         LOG("GetFeatures2: real function is NULL!\n");
     }
+
+    /* Log Vulkan 1.3 feature values (no longer blocking — using converters instead) */
+    if (pFeatures) {
+        typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } VkBase;
+        VkBase* node = (VkBase*)(*(void**)((uint8_t*)pFeatures + 8)); /* pNext */
+        while (node) {
+            if (node->sType == 53) { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES */
+                uint32_t sync2 = *(uint32_t*)((uint8_t*)node + 52);
+                uint32_t dynRender = *(uint32_t*)((uint8_t*)node + 64);
+                LOG("  Vulkan13Features: synchronization2=%u dynamicRendering=%u (kept)\n",
+                    sync2, dynRender);
+                break;
+            }
+            node = (VkBase*)node->pNext;
+        }
+    }
 }
 
 /* ==== Instance-level wrappers ==== */
@@ -388,6 +431,104 @@ static PFN_vkGetDeviceProcAddr real_gdpa = NULL;
 static void* shared_real_device = NULL;
 static int device_ref_count = 0;
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ==== VK_EXT_device_fault: query GPU fault details on DEVICE_LOST ====
+ *
+ * VkDeviceFaultCountsEXT (x86-64):
+ *   offset 0:  sType (4) = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT = 1000341001
+ *   offset 4:  pad (4)
+ *   offset 8:  pNext (8)
+ *   offset 16: addressInfoCount (4)
+ *   offset 20: vendorInfoCount (4)
+ *   offset 24: vendorBinarySize (8)
+ *
+ * VkDeviceFaultInfoEXT (x86-64):
+ *   offset 0:  sType (4) = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT = 1000341002
+ *   offset 4:  pad (4)
+ *   offset 8:  pNext (8)
+ *   offset 16: description[256] (char array)
+ *   offset 272: pAddressInfos (8)
+ *   offset 280: pVendorInfos (8)
+ *   offset 288: pVendorBinaryData (8)
+ *
+ * VkDeviceFaultAddressInfoEXT (24 bytes):
+ *   offset 0:  addressType (4)
+ *   offset 4:  pad (4)
+ *   offset 8:  reportedAddress (8)
+ *   offset 16: addressPrecision (8)
+ *
+ * VkDeviceFaultVendorInfoEXT (280 bytes):
+ *   offset 0:  description[256]
+ *   offset 256: vendorFaultCode (8)
+ *   offset 264: vendorFaultData (8)
+ */
+
+typedef VkResult (*PFN_vkGetDeviceFaultInfoEXT)(void*, void*, void*);
+static PFN_vkGetDeviceFaultInfoEXT real_get_device_fault_info = NULL;
+static int g_fault_queried = 0;
+
+static void query_device_fault(void) {
+    if (g_fault_queried || !real_get_device_fault_info || !shared_real_device) return;
+    g_fault_queried = 1;
+
+    LOG("=== QUERYING VK_EXT_device_fault ===\n");
+
+    /* First call: get counts */
+    uint8_t counts[32];
+    memset(counts, 0, sizeof(counts));
+    *(uint32_t*)(counts + 0) = 1000341001; /* sType */
+
+    VkResult res = real_get_device_fault_info(shared_real_device, counts, NULL);
+    uint32_t addrCount = *(uint32_t*)(counts + 16);
+    uint32_t vendorCount = *(uint32_t*)(counts + 20);
+    uint64_t binarySize = *(uint64_t*)(counts + 24);
+    LOG("  GetDeviceFaultInfo(counts): result=%d addrInfos=%u vendorInfos=%u binarySize=%llu\n",
+        res, addrCount, vendorCount, (unsigned long long)binarySize);
+
+    if (res != 0 && res != 5 /* VK_INCOMPLETE */) return;
+    if (addrCount == 0 && vendorCount == 0) return;
+
+    /* Second call: get actual info */
+    uint8_t* addrInfos = NULL;
+    uint8_t* vendorInfos = NULL;
+    if (addrCount > 0) addrInfos = (uint8_t*)calloc(addrCount, 24);
+    if (vendorCount > 0) vendorInfos = (uint8_t*)calloc(vendorCount, 280);
+
+    uint8_t info[296];
+    memset(info, 0, sizeof(info));
+    *(uint32_t*)(info + 0) = 1000341002; /* sType */
+    *(void**)(info + 272) = addrInfos;
+    *(void**)(info + 280) = vendorInfos;
+
+    /* Reset counts struct for second call */
+    *(uint32_t*)(counts + 16) = addrCount;
+    *(uint32_t*)(counts + 20) = vendorCount;
+    *(uint64_t*)(counts + 24) = 0; /* don't allocate binary data */
+
+    res = real_get_device_fault_info(shared_real_device, counts, info);
+    LOG("  GetDeviceFaultInfo(info): result=%d\n", res);
+    LOG("  Description: %.256s\n", (char*)(info + 16));
+
+    for (uint32_t i = 0; i < addrCount && addrInfos; i++) {
+        uint32_t type = *(uint32_t*)(addrInfos + i * 24);
+        uint64_t addr = *(uint64_t*)(addrInfos + i * 24 + 8);
+        uint64_t prec = *(uint64_t*)(addrInfos + i * 24 + 16);
+        LOG("  AddrInfo[%u]: type=%u addr=0x%llx precision=0x%llx\n",
+            i, type, (unsigned long long)addr, (unsigned long long)prec);
+    }
+
+    for (uint32_t i = 0; i < vendorCount && vendorInfos; i++) {
+        char* desc = (char*)(vendorInfos + i * 280);
+        uint64_t code = *(uint64_t*)(vendorInfos + i * 280 + 256);
+        uint64_t data = *(uint64_t*)(vendorInfos + i * 280 + 264);
+        LOG("  VendorInfo[%u]: code=0x%llx data=0x%llx desc=%.256s\n",
+            i, (unsigned long long)code, (unsigned long long)data, desc);
+    }
+
+    LOG("=== END device_fault ===\n");
+    if (addrInfos) free(addrInfos);
+    if (vendorInfos) free(vendorInfos);
+}
 
 static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
                                      const void* pAllocator, void** pDevice) {
@@ -577,6 +718,7 @@ typedef VkResult (*PFN_vkQueueSubmit)(void*, uint32_t, const ICD_VkSubmitInfo*, 
 static PFN_vkQueueSubmit real_queue_submit = NULL;
 
 static int submit_count_global = 0;
+static int g_cmd_op_count = 0;  /* Cmd* operation counter (defined here, used in Cmd* traces below) */
 
 static VkResult wrapper_QueueSubmit(void* queue, uint32_t submitCount,
                                     const ICD_VkSubmitInfo* pSubmits,
@@ -645,7 +787,12 @@ static void wrapper_CmdExecuteCommands(void* cmdBuf, uint32_t count,
     real_cmd_exec_cmds(real_cmd, count, real_sec);
 }
 
-/* ---- vkQueueSubmit2: unwrap queue + cmdBufs in VkSubmitInfo2 ---- */
+/* ---- vkQueueSubmit2: pass-through with handle unwrapping ----
+ *
+ * Vortek natively supports QueueSubmit2 (vt_handle_vkQueueSubmit2 exists
+ * in libvortekrenderer.so). We just need to unwrap the queue handle and
+ * any command buffer handles embedded in VkCommandBufferSubmitInfo.
+ */
 
 /* VkCommandBufferSubmitInfo (32 bytes on x86-64) */
 typedef struct {
@@ -657,7 +804,7 @@ typedef struct {
     uint32_t    _pad1;          /* 28 */
 } ICD_VkCommandBufferSubmitInfo;
 
-/* VkSubmitInfo2 (72 bytes on x86-64) */
+/* VkSubmitInfo2 (64 bytes on x86-64) */
 typedef struct {
     uint32_t    sType;                      /* 0 */
     uint32_t    _pad0;                      /* 4 */
@@ -682,9 +829,7 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
     void* real_queue = unwrap(queue);
 
     if (submitCount == 0 || !pSubmits) {
-        pthread_mutex_lock(&queue_mutex);
-        VkResult r = real_queue_submit2(real_queue, submitCount, pSubmits, fence);
-        pthread_mutex_unlock(&queue_mutex);
+        VkResult r = real_queue_submit2(real_queue, 0, NULL, fence);
         return r;
     }
 
@@ -694,40 +839,58 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
         total += pSubmits[s].commandBufferInfoCount;
 
     if (total == 0) {
+        /* No command buffers to unwrap — pass through directly */
+        int sn = ++submit_count_global;
+        LOG("[D%d] vkQueueSubmit2 #%d: queue=%p submits=%u cmdBufs=0 (passthrough)\n",
+            g_device_count, sn, real_queue, submitCount);
         pthread_mutex_lock(&queue_mutex);
         VkResult r = real_queue_submit2(real_queue, submitCount, pSubmits, fence);
         pthread_mutex_unlock(&queue_mutex);
+        LOG("[D%d] vkQueueSubmit2 #%d: result=%d\n", g_device_count, sn, r);
         return r;
     }
 
-    /* Create temp copies with unwrapped cmdBuf handles */
+    /* Create temp copies of VkSubmitInfo2 with unwrapped cmdBuf handles.
+     * VkCommandBufferSubmitInfo structs are also copied to patch the handle. */
     ICD_VkSubmitInfo2* tmp = (ICD_VkSubmitInfo2*)alloca(
         submitCount * sizeof(ICD_VkSubmitInfo2));
-    ICD_VkCommandBufferSubmitInfo* cbs = (ICD_VkCommandBufferSubmitInfo*)alloca(
+    ICD_VkCommandBufferSubmitInfo* cbInfos = (ICD_VkCommandBufferSubmitInfo*)alloca(
         total * sizeof(ICD_VkCommandBufferSubmitInfo));
-    uint32_t idx = 0;
+    uint32_t ci = 0;
 
     for (uint32_t s = 0; s < submitCount; s++) {
-        tmp[s] = pSubmits[s];
+        tmp[s] = pSubmits[s];  /* shallow copy preserves all semaphore info as-is */
         if (pSubmits[s].commandBufferInfoCount > 0 && pSubmits[s].pCommandBufferInfos) {
-            tmp[s].pCommandBufferInfos = &cbs[idx];
+            tmp[s].pCommandBufferInfos = &cbInfos[ci];
             for (uint32_t c = 0; c < pSubmits[s].commandBufferInfoCount; c++) {
-                cbs[idx] = pSubmits[s].pCommandBufferInfos[c];
-                cbs[idx].commandBuffer = unwrap(cbs[idx].commandBuffer);
-                idx++;
+                cbInfos[ci] = pSubmits[s].pCommandBufferInfos[c]; /* copy struct */
+                cbInfos[ci].commandBuffer = unwrap(cbInfos[ci].commandBuffer);
+                ci++;
             }
         }
     }
 
     int sn = ++submit_count_global;
-    LOG("[D%d] vkQueueSubmit2 #%d: queue=%p submits=%u cmdBufs=%u\n",
-        g_device_count, sn, real_queue, submitCount, total);
+    LOG("[D%d] vkQueueSubmit2 #%d: queue=%p submits=%u cmdBufs=%u (cmd_ops_so_far=%d)\n",
+        g_device_count, sn, real_queue, submitCount, total, g_cmd_op_count);
+
+    /* Log the actual CB handle order in the submit array */
+    ci = 0;
+    for (uint32_t s = 0; s < submitCount; s++) {
+        for (uint32_t c = 0; c < tmp[s].commandBufferInfoCount; c++) {
+            LOG("[D%d]   submit2 #%d CB[%u]: real=%p\n",
+                g_device_count, sn, ci, tmp[s].pCommandBufferInfos[c].commandBuffer);
+            ci++;
+        }
+    }
 
     pthread_mutex_lock(&queue_mutex);
     VkResult res = real_queue_submit2(real_queue, submitCount, tmp, fence);
     pthread_mutex_unlock(&queue_mutex);
     if (res != 0)
         LOG("[D%d] vkQueueSubmit2 #%d FAILED: %d\n", g_device_count, sn, res);
+    else
+        LOG("[D%d] vkQueueSubmit2 #%d OK\n", g_device_count, sn);
 
     return res;
 }
@@ -774,6 +937,13 @@ static VkResult trace_CreateCommandPool(void* device, const void* pCreateInfo,
 
 typedef VkResult (*PFN_vkAllocateMemory)(void*, const void*, const void*, uint64_t*);
 static PFN_vkAllocateMemory real_alloc_memory = NULL;
+static uint64_t g_staging_alloc_total = 0;  /* total allocated from HOST_VISIBLE types */
+
+/* Types 0 and 1 are HOST_VISIBLE (staging heap). Check if a type is HOST_VISIBLE.
+ * Our virtual type (g_added_type_index) is DEVICE_LOCAL only — not HOST_VISIBLE. */
+static int is_staging_type(uint32_t mem_type) {
+    return (mem_type == 0 || mem_type == 1);
+}
 
 static VkResult trace_AllocateMemory(void* device, const void* pAllocInfo,
                                      const void* pAllocator, uint64_t* pMemory) {
@@ -807,10 +977,41 @@ static VkResult trace_AllocateMemory(void* device, const void* pAllocInfo,
             g_device_count, mem_type, real_type);
     }
 
+    /* Pre-flight: reject staging allocations that would exceed ALLOC_BYTE_CAP.
+     * At ~215MB staging, Mali's internal mmap fails and kills CreateImage.
+     * By capping at 210MB we leave ~5-10MB VA headroom for images/metadata.
+     * DXVK handles -1 by retrying smaller chunk sizes (16→8→4→2→1 MB). */
+    if (is_staging_type(real_type) && g_staging_alloc_total + alloc_size > ALLOC_BYTE_CAP) {
+        LOG("[D%d] vkAllocateMemory: CAPPED type=%u size=%llu staging=%llu MB (cap=%llu MB) -> OOM\n",
+            g_device_count, mem_type, (unsigned long long)alloc_size,
+            (unsigned long long)(g_staging_alloc_total / (1024*1024)),
+            (unsigned long long)(ALLOC_BYTE_CAP / (1024*1024)));
+        if (pMemory) *pMemory = 0;
+        return -1; /* VK_ERROR_OUT_OF_DEVICE_MEMORY */
+    }
+
     VkResult res = real_alloc_memory(real, alloc_info, pAllocator, pMemory);
-    LOG("[D%d] vkAllocateMemory: dev=%p size=%llu type=%u(%u) result=%d mem=0x%llx\n",
+
+    /* Convert DEVICE_LOST (-4) from AllocateMemory to OUT_OF_DEVICE_MEMORY (-1).
+     * Query device fault info for diagnostics. DXVK treats -4 as fatal
+     * but handles -1 gracefully (retries smaller sizes, falls back). */
+    if (res == -4) {
+        LOG("[D%d] vkAllocateMemory: DEVICE_LOST! type=%u size=%llu staging=%llu MB\n",
+            g_device_count, mem_type, (unsigned long long)alloc_size,
+            (unsigned long long)(g_staging_alloc_total / (1024*1024)));
+        query_device_fault();
+        if (pMemory) *pMemory = 0;
+        return -1; /* VK_ERROR_OUT_OF_DEVICE_MEMORY */
+    }
+
+    /* Track staging heap usage on success */
+    if (res == 0 && is_staging_type(mem_type))
+        g_staging_alloc_total += alloc_size;
+
+    LOG("[D%d] vkAllocateMemory: dev=%p size=%llu type=%u(%u) result=%d mem=0x%llx staging=%llu MB\n",
         g_device_count, real, (unsigned long long)alloc_size, mem_type, real_type, res,
-        pMemory ? (unsigned long long)*pMemory : 0);
+        pMemory ? (unsigned long long)*pMemory : 0,
+        (unsigned long long)(g_staging_alloc_total / (1024*1024)));
     return res;
 }
 
@@ -881,6 +1082,13 @@ static VkResult trace_CreateImage(void* device, const void* pCreateInfo,
         usage = *(const uint32_t*)((const char*)pCreateInfo + 56);
     }
     VkResult res = real_create_image(real, pCreateInfo, pAllocator, pImage);
+    /* Convert DEVICE_LOST: query fault info, then return recoverable error */
+    if (res == -4) {
+        LOG("[D%d] vkCreateImage: DEVICE_LOST! fmt=%u %ux%u tiling=%u usage=0x%x\n",
+            g_device_count, fmt, w, h, tiling, usage);
+        query_device_fault();
+        return -1;
+    }
     LOG("[D%d] vkCreateImage: dev=%p fmt=%u %ux%u tiling=%u usage=0x%x result=%d img=0x%llx\n",
         g_device_count, real, fmt, w, h, tiling, usage, res,
         pImage ? (unsigned long long)*pImage : 0);
@@ -913,16 +1121,104 @@ static VkResult trace_CreateSemaphore(void* device, const void* pCreateInfo,
 
 typedef VkResult (*PFN_vkMapMemory)(void*, uint64_t, uint64_t, uint64_t, uint32_t, void**);
 static PFN_vkMapMemory real_map_memory = NULL;
+static uint64_t g_total_mapped_bytes = 0;
+static int g_map_count = 0;
+
+/* Fake MapMemory: when total mapped would exceed MAP_BYTE_LIMIT, return a
+ * pointer into a shared scratch buffer instead of calling the real vkMapMemory.
+ * DXVK thinks the mapping succeeded; CPU writes go to scratch (data lost),
+ * but GPU operations use VkDeviceMemory handles and still work.
+ *
+ * IMPORTANT: Uses ONE shared scratch buffer (16MB) for ALL fake mappings.
+ * Each fake mapping gets a unique offset within the scratch to avoid aliasing.
+ * This minimizes VA space consumption (one mmap vs N*16MB). */
+
+#define SCRATCH_SIZE (16ULL * 1024 * 1024)  /* 16 MB shared scratch */
+static void* g_scratch_buf = NULL;
+static int g_scratch_inited = 0;
+
+static void ensure_scratch(void) {
+    if (g_scratch_inited) return;
+    g_scratch_inited = 1;
+    g_scratch_buf = mmap(NULL, SCRATCH_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_scratch_buf == MAP_FAILED) {
+        g_scratch_buf = NULL;
+        LOG("SCRATCH: mmap failed!\n");
+    } else {
+        LOG("SCRATCH: allocated %llu MB at %p\n",
+            (unsigned long long)(SCRATCH_SIZE / (1024*1024)), g_scratch_buf);
+    }
+}
+
+/* Track which mem handles are fake-mapped (for UnmapMemory) */
+#define MAX_FAKE_MAPS 64
+static uint64_t g_fake_map_handles[MAX_FAKE_MAPS];
+static int g_fake_map_count = 0;
 
 static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
                                 uint64_t size, uint32_t flags, void** ppData) {
     void* real = unwrap(device);
+    uint64_t map_size = (size != (uint64_t)-1) ? size : (16ULL * 1024 * 1024);
+
+    /* Check if this mapping would exceed the FEX thunk VA space limit */
+    if (g_total_mapped_bytes + map_size > MAP_BYTE_LIMIT) {
+        ensure_scratch();
+        if (g_scratch_buf && g_fake_map_count < MAX_FAKE_MAPS) {
+            g_fake_map_handles[g_fake_map_count++] = memory;
+            g_map_count++;
+            if (ppData) *ppData = g_scratch_buf; /* all fakes share one buffer */
+            LOG("[D%d] vkMapMemory #%d FAKE: mem=0x%llx sz=%llu scratch=%p total_real=%llu MB (limit=%llu MB)\n",
+                g_device_count, g_map_count, (unsigned long long)memory,
+                (unsigned long long)map_size, g_scratch_buf,
+                (unsigned long long)(g_total_mapped_bytes / (1024*1024)),
+                (unsigned long long)(MAP_BYTE_LIMIT / (1024*1024)));
+            return 0; /* VK_SUCCESS */
+        }
+    }
+
     VkResult res = real_map_memory(real, memory, offset, size, flags, ppData);
-    LOG("[D%d] vkMapMemory: dev=%p mem=0x%llx off=%llu sz=%llu result=%d data=%p\n",
-        g_device_count, real, (unsigned long long)memory,
-        (unsigned long long)offset, (unsigned long long)size,
-        res, ppData ? *ppData : NULL);
+    /* Convert DEVICE_LOST from VA exhaustion to recoverable error */
+    if (res == -4) {
+        LOG("[D%d] vkMapMemory: DEVICE_LOST -> MEMORY_MAP_FAILED (VA exhausted) total=%llu MB\n",
+            g_device_count, (unsigned long long)(g_total_mapped_bytes / (1024*1024)));
+        return -5; /* VK_ERROR_MEMORY_MAP_FAILED */
+    }
+    if (res == 0) {
+        g_map_count++;
+        if (size != (uint64_t)-1)
+            g_total_mapped_bytes += size;
+    }
+    LOG("[D%d] vkMapMemory #%d: mem=0x%llx sz=%llu result=%d total_mapped=%llu MB\n",
+        g_device_count, g_map_count, (unsigned long long)memory,
+        (unsigned long long)size, res,
+        (unsigned long long)(g_total_mapped_bytes / (1024*1024)));
+    if (res != 0) {
+        LOG("  !!! MapMemory FAILED (result=%d) after %llu MB total mapped\n",
+            res, (unsigned long long)(g_total_mapped_bytes / (1024*1024)));
+    }
     return res;
+}
+
+/* UnmapMemory: if the handle was fake-mapped, just remove from tracking.
+ * Scratch buffer is never freed (shared, process-lifetime). */
+
+typedef void (*PFN_vkUnmapMemory)(void*, uint64_t);
+static PFN_vkUnmapMemory real_unmap_memory = NULL;
+
+static void trace_UnmapMemory(void* device, uint64_t memory) {
+    for (int i = 0; i < g_fake_map_count; i++) {
+        if (g_fake_map_handles[i] == memory) {
+            LOG("[D%d] vkUnmapMemory FAKE: mem=0x%llx\n",
+                g_device_count, (unsigned long long)memory);
+            for (int j = i; j < g_fake_map_count - 1; j++)
+                g_fake_map_handles[j] = g_fake_map_handles[j + 1];
+            g_fake_map_count--;
+            return;
+        }
+    }
+    void* real = unwrap(device);
+    real_unmap_memory(real, memory);
 }
 
 typedef VkResult (*PFN_vkBindBufferMemory)(void*, uint64_t, uint64_t, uint64_t);
@@ -1038,6 +1334,541 @@ static VkResult trace_CreateShaderModule(void* device, const void* pCreateInfo,
     return res;
 }
 
+/* ==== Cmd* tracing ====
+ *
+ * Lightweight tracing for command buffer recording operations.
+ * Shows exactly what ops DXVK records before QueueSubmit2.
+ * All Cmd* functions take VkCommandBuffer (wrapper) as first arg.
+ */
+
+/* --- CmdPipelineBarrier2 (Vulkan 1.3 / KHR) ---
+ *
+ * VkDependencyInfo (x86-64):
+ *   offset 0:  sType (4)
+ *   offset 8:  pNext (8)
+ *   offset 16: dependencyFlags (4)
+ *   offset 20: memoryBarrierCount (4)
+ *   offset 24: pMemoryBarriers (8)
+ *   offset 32: bufferMemoryBarrierCount (4)
+ *   offset 40: pBufferMemoryBarriers (8)
+ *   offset 48: imageMemoryBarrierCount (4)
+ *   offset 56: pImageMemoryBarriers (8)
+ *
+ * VkImageMemoryBarrier2 (x86-64, 96 bytes):
+ *   offset 0:  sType (4)
+ *   offset 8:  pNext (8)
+ *   offset 16: srcStageMask (8)
+ *   offset 24: srcAccessMask (8)
+ *   offset 32: dstStageMask (8)
+ *   offset 40: dstAccessMask (8)
+ *   offset 48: oldLayout (4)
+ *   offset 52: newLayout (4)
+ *   offset 56: srcQueueFamilyIndex (4)
+ *   offset 60: dstQueueFamilyIndex (4)
+ *   offset 64: image (8)
+ *   offset 72: subresourceRange (20): aspectMask(4)+baseMipLevel(4)+levelCount(4)+baseArrayLayer(4)+layerCount(4)
+ */
+
+typedef void (*PFN_vkCmdPipelineBarrier2)(void*, const void*);
+static PFN_vkCmdPipelineBarrier2 real_cmd_pipeline_barrier2 = NULL;
+
+/* CmdPipelineBarrier v1 function pointer for the converter */
+typedef void (*PFN_vkCmdPipelineBarrierV1)(void*, uint32_t, uint32_t, uint32_t,
+    uint32_t, const void*, uint32_t, const void*, uint32_t, const void*);
+static PFN_vkCmdPipelineBarrierV1 real_cmd_pipeline_barrier_v1 = NULL;
+
+/* Convert VkPipelineStageFlags2 (64-bit) to VkPipelineStageFlags (32-bit).
+ * New v2-only bits (>= bit 32) mapped to ALL_COMMANDS for correctness. */
+static uint32_t stage2_to_v1(uint64_t f) {
+    uint32_t v = (uint32_t)(f & 0xFFFFFFFF);
+    if (f >> 32) v |= 0x10000; /* VK_PIPELINE_STAGE_ALL_COMMANDS_BIT */
+    return v;
+}
+
+/* Convert VkAccessFlags2 (64-bit) to VkAccessFlags (32-bit).
+ * New v2-only bits mapped to MEMORY_READ|MEMORY_WRITE. */
+static uint32_t access2_to_v1(uint64_t f) {
+    uint32_t v = (uint32_t)(f & 0xFFFFFFFF);
+    if (f >> 32) v |= 0x8000 | 0x10000; /* MEMORY_READ | MEMORY_WRITE */
+    return v;
+}
+
+/* CmdPipelineBarrier2 → CmdPipelineBarrier v1 converter.
+ * Bypasses FEX thunk marshaling of VkDependencyInfo/VkImageMemoryBarrier2
+ * by converting to v1 structs (proven working through thunks) and calling
+ * CmdPipelineBarrier instead.
+ *
+ * Struct sizes (x86-64):
+ *   VkMemoryBarrier2:       48 bytes → VkMemoryBarrier:       24 bytes
+ *   VkBufferMemoryBarrier2: 80 bytes → VkBufferMemoryBarrier: 56 bytes
+ *   VkImageMemoryBarrier2:  96 bytes → VkImageMemoryBarrier:  72 bytes
+ */
+static void converter_CmdPipelineBarrier2(void* cmdBuf, const void* pDependencyInfo) {
+    void* real = unwrap(cmdBuf);
+
+    if (!pDependencyInfo || !real_cmd_pipeline_barrier_v1) {
+        /* Fallback to v2 if no v1 function available */
+        if (real_cmd_pipeline_barrier2)
+            real_cmd_pipeline_barrier2(real, pDependencyInfo);
+        return;
+    }
+
+    const uint8_t* di = (const uint8_t*)pDependencyInfo;
+    uint32_t depFlags  = *(const uint32_t*)(di + 16);
+    uint32_t memCount  = *(const uint32_t*)(di + 20);
+    const uint8_t* pMem = *(const uint8_t**)(di + 24);
+    uint32_t bufCount  = *(const uint32_t*)(di + 32);
+    const uint8_t* pBuf = *(const uint8_t**)(di + 40);
+    uint32_t imgCount  = *(const uint32_t*)(di + 48);
+    const uint8_t* pImg = *(const uint8_t**)(di + 56);
+
+    /* Limit to stack-allocated arrays */
+    if (memCount > 16) memCount = 16;
+    if (bufCount > 8)  bufCount = 8;
+    if (imgCount > 16) imgCount = 16;
+
+    uint32_t srcStages = 0, dstStages = 0;
+
+    /* Convert VkMemoryBarrier2 (48 bytes) → VkMemoryBarrier (24 bytes) */
+    uint8_t memV1[16 * 24];
+    for (uint32_t i = 0; i < memCount; i++) {
+        const uint8_t* b2 = pMem + i * 48;
+        uint8_t* v1 = memV1 + i * 24;
+        memset(v1, 0, 24);
+        *(uint32_t*)(v1 + 0) = 46; /* VK_STRUCTURE_TYPE_MEMORY_BARRIER */
+        srcStages |= stage2_to_v1(*(const uint64_t*)(b2 + 16));
+        dstStages |= stage2_to_v1(*(const uint64_t*)(b2 + 32));
+        *(uint32_t*)(v1 + 16) = access2_to_v1(*(const uint64_t*)(b2 + 24));
+        *(uint32_t*)(v1 + 20) = access2_to_v1(*(const uint64_t*)(b2 + 40));
+    }
+
+    /* Convert VkBufferMemoryBarrier2 (80 bytes) → VkBufferMemoryBarrier (56 bytes) */
+    uint8_t bufV1[8 * 56];
+    for (uint32_t i = 0; i < bufCount; i++) {
+        const uint8_t* b2 = pBuf + i * 80;
+        uint8_t* v1 = bufV1 + i * 56;
+        memset(v1, 0, 56);
+        *(uint32_t*)(v1 + 0) = 44; /* VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER */
+        srcStages |= stage2_to_v1(*(const uint64_t*)(b2 + 16));
+        dstStages |= stage2_to_v1(*(const uint64_t*)(b2 + 32));
+        *(uint32_t*)(v1 + 16) = access2_to_v1(*(const uint64_t*)(b2 + 24));
+        *(uint32_t*)(v1 + 20) = access2_to_v1(*(const uint64_t*)(b2 + 40));
+        *(uint32_t*)(v1 + 24) = *(const uint32_t*)(b2 + 48); /* srcQueueFamilyIndex */
+        *(uint32_t*)(v1 + 28) = *(const uint32_t*)(b2 + 52); /* dstQueueFamilyIndex */
+        *(uint64_t*)(v1 + 32) = *(const uint64_t*)(b2 + 56); /* buffer */
+        *(uint64_t*)(v1 + 40) = *(const uint64_t*)(b2 + 64); /* offset */
+        *(uint64_t*)(v1 + 48) = *(const uint64_t*)(b2 + 72); /* size */
+    }
+
+    /* Convert VkImageMemoryBarrier2 (96 bytes) → VkImageMemoryBarrier (72 bytes) */
+    uint8_t imgV1[16 * 72];
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const uint8_t* b2 = pImg + i * 96;
+        uint8_t* v1 = imgV1 + i * 72;
+        memset(v1, 0, 72);
+        *(uint32_t*)(v1 + 0) = 45; /* VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER */
+        srcStages |= stage2_to_v1(*(const uint64_t*)(b2 + 16));
+        dstStages |= stage2_to_v1(*(const uint64_t*)(b2 + 32));
+        *(uint32_t*)(v1 + 16) = access2_to_v1(*(const uint64_t*)(b2 + 24));
+        *(uint32_t*)(v1 + 20) = access2_to_v1(*(const uint64_t*)(b2 + 40));
+        *(uint32_t*)(v1 + 24) = *(const uint32_t*)(b2 + 48); /* oldLayout */
+        *(uint32_t*)(v1 + 28) = *(const uint32_t*)(b2 + 52); /* newLayout */
+        *(uint32_t*)(v1 + 32) = *(const uint32_t*)(b2 + 56); /* srcQueueFamilyIndex */
+        *(uint32_t*)(v1 + 36) = *(const uint32_t*)(b2 + 60); /* dstQueueFamilyIndex */
+        *(uint64_t*)(v1 + 40) = *(const uint64_t*)(b2 + 64); /* image */
+        memcpy(v1 + 48, b2 + 72, 20);                        /* subresourceRange */
+    }
+
+    if (!srcStages) srcStages = 0x1;    /* TOP_OF_PIPE */
+    if (!dstStages) dstStages = 0x2000; /* BOTTOM_OF_PIPE */
+
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] Barrier2->v1: cb=%p src=0x%x dst=0x%x dep=0x%x mem=%u buf=%u img=%u\n",
+        op, real, srcStages, dstStages, depFlags, memCount, bufCount, imgCount);
+
+    real_cmd_pipeline_barrier_v1(real, srcStages, dstStages, depFlags,
+        memCount, memCount ? (const void*)memV1 : NULL,
+        bufCount, bufCount ? (const void*)bufV1 : NULL,
+        imgCount, imgCount ? (const void*)imgV1 : NULL);
+}
+
+/* --- CmdCopyBuffer --- */
+typedef void (*PFN_vkCmdCopyBuffer)(void*, uint64_t, uint64_t, uint32_t, const void*);
+static PFN_vkCmdCopyBuffer real_cmd_copy_buffer = NULL;
+
+static void trace_CmdCopyBuffer(void* cmdBuf, uint64_t srcBuf, uint64_t dstBuf,
+                                 uint32_t regionCount, const void* pRegions) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdCopyBuffer: cb=%p src=0x%llx dst=0x%llx regions=%u\n",
+        op, real, (unsigned long long)srcBuf, (unsigned long long)dstBuf, regionCount);
+    real_cmd_copy_buffer(real, srcBuf, dstBuf, regionCount, pRegions);
+}
+
+/* --- CmdCopyBufferToImage --- */
+typedef void (*PFN_vkCmdCopyBufToImg)(void*, uint64_t, uint64_t, uint32_t, uint32_t, const void*);
+static PFN_vkCmdCopyBufToImg real_cmd_copy_buf_to_img = NULL;
+
+static void trace_CmdCopyBufferToImage(void* cmdBuf, uint64_t buffer, uint64_t image,
+                                         uint32_t imageLayout, uint32_t regionCount,
+                                         const void* pRegions) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdCopyBufferToImage: cb=%p buf=0x%llx img=0x%llx layout=%u regions=%u\n",
+        op, real, (unsigned long long)buffer, (unsigned long long)image,
+        imageLayout, regionCount);
+    real_cmd_copy_buf_to_img(real, buffer, image, imageLayout, regionCount, pRegions);
+}
+
+/* --- CmdCopyImageToBuffer --- */
+typedef void (*PFN_vkCmdCopyImgToBuf)(void*, uint64_t, uint32_t, uint64_t, uint32_t, const void*);
+static PFN_vkCmdCopyImgToBuf real_cmd_copy_img_to_buf = NULL;
+
+static void trace_CmdCopyImageToBuffer(void* cmdBuf, uint64_t image, uint32_t imageLayout,
+                                         uint64_t buffer, uint32_t regionCount,
+                                         const void* pRegions) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdCopyImageToBuffer: cb=%p img=0x%llx layout=%u buf=0x%llx regions=%u\n",
+        op, real, (unsigned long long)image, imageLayout,
+        (unsigned long long)buffer, regionCount);
+    real_cmd_copy_img_to_buf(real, image, imageLayout, buffer, regionCount, pRegions);
+}
+
+/* --- CmdClearColorImage --- */
+typedef void (*PFN_vkCmdClearColorImage)(void*, uint64_t, uint32_t, const void*, uint32_t, const void*);
+static PFN_vkCmdClearColorImage real_cmd_clear_color = NULL;
+
+static void trace_CmdClearColorImage(void* cmdBuf, uint64_t image, uint32_t layout,
+                                      const void* pColor, uint32_t rangeCount,
+                                      const void* pRanges) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdClearColorImage: cb=%p img=0x%llx layout=%u ranges=%u\n",
+        op, real, (unsigned long long)image, layout, rangeCount);
+    real_cmd_clear_color(real, image, layout, pColor, rangeCount, pRanges);
+}
+
+/* --- CmdClearDepthStencilImage --- */
+typedef void (*PFN_vkCmdClearDSImage)(void*, uint64_t, uint32_t, const void*, uint32_t, const void*);
+static PFN_vkCmdClearDSImage real_cmd_clear_ds = NULL;
+
+static void trace_CmdClearDepthStencilImage(void* cmdBuf, uint64_t image, uint32_t layout,
+                                              const void* pDepthStencil, uint32_t rangeCount,
+                                              const void* pRanges) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdClearDepthStencilImage: cb=%p img=0x%llx layout=%u ranges=%u\n",
+        op, real, (unsigned long long)image, layout, rangeCount);
+    real_cmd_clear_ds(real, image, layout, pDepthStencil, rangeCount, pRanges);
+}
+
+/* --- CmdBeginRendering (Vulkan 1.3 / KHR dynamic rendering) --- */
+typedef void (*PFN_vkCmdBeginRendering)(void*, const void*);
+static PFN_vkCmdBeginRendering real_cmd_begin_rendering = NULL;
+
+static void trace_CmdBeginRendering(void* cmdBuf, const void* pRenderingInfo) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    /* VkRenderingInfo (x86-64):
+     * offset 0:  sType (4)
+     * offset 4:  pad (4)
+     * offset 8:  pNext (8)
+     * offset 16: flags (4)
+     * offset 20: renderArea.offset.x (4)
+     * offset 24: renderArea.offset.y (4)
+     * offset 28: renderArea.extent.width (4)
+     * offset 32: renderArea.extent.height (4)
+     * offset 36: layerCount (4)
+     * offset 40: viewMask (4)
+     * offset 44: colorAttachmentCount (4)
+     * offset 48: pColorAttachments (8)
+     * offset 56: pDepthAttachment (8)
+     * offset 64: pStencilAttachment (8) */
+    uint32_t colorCount = 0, w = 0, h = 0, flags = 0, layers = 0;
+    const void* pDepth = NULL;
+    const void* pStencil = NULL;
+    if (pRenderingInfo) {
+        flags = *(const uint32_t*)((const char*)pRenderingInfo + 16);
+        w = *(const uint32_t*)((const char*)pRenderingInfo + 28);
+        h = *(const uint32_t*)((const char*)pRenderingInfo + 32);
+        layers = *(const uint32_t*)((const char*)pRenderingInfo + 36);
+        colorCount = *(const uint32_t*)((const char*)pRenderingInfo + 44);
+        pDepth = *(const void**)((const char*)pRenderingInfo + 56);
+        pStencil = *(const void**)((const char*)pRenderingInfo + 64);
+    }
+    LOG("[CMD#%d] CmdBeginRendering: cb=%p %ux%u layers=%u colorAtts=%u depth=%p stencil=%p flags=0x%x\n",
+        op, real, w, h, layers, colorCount, pDepth, pStencil, flags);
+    real_cmd_begin_rendering(real, pRenderingInfo);
+}
+
+/* --- CmdEndRendering --- */
+typedef void (*PFN_vkCmdEndRendering)(void*);
+static PFN_vkCmdEndRendering real_cmd_end_rendering = NULL;
+
+static void trace_CmdEndRendering(void* cmdBuf) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdEndRendering: cb=%p\n", op, real);
+    real_cmd_end_rendering(real);
+}
+
+/* --- CmdBindPipeline --- */
+typedef void (*PFN_vkCmdBindPipeline)(void*, uint32_t, uint64_t);
+static PFN_vkCmdBindPipeline real_cmd_bind_pipeline = NULL;
+
+static void trace_CmdBindPipeline(void* cmdBuf, uint32_t bindPoint, uint64_t pipeline) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdBindPipeline: cb=%p bindPoint=%u(%s) pipeline=0x%llx\n",
+        op, real, bindPoint,
+        bindPoint == 0 ? "GRAPHICS" : bindPoint == 1 ? "COMPUTE" : "RAYTRACE",
+        (unsigned long long)pipeline);
+    real_cmd_bind_pipeline(real, bindPoint, pipeline);
+}
+
+/* --- CmdDraw --- */
+typedef void (*PFN_vkCmdDraw)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+static PFN_vkCmdDraw real_cmd_draw = NULL;
+
+static void trace_CmdDraw(void* cmdBuf, uint32_t vertexCount, uint32_t instanceCount,
+                           uint32_t firstVertex, uint32_t firstInstance) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdDraw: cb=%p verts=%u inst=%u\n",
+        op, real, vertexCount, instanceCount);
+    real_cmd_draw(real, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+/* --- CmdDrawIndexed --- */
+typedef void (*PFN_vkCmdDrawIndexed)(void*, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+static PFN_vkCmdDrawIndexed real_cmd_draw_indexed = NULL;
+
+static void trace_CmdDrawIndexed(void* cmdBuf, uint32_t indexCount, uint32_t instanceCount,
+                                  uint32_t firstIndex, int32_t vertexOffset,
+                                  uint32_t firstInstance) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdDrawIndexed: cb=%p indices=%u inst=%u\n",
+        op, real, indexCount, instanceCount);
+    real_cmd_draw_indexed(real, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+/* --- CmdDispatch --- */
+typedef void (*PFN_vkCmdDispatch)(void*, uint32_t, uint32_t, uint32_t);
+static PFN_vkCmdDispatch real_cmd_dispatch = NULL;
+
+static void trace_CmdDispatch(void* cmdBuf, uint32_t gx, uint32_t gy, uint32_t gz) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdDispatch: cb=%p groups=%u,%u,%u\n",
+        op, real, gx, gy, gz);
+    real_cmd_dispatch(real, gx, gy, gz);
+}
+
+/* --- CmdFillBuffer --- */
+typedef void (*PFN_vkCmdFillBuffer)(void*, uint64_t, uint64_t, uint64_t, uint32_t);
+static PFN_vkCmdFillBuffer real_cmd_fill_buffer = NULL;
+
+static void trace_CmdFillBuffer(void* cmdBuf, uint64_t dstBuf, uint64_t dstOffset,
+                                  uint64_t size, uint32_t data) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdFillBuffer: cb=%p buf=0x%llx off=%llu size=%llu data=0x%x\n",
+        op, real, (unsigned long long)dstBuf, (unsigned long long)dstOffset,
+        (unsigned long long)size, data);
+    real_cmd_fill_buffer(real, dstBuf, dstOffset, size, data);
+}
+
+/* --- CmdUpdateBuffer --- */
+typedef void (*PFN_vkCmdUpdateBuffer)(void*, uint64_t, uint64_t, uint64_t, const void*);
+static PFN_vkCmdUpdateBuffer real_cmd_update_buffer = NULL;
+
+static void trace_CmdUpdateBuffer(void* cmdBuf, uint64_t dstBuf, uint64_t dstOffset,
+                                    uint64_t dataSize, const void* pData) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdUpdateBuffer: cb=%p buf=0x%llx off=%llu size=%llu\n",
+        op, real, (unsigned long long)dstBuf, (unsigned long long)dstOffset,
+        (unsigned long long)dataSize);
+    real_cmd_update_buffer(real, dstBuf, dstOffset, dataSize, pData);
+}
+
+/* --- CmdBindDescriptorSets --- */
+typedef void (*PFN_vkCmdBindDescSets)(void*, uint32_t, uint64_t, uint32_t, uint32_t,
+                                       const uint64_t*, uint32_t, const uint32_t*);
+static PFN_vkCmdBindDescSets real_cmd_bind_desc_sets = NULL;
+
+static void trace_CmdBindDescriptorSets(void* cmdBuf, uint32_t bindPoint, uint64_t layout,
+                                          uint32_t firstSet, uint32_t setCount,
+                                          const uint64_t* pSets, uint32_t dynOffCount,
+                                          const uint32_t* pDynOffs) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdBindDescriptorSets: cb=%p bindPoint=%u sets=%u dynOffs=%u\n",
+        op, real, bindPoint, setCount, dynOffCount);
+    real_cmd_bind_desc_sets(real, bindPoint, layout, firstSet, setCount, pSets, dynOffCount, pDynOffs);
+}
+
+/* --- CmdSetViewport --- */
+typedef void (*PFN_vkCmdSetViewport)(void*, uint32_t, uint32_t, const void*);
+static PFN_vkCmdSetViewport real_cmd_set_viewport = NULL;
+
+static void trace_CmdSetViewport(void* cmdBuf, uint32_t first, uint32_t count, const void* pViewports) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    /* VkViewport: x(4)+y(4)+width(4)+height(4)+minDepth(4)+maxDepth(4) = 24 bytes */
+    if (count > 0 && pViewports) {
+        float w = *(const float*)((const char*)pViewports + 8);
+        float h = *(const float*)((const char*)pViewports + 12);
+        LOG("[CMD#%d] CmdSetViewport: cb=%p count=%u vp0=%.0fx%.0f\n",
+            op, real, count, w, h);
+    } else {
+        LOG("[CMD#%d] CmdSetViewport: cb=%p count=%u\n", op, real, count);
+    }
+    real_cmd_set_viewport(real, first, count, pViewports);
+}
+
+/* --- CmdSetScissor --- */
+typedef void (*PFN_vkCmdSetScissor)(void*, uint32_t, uint32_t, const void*);
+static PFN_vkCmdSetScissor real_cmd_set_scissor = NULL;
+
+static void trace_CmdSetScissor(void* cmdBuf, uint32_t first, uint32_t count, const void* pScissors) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdSetScissor: cb=%p count=%u\n", op, real, count);
+    real_cmd_set_scissor(real, first, count, pScissors);
+}
+
+/* --- CmdBindVertexBuffers --- */
+typedef void (*PFN_vkCmdBindVtxBufs)(void*, uint32_t, uint32_t, const uint64_t*, const uint64_t*);
+static PFN_vkCmdBindVtxBufs real_cmd_bind_vtx_bufs = NULL;
+
+static void trace_CmdBindVertexBuffers(void* cmdBuf, uint32_t first, uint32_t count,
+                                        const uint64_t* pBuffers, const uint64_t* pOffsets) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdBindVertexBuffers: cb=%p first=%u count=%u\n",
+        op, real, first, count);
+    real_cmd_bind_vtx_bufs(real, first, count, pBuffers, pOffsets);
+}
+
+/* --- CmdBindIndexBuffer --- */
+typedef void (*PFN_vkCmdBindIdxBuf)(void*, uint64_t, uint64_t, uint32_t);
+static PFN_vkCmdBindIdxBuf real_cmd_bind_idx_buf = NULL;
+
+static void trace_CmdBindIndexBuffer(void* cmdBuf, uint64_t buffer, uint64_t offset, uint32_t indexType) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdBindIndexBuffer: cb=%p buf=0x%llx type=%u\n",
+        op, real, (unsigned long long)buffer, indexType);
+    real_cmd_bind_idx_buf(real, buffer, offset, indexType);
+}
+
+/* --- CmdPushConstants --- */
+typedef void (*PFN_vkCmdPushConsts)(void*, uint64_t, uint32_t, uint32_t, uint32_t, const void*);
+static PFN_vkCmdPushConsts real_cmd_push_consts = NULL;
+
+static void trace_CmdPushConstants(void* cmdBuf, uint64_t layout, uint32_t stageFlags,
+                                    uint32_t offset, uint32_t size, const void* pValues) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdPushConstants: cb=%p stages=0x%x off=%u size=%u\n",
+        op, real, stageFlags, offset, size);
+    real_cmd_push_consts(real, layout, stageFlags, offset, size, pValues);
+}
+
+/* --- vkCreateGraphicsPipelines --- */
+typedef VkResult (*PFN_vkCreateGraphicsPipelines)(void*, uint64_t, uint32_t, const void*, const void*, uint64_t*);
+static PFN_vkCreateGraphicsPipelines real_create_gfx_pipelines = NULL;
+
+static VkResult trace_CreateGraphicsPipelines(void* device, uint64_t cache, uint32_t count,
+                                               const void* pCreateInfos, const void* pAllocator,
+                                               uint64_t* pPipelines) {
+    void* real = unwrap(device);
+    VkResult res = real_create_gfx_pipelines(real, cache, count, pCreateInfos, pAllocator, pPipelines);
+    LOG("[D%d] vkCreateGraphicsPipelines: dev=%p count=%u result=%d\n",
+        g_device_count, real, count, res);
+    if (res != 0) {
+        LOG("[D%d] *** CreateGraphicsPipelines FAILED: count=%u result=%d ***\n",
+            g_device_count, count, res);
+    }
+    return res;
+}
+
+/* --- vkCreateComputePipelines --- */
+typedef VkResult (*PFN_vkCreateComputePipelines)(void*, uint64_t, uint32_t, const void*, const void*, uint64_t*);
+static PFN_vkCreateComputePipelines real_create_comp_pipelines = NULL;
+
+static VkResult trace_CreateComputePipelines(void* device, uint64_t cache, uint32_t count,
+                                              const void* pCreateInfos, const void* pAllocator,
+                                              uint64_t* pPipelines) {
+    void* real = unwrap(device);
+    VkResult res = real_create_comp_pipelines(real, cache, count, pCreateInfos, pAllocator, pPipelines);
+    LOG("[D%d] vkCreateComputePipelines: dev=%p count=%u result=%d\n",
+        g_device_count, real, count, res);
+    if (res != 0) {
+        LOG("[D%d] *** CreateComputePipelines FAILED: count=%u result=%d ***\n",
+            g_device_count, count, res);
+    }
+    return res;
+}
+
+/* --- vkCreateRenderPass / vkCreateRenderPass2 --- */
+typedef VkResult (*PFN_vkCreateRenderPass)(void*, const void*, const void*, uint64_t*);
+static PFN_vkCreateRenderPass real_create_render_pass = NULL;
+
+static VkResult trace_CreateRenderPass(void* device, const void* pCreateInfo,
+                                        const void* pAllocator, uint64_t* pRenderPass) {
+    void* real = unwrap(device);
+    VkResult res = real_create_render_pass(real, pCreateInfo, pAllocator, pRenderPass);
+    LOG("[D%d] vkCreateRenderPass: dev=%p result=%d rp=0x%llx\n",
+        g_device_count, real, res, pRenderPass ? (unsigned long long)*pRenderPass : 0);
+    return res;
+}
+
+typedef VkResult (*PFN_vkCreateRenderPass2)(void*, const void*, const void*, uint64_t*);
+static PFN_vkCreateRenderPass2 real_create_render_pass2 = NULL;
+
+static VkResult trace_CreateRenderPass2(void* device, const void* pCreateInfo,
+                                         const void* pAllocator, uint64_t* pRenderPass) {
+    void* real = unwrap(device);
+    VkResult res = real_create_render_pass2(real, pCreateInfo, pAllocator, pRenderPass);
+    LOG("[D%d] vkCreateRenderPass2: dev=%p result=%d rp=0x%llx\n",
+        g_device_count, real, res, pRenderPass ? (unsigned long long)*pRenderPass : 0);
+    return res;
+}
+
+/* --- vkAllocateDescriptorSets --- */
+typedef VkResult (*PFN_vkAllocDescSets)(void*, const void*, uint64_t*);
+static PFN_vkAllocDescSets real_alloc_desc_sets = NULL;
+
+static VkResult trace_AllocateDescriptorSets(void* device, const void* pAllocInfo,
+                                              uint64_t* pDescSets) {
+    void* real = unwrap(device);
+    /* VkDescriptorSetAllocateInfo: sType(4)+pad(4)+pNext(8)+descriptorPool(8)+descriptorSetCount(4) */
+    uint32_t count = 0;
+    if (pAllocInfo)
+        count = *(const uint32_t*)((const char*)pAllocInfo + 24);
+    VkResult res = real_alloc_desc_sets(real, pAllocInfo, pDescSets);
+    LOG("[D%d] vkAllocateDescriptorSets: dev=%p count=%u result=%d\n",
+        g_device_count, real, count, res);
+    return res;
+}
+
+/* --- vkCreateDescriptorPool --- */
+typedef VkResult (*PFN_vkCreateDescPool)(void*, const void*, const void*, uint64_t*);
+static PFN_vkCreateDescPool real_create_desc_pool = NULL;
+
+static VkResult trace_CreateDescriptorPool(void* device, const void* pCreateInfo,
+                                            const void* pAllocator, uint64_t* pPool) {
+    void* real = unwrap(device);
+    VkResult res = real_create_desc_pool(real, pCreateInfo, pAllocator, pPool);
+    LOG("[D%d] vkCreateDescriptorPool: dev=%p result=%d pool=0x%llx\n",
+        g_device_count, real, res, pPool ? (unsigned long long)*pPool : 0);
+    return res;
+}
+
 /* ==== Memory requirements patching ====
  *
  * When we add a virtual DEVICE_LOCAL-only type (g_added_type_index >= 0),
@@ -1058,9 +1889,12 @@ static PFN_vkGetBufMemReqs real_get_buf_mem_reqs = NULL;
 static void wrapped_GetBufferMemoryRequirements(void* device, uint64_t buffer, void* pReqs) {
     void* real = unwrap(device);
     real_get_buf_mem_reqs(real, buffer, pReqs);
-    if (pReqs && g_added_type_index >= 0) {
+    if (pReqs) {
         uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 16);
-        *bits |= (1u << g_added_type_index);
+        uint32_t orig = *bits;
+        if (g_added_type_index >= 0)
+            *bits |= (1u << g_added_type_index);
+        LOG("GetBufMemReqs: bits=0x%x -> 0x%x (added_idx=%d)\n", orig, *bits, g_added_type_index);
     }
 }
 
@@ -1082,9 +1916,12 @@ static PFN_vkGetBufMemReqs2 real_get_buf_mem_reqs2 = NULL;
 static void wrapped_GetBufferMemoryRequirements2(void* device, const void* pInfo, void* pReqs) {
     void* real = unwrap(device);
     real_get_buf_mem_reqs2(real, pInfo, pReqs);
-    if (pReqs && g_added_type_index >= 0) {
+    if (pReqs) {
         uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
-        *bits |= (1u << g_added_type_index);
+        uint32_t orig = *bits;
+        if (g_added_type_index >= 0)
+            *bits |= (1u << g_added_type_index);
+        LOG("GetBufMemReqs2: bits=0x%x -> 0x%x (added_idx=%d)\n", orig, *bits, g_added_type_index);
     }
 }
 
@@ -1097,6 +1934,40 @@ static void wrapped_GetImageMemoryRequirements2(void* device, const void* pInfo,
     if (pReqs && g_added_type_index >= 0) {
         uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
         *bits |= (1u << g_added_type_index);
+    }
+}
+
+/* Vulkan 1.3: vkGetDeviceBufferMemoryRequirements / vkGetDeviceImageMemoryRequirements
+ * Same output as GetXxxMemoryRequirements2 (VkMemoryRequirements2, bits at offset 32).
+ * DXVK 2.7+ uses these for initial type mask probes — must patch here too. */
+
+typedef void (*PFN_vkGetDevBufMemReqs)(void*, const void*, void*);
+static PFN_vkGetDevBufMemReqs real_get_dev_buf_mem_reqs = NULL;
+
+static void wrapped_GetDeviceBufferMemoryRequirements(void* device, const void* pInfo, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_dev_buf_mem_reqs(real, pInfo, pReqs);
+    if (pReqs) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
+        uint32_t orig = *bits;
+        if (g_added_type_index >= 0)
+            *bits |= (1u << g_added_type_index);
+        LOG("GetDevBufMemReqs: bits=0x%x -> 0x%x (added_idx=%d)\n", orig, *bits, g_added_type_index);
+    }
+}
+
+typedef void (*PFN_vkGetDevImgMemReqs)(void*, const void*, void*);
+static PFN_vkGetDevImgMemReqs real_get_dev_img_mem_reqs = NULL;
+
+static void wrapped_GetDeviceImageMemoryRequirements(void* device, const void* pInfo, void* pReqs) {
+    void* real = unwrap(device);
+    real_get_dev_img_mem_reqs(real, pInfo, pReqs);
+    if (pReqs) {
+        uint32_t* bits = (uint32_t*)((uint8_t*)pReqs + 32);
+        uint32_t orig = *bits;
+        if (g_added_type_index >= 0)
+            *bits |= (1u << g_added_type_index);
+        LOG("GetDevImgMemReqs: bits=0x%x -> 0x%x (added_idx=%d)\n", orig, *bits, g_added_type_index);
     }
 }
 
@@ -1125,6 +1996,39 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         }
     }
 
+    /* CmdPipelineBarrier2 → v1 converter: bypass FEX thunk marshaling of
+     * VkDependencyInfo by converting to proven-working v1 barrier call. */
+    if (strcmp(pName, "vkCmdPipelineBarrier2") == 0 ||
+        strcmp(pName, "vkCmdPipelineBarrier2KHR") == 0) {
+        real_cmd_pipeline_barrier2 = (PFN_vkCmdPipelineBarrier2)fn;
+        /* Also resolve v1 barrier function for the converter */
+        if (!real_cmd_pipeline_barrier_v1) {
+            PFN_vkVoidFunction v1fn = NULL;
+            if (real_gipa && saved_instance)
+                v1fn = real_gipa(saved_instance, "vkCmdPipelineBarrier");
+            if (!v1fn && thunk_lib)
+                v1fn = (PFN_vkVoidFunction)dlsym(thunk_lib, "vkCmdPipelineBarrier");
+            if (!v1fn && real_gdpa && device) {
+                void* rd = unwrap(device);
+                if (rd) v1fn = real_gdpa(rd, "vkCmdPipelineBarrier");
+            }
+            real_cmd_pipeline_barrier_v1 = (PFN_vkCmdPipelineBarrierV1)v1fn;
+            LOG("GDPA: resolved vkCmdPipelineBarrier v1 -> %p\n", (void*)v1fn);
+        }
+        LOG("GDPA: %s -> converter (v2->v1, real_v2=%p, real_v1=%p)\n",
+            pName, (void*)fn, (void*)real_cmd_pipeline_barrier_v1);
+        return (PFN_vkVoidFunction)converter_CmdPipelineBarrier2;
+    }
+
+    /* Resolve vkGetDeviceFaultInfoEXT for GPU fault diagnostics */
+    if (strcmp(pName, "vkGetDeviceFaultInfoEXT") == 0) {
+        if (fn) {
+            real_get_device_fault_info = (PFN_vkGetDeviceFaultInfoEXT)fn;
+            LOG("GDPA: vkGetDeviceFaultInfoEXT -> %p (resolved for fault diagnostics)\n", (void*)fn);
+        }
+        return fn ? make_unwrap_trampoline(fn) : NULL;
+    }
+
     /* Block extensions that crash through thunks.
      * Wine checks if vkMapMemory2KHR is non-NULL and uses placed mapping
      * for ALL mappings. Vortek/thunks don't support placed mapping properly.
@@ -1135,15 +2039,15 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         return NULL;
     }
 
-    /* vkQueueSubmit2 wrapper — unwrap queue + cmdBuf handles in VkSubmitInfo2 */
+    /* vkQueueSubmit2: pass-through with handle unwrapping.
+     * Vortek natively supports QueueSubmit2 — just unwrap queue + cmdBuf handles. */
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0 ||
         strcmp(pName, "vkQueueSubmit2") == 0) {
         if (fn) {
             real_queue_submit2 = (PFN_vkQueueSubmit2)fn;
+            LOG("GDPA: %s -> unwrap wrapper (real=%p)\n", pName, (void*)fn);
             return (PFN_vkVoidFunction)wrapper_QueueSubmit2;
         }
-        LOG("GDPA: %s -> NULL (not available from ICD)\n", pName);
-        return NULL;
     }
 
     /* Self-reference */
@@ -1208,6 +2112,23 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         real_get_img_mem_reqs2 = (PFN_vkGetImgMemReqs2)fn;
         return (PFN_vkVoidFunction)wrapped_GetImageMemoryRequirements2;
     }
+    /* Vulkan 1.3: vkGetDeviceBufferMemoryRequirements — DXVK 2.7+ uses this for
+     * initial type mask probe. Must patch memoryTypeBits here too.
+     * Only hook core function (not KHR) to avoid dispatch issues. */
+    if (strcmp(pName, "vkGetDeviceBufferMemoryRequirements") == 0) {
+        if (fn) {
+            real_get_dev_buf_mem_reqs = (PFN_vkGetDevBufMemReqs)fn;
+            LOG("GDPA: %s -> wrapped (real=%p)\n", pName, (void*)fn);
+            return (PFN_vkVoidFunction)wrapped_GetDeviceBufferMemoryRequirements;
+        }
+    }
+    if (strcmp(pName, "vkGetDeviceImageMemoryRequirements") == 0) {
+        if (fn) {
+            real_get_dev_img_mem_reqs = (PFN_vkGetDevImgMemReqs)fn;
+            LOG("GDPA: %s -> wrapped (real=%p)\n", pName, (void*)fn);
+            return (PFN_vkVoidFunction)wrapped_GetDeviceImageMemoryRequirements;
+        }
+    }
 
     /* Trace wrappers: log VkResult for key init-time functions.
      * These help diagnose which Vulkan call fails during the
@@ -1239,6 +2160,10 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
     if (strcmp(pName, "vkMapMemory") == 0) {
         real_map_memory = (PFN_vkMapMemory)fn;
         return (PFN_vkVoidFunction)trace_MapMemory;
+    }
+    if (strcmp(pName, "vkUnmapMemory") == 0) {
+        real_unmap_memory = (PFN_vkUnmapMemory)fn;
+        return (PFN_vkVoidFunction)trace_UnmapMemory;
     }
     if (strcmp(pName, "vkBindBufferMemory") == 0) {
         real_bind_buf_mem = (PFN_vkBindBufferMemory)fn;
@@ -1276,11 +2201,195 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         real_create_shader_module = (PFN_vkCreateShaderModule)fn;
         return (PFN_vkVoidFunction)trace_CreateShaderModule;
     }
+    if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) {
+        real_create_gfx_pipelines = (PFN_vkCreateGraphicsPipelines)fn;
+        return (PFN_vkVoidFunction)trace_CreateGraphicsPipelines;
+    }
+    if (strcmp(pName, "vkCreateComputePipelines") == 0) {
+        real_create_comp_pipelines = (PFN_vkCreateComputePipelines)fn;
+        return (PFN_vkVoidFunction)trace_CreateComputePipelines;
+    }
+    if (strcmp(pName, "vkCreateRenderPass") == 0) {
+        real_create_render_pass = (PFN_vkCreateRenderPass)fn;
+        return (PFN_vkVoidFunction)trace_CreateRenderPass;
+    }
+    if (strcmp(pName, "vkCreateRenderPass2") == 0 ||
+        strcmp(pName, "vkCreateRenderPass2KHR") == 0) {
+        real_create_render_pass2 = (PFN_vkCreateRenderPass2)fn;
+        return (PFN_vkVoidFunction)trace_CreateRenderPass2;
+    }
+    if (strcmp(pName, "vkAllocateDescriptorSets") == 0) {
+        real_alloc_desc_sets = (PFN_vkAllocDescSets)fn;
+        return (PFN_vkVoidFunction)trace_AllocateDescriptorSets;
+    }
+    if (strcmp(pName, "vkCreateDescriptorPool") == 0) {
+        real_create_desc_pool = (PFN_vkCreateDescPool)fn;
+        return (PFN_vkVoidFunction)trace_CreateDescriptorPool;
+    }
+
+    /* Cmd* tracing: log command buffer recording operations
+     * Note: CmdPipelineBarrier2 is handled above by the v2→v1 converter */
+    if (strcmp(pName, "vkCmdCopyBuffer") == 0) {
+        real_cmd_copy_buffer = (PFN_vkCmdCopyBuffer)fn;
+        return (PFN_vkVoidFunction)trace_CmdCopyBuffer;
+    }
+    if (strcmp(pName, "vkCmdCopyBufferToImage") == 0) {
+        real_cmd_copy_buf_to_img = (PFN_vkCmdCopyBufToImg)fn;
+        return (PFN_vkVoidFunction)trace_CmdCopyBufferToImage;
+    }
+    if (strcmp(pName, "vkCmdCopyImageToBuffer") == 0) {
+        real_cmd_copy_img_to_buf = (PFN_vkCmdCopyImgToBuf)fn;
+        return (PFN_vkVoidFunction)trace_CmdCopyImageToBuffer;
+    }
+    if (strcmp(pName, "vkCmdClearColorImage") == 0) {
+        real_cmd_clear_color = (PFN_vkCmdClearColorImage)fn;
+        return (PFN_vkVoidFunction)trace_CmdClearColorImage;
+    }
+    if (strcmp(pName, "vkCmdClearDepthStencilImage") == 0) {
+        real_cmd_clear_ds = (PFN_vkCmdClearDSImage)fn;
+        return (PFN_vkVoidFunction)trace_CmdClearDepthStencilImage;
+    }
+    if (strcmp(pName, "vkCmdBeginRendering") == 0 ||
+        strcmp(pName, "vkCmdBeginRenderingKHR") == 0) {
+        real_cmd_begin_rendering = (PFN_vkCmdBeginRendering)fn;
+        return (PFN_vkVoidFunction)trace_CmdBeginRendering;
+    }
+    if (strcmp(pName, "vkCmdEndRendering") == 0 ||
+        strcmp(pName, "vkCmdEndRenderingKHR") == 0) {
+        real_cmd_end_rendering = (PFN_vkCmdEndRendering)fn;
+        return (PFN_vkVoidFunction)trace_CmdEndRendering;
+    }
+    if (strcmp(pName, "vkCmdBindPipeline") == 0) {
+        real_cmd_bind_pipeline = (PFN_vkCmdBindPipeline)fn;
+        return (PFN_vkVoidFunction)trace_CmdBindPipeline;
+    }
+    if (strcmp(pName, "vkCmdDraw") == 0) {
+        real_cmd_draw = (PFN_vkCmdDraw)fn;
+        return (PFN_vkVoidFunction)trace_CmdDraw;
+    }
+    if (strcmp(pName, "vkCmdDrawIndexed") == 0) {
+        real_cmd_draw_indexed = (PFN_vkCmdDrawIndexed)fn;
+        return (PFN_vkVoidFunction)trace_CmdDrawIndexed;
+    }
+    if (strcmp(pName, "vkCmdDispatch") == 0) {
+        real_cmd_dispatch = (PFN_vkCmdDispatch)fn;
+        return (PFN_vkVoidFunction)trace_CmdDispatch;
+    }
+    if (strcmp(pName, "vkCmdFillBuffer") == 0) {
+        real_cmd_fill_buffer = (PFN_vkCmdFillBuffer)fn;
+        return (PFN_vkVoidFunction)trace_CmdFillBuffer;
+    }
+    if (strcmp(pName, "vkCmdUpdateBuffer") == 0) {
+        real_cmd_update_buffer = (PFN_vkCmdUpdateBuffer)fn;
+        return (PFN_vkVoidFunction)trace_CmdUpdateBuffer;
+    }
+    if (strcmp(pName, "vkCmdBindDescriptorSets") == 0) {
+        real_cmd_bind_desc_sets = (PFN_vkCmdBindDescSets)fn;
+        return (PFN_vkVoidFunction)trace_CmdBindDescriptorSets;
+    }
+    if (strcmp(pName, "vkCmdSetViewport") == 0) {
+        real_cmd_set_viewport = (PFN_vkCmdSetViewport)fn;
+        return (PFN_vkVoidFunction)trace_CmdSetViewport;
+    }
+    if (strcmp(pName, "vkCmdSetScissor") == 0) {
+        real_cmd_set_scissor = (PFN_vkCmdSetScissor)fn;
+        return (PFN_vkVoidFunction)trace_CmdSetScissor;
+    }
+    if (strcmp(pName, "vkCmdBindVertexBuffers") == 0) {
+        real_cmd_bind_vtx_bufs = (PFN_vkCmdBindVtxBufs)fn;
+        return (PFN_vkVoidFunction)trace_CmdBindVertexBuffers;
+    }
+    if (strcmp(pName, "vkCmdBindIndexBuffer") == 0) {
+        real_cmd_bind_idx_buf = (PFN_vkCmdBindIdxBuf)fn;
+        return (PFN_vkVoidFunction)trace_CmdBindIndexBuffer;
+    }
+    if (strcmp(pName, "vkCmdPushConstants") == 0) {
+        real_cmd_push_consts = (PFN_vkCmdPushConsts)fn;
+        return (PFN_vkVoidFunction)trace_CmdPushConstants;
+    }
 
     /* All other device/queue/cmdbuf functions: simple unwrap trampoline.
      * The trampoline reads the real handle from wrapper offset 8 and
      * tail-calls the thunk function with all other args preserved. */
     return make_unwrap_trampoline(fn);
+}
+
+/* ==== Extension enumeration logging ====
+ *
+ * Log what extensions Vortek actually reports, so we can compare with
+ * what the native Mali driver advertises and identify gaps.
+ */
+
+typedef VkResult (*PFN_vkEnumDevExtProps)(void*, const char*, uint32_t*, void*);
+static PFN_vkEnumDevExtProps real_enum_dev_ext_props = NULL;
+static int ext_logged = 0;
+
+/* VkExtensionProperties: extensionName[256] + specVersion(uint32_t) = 260 bytes */
+#define VK_EXT_PROPS_SIZE 260
+
+/* Extensions to HIDE from DXVK — forces fallback to proven Vulkan 1.0/1.1 codepaths.
+ *
+ * VK_KHR_synchronization2: CmdPipelineBarrier2 + QueueSubmit2 — suspected thunk marshaling bugs
+ * VK_KHR_dynamic_rendering: CmdBeginRendering — suspected thunk marshaling bugs
+ *
+ * Hiding these forces DXVK to use CmdPipelineBarrier(v1), QueueSubmit(v1),
+ * and legacy VkRenderPass — all of which work through the thunk (vkcube, test_wine_vulkan).
+ */
+static const char* g_hidden_extensions[] = {
+    "VK_KHR_synchronization2",
+    "VK_KHR_dynamic_rendering",
+    NULL
+};
+
+static int is_hidden_extension(const char* name) {
+    for (int i = 0; g_hidden_extensions[i]; i++) {
+        if (strcmp(name, g_hidden_extensions[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static VkResult wrapped_EnumerateDeviceExtensionProperties(
+        void* physDev, const char* pLayerName,
+        uint32_t* pCount, void* pProps) {
+    VkResult res = real_enum_dev_ext_props(physDev, pLayerName, pCount, pProps);
+    if (res == 0 && pProps && pCount && *pCount > 0) {
+        /* Log extensions on first enumeration */
+        if (!ext_logged) {
+            ext_logged = 1;
+            LOG("=== Vortek Device Extensions (%u) ===\n", *pCount);
+            for (uint32_t i = 0; i < *pCount; i++) {
+                const char* name = (const char*)pProps + i * VK_EXT_PROPS_SIZE;
+                uint32_t ver = *(uint32_t*)((const char*)pProps + i * VK_EXT_PROPS_SIZE + 256);
+                LOG("  ext[%u] %s (v%u)\n", i, name, ver);
+            }
+            LOG("=== End Extensions ===\n");
+        }
+
+        /* Filter out hidden extensions by compacting the array */
+        uint32_t orig = *pCount;
+        uint32_t dst = 0;
+        for (uint32_t src = 0; src < orig; src++) {
+            const char* name = (const char*)pProps + src * VK_EXT_PROPS_SIZE;
+            if (is_hidden_extension(name)) {
+                LOG("EXT FILTER: hiding %s\n", name);
+                continue;
+            }
+            if (dst != src)
+                memcpy((char*)pProps + dst * VK_EXT_PROPS_SIZE,
+                       (char*)pProps + src * VK_EXT_PROPS_SIZE,
+                       VK_EXT_PROPS_SIZE);
+            dst++;
+        }
+        *pCount = dst;
+        if (dst != orig)
+            LOG("EXT FILTER: %u -> %u extensions (hid %u)\n", orig, dst, orig - dst);
+    } else if (res == 0 && !pProps && pCount) {
+        /* Count-only query: reduce count by number of hidden extensions.
+         * We don't know which ones are present without enumerating, so
+         * just let the count be slightly higher — DXVK will re-enumerate. */
+    }
+    return res;
 }
 
 /* ==== ICD entry points ==== */
@@ -1327,6 +2436,11 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
         LOG("GIPA: %s -> heap-split wrapper (thunk=%p, stored=%p)\n",
             pName, (void*)fn2, (void*)real_get_mem_props2);
         return real_get_mem_props2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties2 : NULL;
+    }
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) {
+        real_enum_dev_ext_props = (PFN_vkEnumDevExtProps)real_gipa(instance, pName);
+        LOG("GIPA: vkEnumerateDeviceExtensionProperties -> logging wrapper\n");
+        return real_enum_dev_ext_props ? (PFN_vkVoidFunction)wrapped_EnumerateDeviceExtensionProperties : NULL;
     }
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
         strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {

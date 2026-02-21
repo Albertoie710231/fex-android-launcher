@@ -517,8 +517,8 @@ dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
 
 # Memory limits: Vortek/FEX thunks have ~174MB host-visible mapping limit.
-# Reduce chunk sizes so DXVK creates smaller allocations (16MB instead of 64MB).
-dxvk.maxChunkSize = 16
+# Reduce chunk sizes so DXVK creates smaller allocations (8MB instead of 64MB).
+dxvk.maxChunkSize = 8
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
@@ -573,6 +573,7 @@ DXVKEOF
             rm -f /tmp/icd_trace.log
 
             cd "$exeDir"
+            export DXVK_CONFIG_FILE="$exeDir/dxvk.conf"
 
             # Create steam_appid.txt BEFORE wine launch (prevents Steam client check)
             echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
@@ -801,7 +802,7 @@ dxvk.logLevel = trace
 dxvk.numCompilerThreads = 1
 dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
-dxvk.maxChunkSize = 16
+dxvk.maxChunkSize = 8
 DXVKEOF
 
             # Game-specific stub DLLs
@@ -832,6 +833,7 @@ DXVKEOF
             echo "Cleaned old dump files"
 
             cd "$exeDir"
+            export DXVK_CONFIG_FILE="$exeDir/dxvk.conf"
             echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
 
             # Launch Wine — redirect debug spew to file, show only important lines on terminal
