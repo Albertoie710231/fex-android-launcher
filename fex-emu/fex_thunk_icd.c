@@ -1289,6 +1289,8 @@ static VkResult trace_CreateSemaphore(void* device, const void* pCreateInfo,
 
 typedef VkResult (*PFN_vkMapMemory)(void*, uint64_t, uint64_t, uint64_t, uint32_t, void**);
 static PFN_vkMapMemory real_map_memory = NULL;
+typedef void (*PFN_vkUnmapMemory)(void*, uint64_t);
+static PFN_vkUnmapMemory real_unmap_memory;
 static uint64_t g_total_mapped_bytes = 0;
 static int g_map_count = 0;
 
@@ -1319,10 +1321,22 @@ static void ensure_scratch(void) {
     }
 }
 
-/* Track which mem handles are fake-mapped (for UnmapMemory) */
+/* Track fake-mapped handles (shared scratch, no real GPU mapping) */
 #define MAX_FAKE_MAPS 64
 static uint64_t g_fake_map_handles[MAX_FAKE_MAPS];
 static int g_fake_map_count = 0;
+
+/* Track real-mapped handles so we can decrement g_total_mapped_bytes on unmap.
+ * Without this, the counter is monotonically increasing and eventually ALL maps
+ * become FAKE (including the headless layer's small staging buffer → black frames). */
+typedef struct {
+    uint64_t handle;
+    uint64_t mapped_size;
+} RealMapEntry;
+
+#define MAX_REAL_MAPS 512
+static RealMapEntry g_real_maps[MAX_REAL_MAPS];
+static int g_real_map_count = 0;
 
 static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
                                 uint64_t size, uint32_t flags, void** ppData) {
@@ -1354,8 +1368,14 @@ static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
     }
     if (res == 0) {
         g_map_count++;
-        if (size != (uint64_t)-1)
-            g_total_mapped_bytes += size;
+        uint64_t tracked = (size != (uint64_t)-1) ? size : (16ULL * 1024 * 1024);
+        g_total_mapped_bytes += tracked;
+        /* Track handle→size for decrement on unmap */
+        if (g_real_map_count < MAX_REAL_MAPS) {
+            g_real_maps[g_real_map_count].handle = memory;
+            g_real_maps[g_real_map_count].mapped_size = tracked;
+            g_real_map_count++;
+        }
     }
     LOG("[D%d] vkMapMemory #%d: mem=0x%llx sz=%llu result=%d total_mapped=%llu MB\n",
         g_device_count, g_map_count, (unsigned long long)memory,
@@ -1368,13 +1388,12 @@ static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
     return res;
 }
 
-/* UnmapMemory: if the handle was fake-mapped, just remove from tracking.
- * Scratch buffer is never freed (shared, process-lifetime). */
-
-typedef void (*PFN_vkUnmapMemory)(void*, uint64_t);
-static PFN_vkUnmapMemory real_unmap_memory = NULL;
+/* UnmapMemory: if fake-mapped, just remove from tracking (scratch is shared).
+ * If real-mapped, call real unmap AND decrement g_total_mapped_bytes so the
+ * counter stays accurate (fixes: all maps becoming FAKE after enough cycles). */
 
 static void trace_UnmapMemory(void* device, uint64_t memory) {
+    /* Check fake maps first */
     for (int i = 0; i < g_fake_map_count; i++) {
         if (g_fake_map_handles[i] == memory) {
             LOG("[D%d] vkUnmapMemory FAKE: mem=0x%llx\n",
@@ -1385,6 +1404,22 @@ static void trace_UnmapMemory(void* device, uint64_t memory) {
             return;
         }
     }
+
+    /* Real map: decrement tracked bytes */
+    for (int i = 0; i < g_real_map_count; i++) {
+        if (g_real_maps[i].handle == memory) {
+            g_total_mapped_bytes -= g_real_maps[i].mapped_size;
+            LOG("[D%d] vkUnmapMemory REAL: mem=0x%llx freed=%llu MB total_mapped=%llu MB\n",
+                g_device_count, (unsigned long long)memory,
+                (unsigned long long)(g_real_maps[i].mapped_size / (1024*1024)),
+                (unsigned long long)(g_total_mapped_bytes / (1024*1024)));
+            for (int j = i; j < g_real_map_count - 1; j++)
+                g_real_maps[j] = g_real_maps[j + 1];
+            g_real_map_count--;
+            break;
+        }
+    }
+
     void* real = unwrap(device);
     real_unmap_memory(real, memory);
 }
