@@ -402,18 +402,14 @@ static void wrapped_GetPhysicalDeviceFeatures2(void* physDev, void* pFeatures) {
                 uint32_t* robustImg = (uint32_t*)((uint8_t*)node + 20);
                 uint32_t* nullDesc  = (uint32_t*)((uint8_t*)node + 24);
                 LOG("  Robustness2: buf=%u img=%u null=%u", *robustBuf, *robustImg, *nullDesc);
-                if (!*robustBuf) {
-                    *robustBuf = 1;
-                    LOG(" -> SPOOFED buf=1");
-                }
-                if (!*robustImg) {
-                    *robustImg = 1;
-                    LOG(" -> SPOOFED img=1");
-                }
-                if (!*nullDesc) {
-                    *nullDesc = 1;
-                    LOG(" -> SPOOFED null=1");
-                }
+                /* Spoof all three robustness2 features.  DXVK hard-requires
+                 * robustBufferAccess2 AND nullDescriptor for adapter selection.
+                 * We do NOT strip these from CreateDevice pNext — Vortek/Mali
+                 * may honour the feature struct even without the extension name,
+                 * and Mali generally handles OOB/null gracefully. */
+                if (!*robustBuf) { *robustBuf = 1; LOG(" -> SPOOFED buf=1"); }
+                if (!*robustImg) { *robustImg = 1; LOG(" -> SPOOFED img=1"); }
+                if (!*nullDesc)  { *nullDesc = 1;  LOG(" -> SPOOFED null=1"); }
                 LOG("\n");
             }
             /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR = 1000470000
@@ -686,10 +682,9 @@ static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
             if (pn->sType == 1000286000) { /* VkPhysicalDeviceRobustness2FeaturesEXT */
                 uint32_t* f = (uint32_t*)((uint8_t*)pn + 16);
                 save_robust[0] = f[0]; save_robust[1] = f[1]; save_robust[2] = f[2];
-                if (f[0] || f[1] || f[2]) {
-                    LOG("CD: stripped robustness2 (%u,%u,%u)\n", f[0], f[1], f[2]);
-                    f[0] = f[1] = f[2] = 0;
-                }
+                /* Do NOT strip robustness2 — let Vortek/Mali see the request.
+                 * Mali generally handles null descriptors and OOB gracefully. */
+                LOG("CD: passing robustness2 through (%u,%u,%u)\n", f[0], f[1], f[2]);
             }
             if (pn->sType == 1000470000) { /* VkPhysicalDeviceMaintenance5FeaturesKHR */
                 uint32_t* f = (uint32_t*)((uint8_t*)pn + 16);
@@ -1955,10 +1950,114 @@ static void trace_CmdPushConstants(void* cmdBuf, uint64_t layout, uint32_t stage
 typedef VkResult (*PFN_vkCreateGraphicsPipelines)(void*, uint64_t, uint32_t, const void*, const void*, uint64_t*);
 static PFN_vkCreateGraphicsPipelines real_create_gfx_pipelines = NULL;
 
+typedef void (*PFN_vkDestroyShaderModule)(void*, uint64_t, const void*);
+static PFN_vkDestroyShaderModule real_destroy_shader_module = NULL;
+
+/* Convert inline VkShaderModuleCreateInfo (maintenance5) to real VkShaderModule.
+ * Vortek's IPC can't serialize pNext chains on shader stages, so we pre-create
+ * the modules and patch the stage to use them.
+ * Returns number of temp modules created; caller must destroy them after pipeline creation.
+ */
+#define MAX_TEMP_MODULES 32
+static uint32_t fixup_inline_shaders(void* real_device, const void* pCreateInfos,
+                                      uint32_t pipe_count, uint64_t* temp_modules) {
+    uint32_t n_temp = 0;
+    typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } PNBase;
+
+    for (uint32_t i = 0; i < pipe_count; i++) {
+        uint8_t* ci = (uint8_t*)pCreateInfos + i * 144;
+        uint32_t stageCount = *(uint32_t*)(ci + 20);
+        uint8_t* pStages = *(uint8_t**)(ci + 24);
+        if (!pStages) continue;
+
+        for (uint32_t s = 0; s < stageCount && s < 6; s++) {
+            uint8_t* stage = pStages + s * 48;
+            uint64_t* pModule = (uint64_t*)(stage + 24);
+
+            if (*pModule != 0) continue; /* already has a VkShaderModule */
+
+            /* Walk pNext for VkShaderModuleCreateInfo (sType=16)
+             * Layout: sType(4)+pad(4)+pNext(8)+flags(4)+pad(4)+codeSize(8)+pCode(8) = 40 bytes */
+            PNBase* pn = (PNBase*)(*(void**)(stage + 8));
+            while (pn) {
+                if (pn->sType == 16) { /* VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO */
+                    if (n_temp >= MAX_TEMP_MODULES) {
+                        LOG("  WARNING: too many inline shaders (%u)\n", n_temp);
+                        break;
+                    }
+                    /* Create real VkShaderModule from inline data */
+                    uint64_t new_module = 0;
+                    VkResult r = real_create_shader_module(real_device, (const void*)pn, NULL, &new_module);
+                    if (r == 0 && new_module) {
+                        *pModule = new_module;
+                        temp_modules[n_temp++] = new_module;
+                        uint64_t codeSize = *(uint64_t*)((uint8_t*)pn + 24);
+                        LOG("  inline->module: stage[%u] codeSize=%lu module=0x%lx\n",
+                            s, (unsigned long)codeSize, (unsigned long)new_module);
+                    } else {
+                        LOG("  WARNING: failed to create module from inline SPIR-V: %d\n", r);
+                    }
+                    break;
+                }
+                pn = (PNBase*)pn->pNext;
+            }
+        }
+
+        /* Strip VkPipelineCreateFlags2CreateInfoKHR (sType=1000470005) from pipe pNext.
+         * Vortek doesn't know this maintenance5 struct and may choke on it. */
+        {
+            void** ppNext = (void**)(ci + 8);
+            PNBase* prev = NULL;
+            PNBase* pn = (PNBase*)*ppNext;
+            while (pn) {
+                if (pn->sType == 1000470005) {
+                    LOG("  stripped PipelineCreateFlags2 from pNext\n");
+                    if (prev) prev->pNext = pn->pNext;
+                    else *ppNext = pn->pNext;
+                    break;
+                }
+                prev = pn;
+                pn = (PNBase*)pn->pNext;
+            }
+        }
+    }
+    return n_temp;
+}
+
 static VkResult trace_CreateGraphicsPipelines(void* device, uint64_t cache, uint32_t count,
                                                const void* pCreateInfos, const void* pAllocator,
                                                uint64_t* pPipelines) {
     void* real = unwrap(device);
+
+    /* Log + patch each pipeline create info */
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t* ci = (const uint8_t*)pCreateInfos + i * 144;
+        uint32_t stageCount = *(uint32_t*)(ci + 20);
+        void* pColorBlendState = *(void**)(ci + 88);
+        uint64_t renderPass = *(uint64_t*)(ci + 112);
+
+        LOG("[D%d] GfxPipe[%u]: stages=%u renderPass=0x%lx\n",
+            g_device_count, i, stageCount, (unsigned long)renderPass);
+
+        /* Patch: Mali-G720 doesn't support logicOp — force disable */
+        if (pColorBlendState) {
+            uint32_t* logicOpEnable = (uint32_t*)((uint8_t*)pColorBlendState + 20);
+            if (*logicOpEnable) {
+                LOG("  -> PATCHING logicOpEnable=0 (Mali unsupported)\n");
+                *logicOpEnable = 0;
+                *(uint32_t*)((uint8_t*)pColorBlendState + 24) = 0;
+            }
+        }
+    }
+
+    /* Convert inline shaders to real VkShaderModule objects for Vortek compatibility */
+    uint64_t temp_modules[MAX_TEMP_MODULES];
+    uint32_t n_temp = 0;
+    if (real_create_shader_module) {
+        n_temp = fixup_inline_shaders(real, pCreateInfos, count, temp_modules);
+        if (n_temp > 0) LOG("  created %u temp shader modules\n", n_temp);
+    }
+
     VkResult res = real_create_gfx_pipelines(real, cache, count, pCreateInfos, pAllocator, pPipelines);
     LOG("[D%d] vkCreateGraphicsPipelines: dev=%p count=%u result=%d\n",
         g_device_count, real, count, res);
@@ -1966,6 +2065,15 @@ static VkResult trace_CreateGraphicsPipelines(void* device, uint64_t cache, uint
         LOG("[D%d] *** CreateGraphicsPipelines FAILED: count=%u result=%d ***\n",
             g_device_count, count, res);
     }
+
+    /* Destroy temporary shader modules */
+    if (n_temp > 0 && real_destroy_shader_module) {
+        for (uint32_t i = 0; i < n_temp; i++) {
+            real_destroy_shader_module(real, temp_modules[i], NULL);
+        }
+        LOG("  destroyed %u temp shader modules\n", n_temp);
+    }
+
     return res;
 }
 
@@ -1977,6 +2085,57 @@ static VkResult trace_CreateComputePipelines(void* device, uint64_t cache, uint3
                                               const void* pCreateInfos, const void* pAllocator,
                                               uint64_t* pPipelines) {
     void* real = unwrap(device);
+    typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } PNBase;
+
+    /* VkComputePipelineCreateInfo (LP64):
+     *   0: sType(4)+pad(4)  8: pNext(8)  16: flags(4)+pad(4)
+     *  24: stage(48 = VkPipelineShaderStageCreateInfo)  72: layout(8)  80: basePipeHandle(8)  88: basePipeIndex(4)
+     * Total ~ 96 bytes
+     */
+    uint64_t temp_modules[MAX_TEMP_MODULES];
+    uint32_t n_temp = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t* ci = (uint8_t*)pCreateInfos + i * 96;
+        /* stage is embedded at offset 24, module at stage+24 = ci+48 */
+        uint64_t* pModule = (uint64_t*)(ci + 24 + 24);
+
+        if (*pModule == 0 && real_create_shader_module && n_temp < MAX_TEMP_MODULES) {
+            /* Walk stage pNext for inline VkShaderModuleCreateInfo */
+            PNBase* pn = (PNBase*)(*(void**)(ci + 24 + 8));
+            while (pn) {
+                if (pn->sType == 16) {
+                    uint64_t new_module = 0;
+                    VkResult r = real_create_shader_module(real, (const void*)pn, NULL, &new_module);
+                    if (r == 0 && new_module) {
+                        *pModule = new_module;
+                        temp_modules[n_temp++] = new_module;
+                        LOG("[D%d] CompPipe[%u]: inline->module 0x%lx\n",
+                            g_device_count, i, (unsigned long)new_module);
+                    }
+                    break;
+                }
+                pn = (PNBase*)pn->pNext;
+            }
+        }
+
+        /* Strip VkPipelineCreateFlags2CreateInfoKHR from pipe pNext */
+        {
+            void** ppNext = (void**)(ci + 8);
+            PNBase* prev = NULL;
+            PNBase* pn = (PNBase*)*ppNext;
+            while (pn) {
+                if (pn->sType == 1000470005) {
+                    if (prev) prev->pNext = pn->pNext;
+                    else *ppNext = pn->pNext;
+                    break;
+                }
+                prev = pn;
+                pn = (PNBase*)pn->pNext;
+            }
+        }
+    }
+
     VkResult res = real_create_comp_pipelines(real, cache, count, pCreateInfos, pAllocator, pPipelines);
     LOG("[D%d] vkCreateComputePipelines: dev=%p count=%u result=%d\n",
         g_device_count, real, count, res);
@@ -1984,7 +2143,492 @@ static VkResult trace_CreateComputePipelines(void* device, uint64_t cache, uint3
         LOG("[D%d] *** CreateComputePipelines FAILED: count=%u result=%d ***\n",
             g_device_count, count, res);
     }
+
+    /* Destroy temporary modules */
+    if (n_temp > 0 && real_destroy_shader_module) {
+        for (uint32_t i = 0; i < n_temp; i++)
+            real_destroy_shader_module(real, temp_modules[i], NULL);
+    }
+
     return res;
+}
+
+/* ==== Forward declarations for memory requirements (defined later) ==== */
+typedef void (*PFN_vkGetBufMemReqs)(void*, uint64_t, void*);
+static PFN_vkGetBufMemReqs real_get_buf_mem_reqs;
+
+typedef void (*PFN_vkGetImgMemReqs)(void*, uint64_t, void*);
+static PFN_vkGetImgMemReqs real_get_img_mem_reqs;
+
+/* ==== Null Descriptor Guard ====
+ *
+ * When nullDescriptor=1 is spoofed, DXVK writes VK_NULL_HANDLE into descriptor
+ * sets for unused bindings. Vortek's vt_handle_vkUpdateDescriptorSets crashes
+ * when VkObject_fromId(0) returns NULL. We intercept UpdateDescriptorSets and
+ * replace NULL handles with real dummy resources.
+ */
+
+/* Dummy resource handles — created lazily on first null encounter */
+static uint64_t g_dummy_sampler = 0;
+static uint64_t g_dummy_image_view = 0;
+static uint64_t g_dummy_buffer = 0;
+static uint64_t g_dummy_buffer_view = 0;
+static uint64_t g_dummy_image = 0;
+static uint64_t g_dummy_memory = 0;
+static int g_dummies_init = 0;
+
+typedef VkResult (*PFN_vkCreateBufferView)(void*, const void*, const void*, uint64_t*);
+static PFN_vkCreateBufferView real_create_buffer_view = NULL;
+
+/* Uses existing fn ptrs: real_create_buffer, real_create_image, real_create_sampler,
+ * real_create_image_view, real_alloc_memory, real_bind_img_mem, real_bind_buf_mem,
+ * real_get_img_mem_reqs, real_get_buf_mem_reqs */
+
+/* Resolve a device-level function pointer if still NULL */
+static PFN_vkVoidFunction resolve_dev_fn(void* real_device, const char* name) {
+    PFN_vkVoidFunction fn = NULL;
+    if (real_gipa && saved_instance)
+        fn = real_gipa(saved_instance, name);
+    if (!fn && thunk_lib)
+        fn = (PFN_vkVoidFunction)dlsym(thunk_lib, name);
+    if (!fn && real_gdpa && real_device)
+        fn = real_gdpa(real_device, name);
+    return fn;
+}
+
+static void create_dummy_resources(void* real_device) {
+    if (g_dummies_init) return;
+    g_dummies_init = 1;
+
+    LOG("Creating dummy resources for null descriptors\n");
+
+    /* Resolve any fn ptrs that GDPA hasn't captured yet */
+    if (!real_get_buf_mem_reqs)
+        real_get_buf_mem_reqs = (PFN_vkGetBufMemReqs)resolve_dev_fn(real_device, "vkGetBufferMemoryRequirements");
+    if (!real_get_img_mem_reqs)
+        real_get_img_mem_reqs = (PFN_vkGetImgMemReqs)resolve_dev_fn(real_device, "vkGetImageMemoryRequirements");
+    if (!real_create_image_view)
+        real_create_image_view = (PFN_vkCreateImageView)resolve_dev_fn(real_device, "vkCreateImageView");
+    if (!real_create_buffer_view)
+        real_create_buffer_view = (PFN_vkCreateBufferView)resolve_dev_fn(real_device, "vkCreateBufferView");
+    if (!real_bind_img_mem)
+        real_bind_img_mem = (PFN_vkBindImageMemory)resolve_dev_fn(real_device, "vkBindImageMemory");
+    if (!real_bind_buf_mem)
+        real_bind_buf_mem = (PFN_vkBindBufferMemory)resolve_dev_fn(real_device, "vkBindBufferMemory");
+    if (!real_alloc_memory)
+        real_alloc_memory = (PFN_vkAllocateMemory)resolve_dev_fn(real_device, "vkAllocateMemory");
+    if (!real_create_sampler)
+        real_create_sampler = (PFN_vkCreateSampler)resolve_dev_fn(real_device, "vkCreateSampler");
+    if (!real_create_buffer)
+        real_create_buffer = (PFN_vkCreateBuffer)resolve_dev_fn(real_device, "vkCreateBuffer");
+    if (!real_create_image)
+        real_create_image = (PFN_vkCreateImage)resolve_dev_fn(real_device, "vkCreateImage");
+    LOG("  resolved: sampler=%p buf=%p img=%p imgView=%p bufView=%p alloc=%p bindBuf=%p bindImg=%p getBufReqs=%p getImgReqs=%p\n",
+        (void*)real_create_sampler, (void*)real_create_buffer, (void*)real_create_image,
+        (void*)real_create_image_view, (void*)real_create_buffer_view,
+        (void*)real_alloc_memory, (void*)real_bind_buf_mem, (void*)real_bind_img_mem,
+        (void*)real_get_buf_mem_reqs, (void*)real_get_img_mem_reqs);
+
+    /* Dummy sampler (minimal) */
+    if (real_create_sampler) {
+        /* VkSamplerCreateInfo: sType=31, minimal config */
+        uint8_t sci[80];
+        memset(sci, 0, sizeof(sci));
+        *(uint32_t*)sci = 31; /* VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO */
+        /* All filter/address modes default to 0 = NEAREST/REPEAT */
+        *(float*)(sci + 40) = 1.0f; /* maxAnisotropy */
+        *(float*)(sci + 52) = 1000.0f; /* maxLod */
+        VkResult r = real_create_sampler(real_device, sci, NULL, &g_dummy_sampler);
+        LOG("  dummy sampler: %s (0x%lx)\n", r == 0 ? "OK" : "FAIL", (unsigned long)g_dummy_sampler);
+    }
+
+    /* Dummy buffer (16 bytes) */
+    if (real_create_buffer) {
+        /* VkBufferCreateInfo: sType=12 */
+        uint8_t bci[56];
+        memset(bci, 0, sizeof(bci));
+        *(uint32_t*)bci = 12; /* VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO */
+        *(uint64_t*)(bci + 24) = 256; /* size */
+        *(uint32_t*)(bci + 32) = 0x1FF; /* usage: all transfer+vertex+index+uniform+storage+indirect */
+        VkResult r = real_create_buffer(real_device, bci, NULL, &g_dummy_buffer);
+        LOG("  dummy buffer: %s (0x%lx)\n", r == 0 ? "OK" : "FAIL", (unsigned long)g_dummy_buffer);
+
+        /* Allocate and bind memory for the dummy buffer */
+        if (r == 0 && real_get_buf_mem_reqs && real_alloc_memory && real_bind_buf_mem) {
+            uint8_t memReqs[24]; /* VkMemoryRequirements: size(8)+align(8)+memTypeBits(4) */
+            real_get_buf_mem_reqs(real_device, g_dummy_buffer, memReqs);
+            uint64_t memSize = *(uint64_t*)memReqs;
+            uint32_t memBits = *(uint32_t*)(memReqs + 16);
+
+            /* Find first valid memory type */
+            uint32_t memType = 0;
+            for (uint32_t i = 0; i < 32; i++) {
+                if (memBits & (1u << i)) { memType = i; break; }
+            }
+
+            /* VkMemoryAllocateInfo LP64:
+             * sType(4)+pad(4)+pNext(8)+allocationSize(8)+memoryTypeIndex(4) = 28, pad to 32 */
+            uint8_t mai2[32];
+            memset(mai2, 0, sizeof(mai2));
+            *(uint32_t*)(mai2 + 0) = 5; /* sType */
+            *(uint64_t*)(mai2 + 16) = memSize; /* allocationSize */
+            *(uint32_t*)(mai2 + 24) = memType; /* memoryTypeIndex */
+
+            r = real_alloc_memory(real_device, mai2, NULL, &g_dummy_memory);
+            if (r == 0) {
+                real_bind_buf_mem(real_device, g_dummy_buffer, g_dummy_memory, 0);
+                LOG("  dummy buffer memory bound OK (size=%lu type=%u)\n", (unsigned long)memSize, memType);
+            }
+        }
+    }
+
+    /* Dummy image (1x1 R8G8B8A8) */
+    if (real_create_image) {
+        /* VkImageCreateInfo: 88 bytes on LP64 */
+        uint8_t ici[96];
+        memset(ici, 0, sizeof(ici));
+        *(uint32_t*)ici = 14; /* VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14 */
+        *(uint32_t*)(ici + 16) = 0; /* flags */
+        *(uint32_t*)(ici + 20) = 1; /* imageType = VK_IMAGE_TYPE_2D */
+        *(uint32_t*)(ici + 24) = 37; /* format = VK_FORMAT_R8G8B8A8_UNORM */
+        *(uint32_t*)(ici + 28) = 1; /* width */
+        *(uint32_t*)(ici + 32) = 1; /* height */
+        *(uint32_t*)(ici + 36) = 1; /* depth */
+        *(uint32_t*)(ici + 40) = 1; /* mipLevels */
+        *(uint32_t*)(ici + 44) = 1; /* arrayLayers */
+        *(uint32_t*)(ici + 48) = 1; /* samples = VK_SAMPLE_COUNT_1_BIT */
+        *(uint32_t*)(ici + 52) = 0; /* tiling = VK_IMAGE_TILING_OPTIMAL */
+        *(uint32_t*)(ici + 56) = 0x6; /* usage = TRANSFER_DST | SAMPLED */
+        VkResult r = real_create_image(real_device, ici, NULL, &g_dummy_image);
+        LOG("  dummy image: %s (0x%lx)\n", r == 0 ? "OK" : "FAIL", (unsigned long)g_dummy_image);
+
+        /* Bind memory for dummy image */
+        if (r == 0 && real_get_img_mem_reqs && real_alloc_memory && real_bind_img_mem) {
+            uint8_t memReqs[24];
+            real_get_img_mem_reqs(real_device, g_dummy_image, memReqs);
+            uint64_t memSize = *(uint64_t*)memReqs;
+            uint32_t memBits = *(uint32_t*)(memReqs + 16);
+            uint32_t memType = 0;
+            for (uint32_t i = 0; i < 32; i++) {
+                if (memBits & (1u << i)) { memType = i; break; }
+            }
+            uint64_t imgMem = 0;
+            uint8_t mai2[32];
+            memset(mai2, 0, sizeof(mai2));
+            *(uint32_t*)mai2 = 5;
+            *(uint64_t*)(mai2 + 16) = memSize;
+            *(uint32_t*)(mai2 + 24) = memType;
+            r = real_alloc_memory(real_device, mai2, NULL, &imgMem);
+            if (r == 0) {
+                real_bind_img_mem(real_device, g_dummy_image, imgMem, 0);
+                LOG("  dummy image memory bound OK (size=%lu type=%u)\n", (unsigned long)memSize, memType);
+            } else {
+                LOG("  dummy image memory alloc FAILED: %d\n", r);
+            }
+        }
+
+        /* Dummy image view
+         * VkImageViewCreateInfo LP64 layout:
+         *   0: sType(4) 4:pad 8:pNext(8) 16:flags(4) 20:pad
+         *  24: image(8) 32:viewType(4) 36:format(4)
+         *  40: components(4x4=16)  56: subresourceRange(4+4x4=20)
+         *  total = 76, padded to 80 */
+        if (g_dummy_image && real_create_image_view) {
+            uint8_t ivci[80];
+            memset(ivci, 0, sizeof(ivci));
+            *(uint32_t*)(ivci + 0)  = 15; /* VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO */
+            *(uint64_t*)(ivci + 24) = g_dummy_image; /* image */
+            *(uint32_t*)(ivci + 32) = 1;  /* viewType = VK_IMAGE_VIEW_TYPE_2D */
+            *(uint32_t*)(ivci + 36) = 37; /* format = VK_FORMAT_R8G8B8A8_UNORM */
+            /* componentMapping at 40: all 0 = IDENTITY */
+            /* subresourceRange at 56: */
+            *(uint32_t*)(ivci + 56) = 1;  /* aspectMask = VK_IMAGE_ASPECT_COLOR_BIT */
+            *(uint32_t*)(ivci + 60) = 0;  /* baseMipLevel */
+            *(uint32_t*)(ivci + 64) = 1;  /* levelCount */
+            *(uint32_t*)(ivci + 68) = 0;  /* baseArrayLayer */
+            *(uint32_t*)(ivci + 72) = 1;  /* layerCount */
+            LOG("  creating imageView: image=0x%lx\n", (unsigned long)g_dummy_image);
+            r = real_create_image_view(real_device, ivci, NULL, &g_dummy_image_view);
+            LOG("  dummy imageView: %s (0x%lx)\n", r == 0 ? "OK" : "FAIL", (unsigned long)g_dummy_image_view);
+        }
+    }
+
+    /* Dummy buffer view
+     * VkBufferViewCreateInfo LP64 layout:
+     *   0: sType(4) 4:pad 8:pNext(8) 16:flags(4) 20:pad
+     *  24: buffer(8) 32:format(4) 36:pad 40:offset(8) 48:range(8)
+     *  total = 56 */
+    if (g_dummy_buffer && real_create_buffer_view) {
+        uint8_t bvci[56];
+        memset(bvci, 0, sizeof(bvci));
+        *(uint32_t*)(bvci + 0)  = 13; /* VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO */
+        *(uint64_t*)(bvci + 24) = g_dummy_buffer; /* buffer */
+        *(uint32_t*)(bvci + 32) = 37; /* format = R8G8B8A8_UNORM */
+        *(uint64_t*)(bvci + 40) = 0;  /* offset */
+        *(uint64_t*)(bvci + 48) = 256; /* range */
+        LOG("  creating bufferView: buf=0x%lx\n", (unsigned long)g_dummy_buffer);
+        VkResult r = real_create_buffer_view(real_device, bvci, NULL, &g_dummy_buffer_view);
+        LOG("  dummy bufferView: %s (0x%lx)\n", r == 0 ? "OK" : "FAIL", (unsigned long)g_dummy_buffer_view);
+    }
+}
+
+/* vkUpdateDescriptorSets interceptor */
+typedef void (*PFN_vkUpdateDescriptorSets)(void*, uint32_t, const void*, uint32_t, const void*);
+static PFN_vkUpdateDescriptorSets real_update_desc_sets = NULL;
+
+/* VkWriteDescriptorSet layout (LP64):
+ *   0: sType(4)+pad(4)  8: pNext(8)  16: dstSet(8)  24: dstBinding(4)
+ *  28: dstArrayElement(4)  32: descriptorCount(4)  36: descriptorType(4)
+ *  40: pImageInfo(8)  48: pBufferInfo(8)  56: pTexelBufferView(8)
+ *  total = 64 bytes
+ *
+ * VkDescriptorImageInfo: sampler(8)+imageView(8)+imageLayout(4)+pad(4) = 24
+ * VkDescriptorBufferInfo: buffer(8)+offset(8)+range(8) = 24
+ */
+#define WRITE_DESC_SET_SIZE 64
+
+/* Check if a descriptor write entry has any NULL handles that we can't fix.
+ * Returns 1 if the write is safe to send to Vortek, 0 if it must be skipped. */
+static int fix_or_check_write(uint8_t* ws) {
+    uint32_t count = *(uint32_t*)(ws + 32);
+    uint32_t type = *(uint32_t*)(ws + 36);
+
+    /* Types that use pImageInfo: SAMPLER(0), COMBINED_IMAGE_SAMPLER(1),
+     * SAMPLED_IMAGE(2), STORAGE_IMAGE(3), INPUT_ATTACHMENT(10) */
+    if (type <= 3 || type == 10) {
+        uint8_t* pImageInfo = *(uint8_t**)(ws + 40);
+        if (!pImageInfo) return 1;
+        for (uint32_t d = 0; d < count; d++) {
+            uint64_t* sampler = (uint64_t*)(pImageInfo + d * 24 + 0);
+            uint64_t* imageView = (uint64_t*)(pImageInfo + d * 24 + 8);
+
+            /* Fix NULL sampler */
+            if ((type == 0 || type == 1) && *sampler == 0) {
+                if (g_dummy_sampler) *sampler = g_dummy_sampler;
+                else return 0; /* can't fix */
+            }
+            /* Fix NULL imageView */
+            if (type != 0 && *imageView == 0) {
+                if (g_dummy_image_view) {
+                    *imageView = g_dummy_image_view;
+                    uint32_t* layout = (uint32_t*)(pImageInfo + d * 24 + 16);
+                    if (*layout == 0) *layout = 1; /* VK_IMAGE_LAYOUT_GENERAL */
+                } else {
+                    return 0; /* can't fix — skip entire write */
+                }
+            }
+        }
+        return 1;
+    }
+    /* Types that use pBufferInfo: UNIFORM_BUFFER(6), STORAGE_BUFFER(7),
+     * UNIFORM_BUFFER_DYNAMIC(8), STORAGE_BUFFER_DYNAMIC(9) */
+    if (type >= 6 && type <= 9) {
+        uint8_t* pBufferInfo = *(uint8_t**)(ws + 48);
+        if (!pBufferInfo) return 1;
+        for (uint32_t d = 0; d < count; d++) {
+            uint64_t* buffer = (uint64_t*)(pBufferInfo + d * 24);
+            if (*buffer == 0) {
+                if (g_dummy_buffer) {
+                    *buffer = g_dummy_buffer;
+                    uint64_t* range = (uint64_t*)(pBufferInfo + d * 24 + 16);
+                    if (*range == 0) *range = 256;
+                } else {
+                    return 0;
+                }
+            }
+        }
+        return 1;
+    }
+    /* Types that use pTexelBufferView: UNIFORM_TEXEL_BUFFER(4), STORAGE_TEXEL_BUFFER(5) */
+    if (type == 4 || type == 5) {
+        uint64_t* pTexelViews = *(uint64_t**)(ws + 56);
+        if (!pTexelViews) return 1;
+        for (uint32_t d = 0; d < count; d++) {
+            if (pTexelViews[d] == 0) {
+                if (g_dummy_buffer_view)
+                    pTexelViews[d] = g_dummy_buffer_view;
+                else
+                    return 0;
+            }
+        }
+        return 1;
+    }
+    return 1; /* unknown type — pass through */
+}
+
+/* ==== Descriptor Update Template Tracking ====
+ *
+ * DXVK uses vkUpdateDescriptorSetWithTemplate for performance.
+ * We must track each template's entry layout so we can scan the raw pData
+ * blob for NULL handles and replace them with dummy resources.
+ *
+ * VkDescriptorUpdateTemplateEntry LP64 layout:
+ *   0: dstBinding(4)  4: dstArrayElement(4)  8: descriptorCount(4)
+ *  12: descriptorType(4)  16: offset(8)  24: stride(8)   total=32
+ *
+ * VkDescriptorUpdateTemplateCreateInfo LP64:
+ *   0:sType 8:pNext 16:flags(4) 20:entryCount(4) 24:pEntries(8)
+ *  32:templateType(4) ... */
+
+typedef struct {
+    uint32_t descriptorCount;
+    uint32_t descriptorType;
+    uint64_t offset;
+    uint64_t stride;
+} TemplateEntryCompact;
+
+typedef struct {
+    uint64_t templateHandle;
+    uint32_t entryCount;
+    TemplateEntryCompact* entries;
+} TrackedTemplate;
+
+#define MAX_TRACKED_TEMPLATES 256
+static TrackedTemplate g_templates[MAX_TRACKED_TEMPLATES];
+static int g_template_count = 0;
+
+typedef VkResult (*PFN_vkCreateDescUpdateTemplate)(void*, const void*, const void*, uint64_t*);
+static PFN_vkCreateDescUpdateTemplate real_create_desc_update_template = NULL;
+
+static VkResult null_guard_CreateDescriptorUpdateTemplate(void* device, const void* pCreateInfo,
+                                                           const void* pAllocator, uint64_t* pTemplate) {
+    void* real = unwrap(device);
+    VkResult res = real_create_desc_update_template(real, pCreateInfo, pAllocator, pTemplate);
+    if (res != 0 || !pTemplate || !*pTemplate || !pCreateInfo) return res;
+
+    /* Parse VkDescriptorUpdateTemplateCreateInfo to save entry layout */
+    const uint8_t* ci = (const uint8_t*)pCreateInfo;
+    uint32_t entryCount = *(const uint32_t*)(ci + 20);
+    const uint8_t* pEntries = *(const uint8_t* const*)(ci + 24);
+
+    if (entryCount > 0 && pEntries && g_template_count < MAX_TRACKED_TEMPLATES) {
+        TrackedTemplate* t = &g_templates[g_template_count];
+        t->templateHandle = *pTemplate;
+        t->entryCount = entryCount;
+        t->entries = (TemplateEntryCompact*)malloc(entryCount * sizeof(TemplateEntryCompact));
+        if (t->entries) {
+            for (uint32_t i = 0; i < entryCount; i++) {
+                const uint8_t* e = pEntries + i * 32;
+                t->entries[i].descriptorCount = *(const uint32_t*)(e + 8);
+                t->entries[i].descriptorType = *(const uint32_t*)(e + 12);
+                t->entries[i].offset = *(const uint64_t*)(e + 16);
+                t->entries[i].stride = *(const uint64_t*)(e + 24);
+            }
+            g_template_count++;
+            LOG("DescUpdateTemplate: handle=0x%lx entries=%u (tracked #%d)\n",
+                (unsigned long)*pTemplate, entryCount, g_template_count);
+        }
+    }
+    return res;
+}
+
+static TrackedTemplate* find_template(uint64_t handle) {
+    for (int i = 0; i < g_template_count; i++) {
+        if (g_templates[i].templateHandle == handle)
+            return &g_templates[i];
+    }
+    return NULL;
+}
+
+typedef void (*PFN_vkUpdateDescSetWithTemplate)(void*, uint64_t, uint64_t, const void*);
+static PFN_vkUpdateDescSetWithTemplate real_update_desc_set_with_template = NULL;
+
+static void null_guard_UpdateDescriptorSetWithTemplate(void* device, uint64_t descriptorSet,
+                                                        uint64_t descriptorUpdateTemplate,
+                                                        const void* pData) {
+    void* real = unwrap(device);
+    if (!g_dummies_init) create_dummy_resources(real);
+
+    TrackedTemplate* tmpl = find_template(descriptorUpdateTemplate);
+    if (tmpl && pData) {
+        uint8_t* data = (uint8_t*)pData; /* mutable cast — we fix NULLs in-place */
+        for (uint32_t e = 0; e < tmpl->entryCount; e++) {
+            uint32_t type = tmpl->entries[e].descriptorType;
+            uint64_t off = tmpl->entries[e].offset;
+            uint64_t stride = tmpl->entries[e].stride;
+            uint32_t count = tmpl->entries[e].descriptorCount;
+
+            for (uint32_t d = 0; d < count; d++) {
+                uint8_t* p = data + off + d * stride;
+
+                /* Image types: sampler(8)+imageView(8)+imageLayout(4) at p */
+                if (type <= 3 || type == 10) {
+                    uint64_t* sampler = (uint64_t*)(p + 0);
+                    uint64_t* imageView = (uint64_t*)(p + 8);
+                    if ((type == 0 || type == 1) && *sampler == 0 && g_dummy_sampler)
+                        *sampler = g_dummy_sampler;
+                    if (type != 0 && *imageView == 0 && g_dummy_image_view) {
+                        *imageView = g_dummy_image_view;
+                        uint32_t* layout = (uint32_t*)(p + 16);
+                        if (*layout == 0) *layout = 1;
+                    }
+                }
+                /* Buffer types: buffer(8)+offset(8)+range(8) at p */
+                else if (type >= 6 && type <= 9) {
+                    uint64_t* buffer = (uint64_t*)(p + 0);
+                    if (*buffer == 0 && g_dummy_buffer) {
+                        *buffer = g_dummy_buffer;
+                        uint64_t* range = (uint64_t*)(p + 16);
+                        if (*range == 0) *range = 256;
+                    }
+                }
+                /* Texel buffer: VkBufferView (uint64_t) at p */
+                else if (type == 4 || type == 5) {
+                    uint64_t* view = (uint64_t*)p;
+                    if (*view == 0 && g_dummy_buffer_view)
+                        *view = g_dummy_buffer_view;
+                }
+            }
+        }
+    }
+
+    real_update_desc_set_with_template(real, descriptorSet, descriptorUpdateTemplate, pData);
+}
+
+static int g_null_guard_logged = 0;
+
+static void null_guard_UpdateDescriptorSets(void* device, uint32_t writeCount,
+                                             const void* pWrites,
+                                             uint32_t copyCount, const void* pCopies) {
+    void* real = unwrap(device);
+
+    /* Lazily init dummy resources on first call */
+    if (!g_dummies_init) create_dummy_resources(real);
+
+    /* Build filtered writes array: fix NULL handles or skip unfixable writes */
+    uint8_t filtered[64 * WRITE_DESC_SET_SIZE]; /* stack buffer for up to 64 writes */
+    uint8_t* heap_buf = NULL;
+    uint8_t* out = filtered;
+
+    if (writeCount > 64) {
+        heap_buf = (uint8_t*)malloc(writeCount * WRITE_DESC_SET_SIZE);
+        out = heap_buf ? heap_buf : filtered;
+        if (!heap_buf) writeCount = 64; /* safety cap */
+    }
+
+    uint32_t kept = 0;
+    uint32_t skipped = 0;
+    for (uint32_t w = 0; w < writeCount; w++) {
+        uint8_t* ws = (uint8_t*)pWrites + w * WRITE_DESC_SET_SIZE;
+        /* Make a mutable copy so we can patch in-place */
+        memcpy(out + kept * WRITE_DESC_SET_SIZE, ws, WRITE_DESC_SET_SIZE);
+        if (fix_or_check_write(out + kept * WRITE_DESC_SET_SIZE)) {
+            kept++;
+        } else {
+            skipped++;
+        }
+    }
+
+    if (skipped > 0 && !g_null_guard_logged) {
+        LOG("null_guard: skipped %u/%u descriptor writes with unfixable NULL handles\n",
+            skipped, writeCount);
+        g_null_guard_logged = 1;
+    }
+
+    if (kept > 0)
+        real_update_desc_sets(real, kept, out, copyCount, pCopies);
+
+    if (heap_buf) free(heap_buf);
 }
 
 /* --- vkCreateRenderPass / vkCreateRenderPass2 --- */
@@ -2056,9 +2700,6 @@ static VkResult trace_CreateDescriptorPool(void* device, const void* pCreateInfo
  * VkMemoryRequirements2 wraps it at offset 16 (after sType+pNext).
  */
 
-typedef void (*PFN_vkGetBufMemReqs)(void*, uint64_t, void*);
-static PFN_vkGetBufMemReqs real_get_buf_mem_reqs = NULL;
-
 static void wrapped_GetBufferMemoryRequirements(void* device, uint64_t buffer, void* pReqs) {
     void* real = unwrap(device);
     real_get_buf_mem_reqs(real, buffer, pReqs);
@@ -2070,9 +2711,6 @@ static void wrapped_GetBufferMemoryRequirements(void* device, uint64_t buffer, v
         LOG("GetBufMemReqs: bits=0x%x -> 0x%x (added_idx=%d)\n", orig, *bits, g_added_type_index);
     }
 }
-
-typedef void (*PFN_vkGetImgMemReqs)(void*, uint64_t, void*);
-static PFN_vkGetImgMemReqs real_get_img_mem_reqs = NULL;
 
 static void wrapped_GetImageMemoryRequirements(void* device, uint64_t image, void* pReqs) {
     void* real = unwrap(device);
@@ -2374,6 +3012,10 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         real_create_shader_module = (PFN_vkCreateShaderModule)fn;
         return (PFN_vkVoidFunction)trace_CreateShaderModule;
     }
+    if (strcmp(pName, "vkDestroyShaderModule") == 0) {
+        real_destroy_shader_module = (PFN_vkDestroyShaderModule)fn;
+        return fn; /* pass through, no wrapper needed */
+    }
     if (strcmp(pName, "vkCreateGraphicsPipelines") == 0) {
         real_create_gfx_pipelines = (PFN_vkCreateGraphicsPipelines)fn;
         return (PFN_vkVoidFunction)trace_CreateGraphicsPipelines;
@@ -2398,6 +3040,28 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
     if (strcmp(pName, "vkCreateDescriptorPool") == 0) {
         real_create_desc_pool = (PFN_vkCreateDescPool)fn;
         return (PFN_vkVoidFunction)trace_CreateDescriptorPool;
+    }
+    if (strcmp(pName, "vkUpdateDescriptorSets") == 0) {
+        real_update_desc_sets = (PFN_vkUpdateDescriptorSets)fn;
+        LOG("GDPA: vkUpdateDescriptorSets -> null_guard wrapper (real=%p)\n", (void*)fn);
+        return (PFN_vkVoidFunction)null_guard_UpdateDescriptorSets;
+    }
+    if (strcmp(pName, "vkUpdateDescriptorSetWithTemplate") == 0 ||
+        strcmp(pName, "vkUpdateDescriptorSetWithTemplateKHR") == 0) {
+        real_update_desc_set_with_template = (PFN_vkUpdateDescSetWithTemplate)fn;
+        LOG("GDPA: %s -> null_guard template wrapper (real=%p)\n", pName, (void*)fn);
+        return (PFN_vkVoidFunction)null_guard_UpdateDescriptorSetWithTemplate;
+    }
+    if (strcmp(pName, "vkCreateDescriptorUpdateTemplate") == 0 ||
+        strcmp(pName, "vkCreateDescriptorUpdateTemplateKHR") == 0) {
+        real_create_desc_update_template = (PFN_vkCreateDescUpdateTemplate)fn;
+        LOG("GDPA: %s -> template tracker (real=%p)\n", pName, (void*)fn);
+        return (PFN_vkVoidFunction)null_guard_CreateDescriptorUpdateTemplate;
+    }
+    if (strcmp(pName, "vkCreateBufferView") == 0) {
+        real_create_buffer_view = (PFN_vkCreateBufferView)fn;
+        LOG("GDPA: vkCreateBufferView -> %p (captured for dummy resources)\n", (void*)fn);
+        return fn ? make_unwrap_trampoline(fn) : NULL;
     }
 
     /* Cmd* tracing: log command buffer recording operations
