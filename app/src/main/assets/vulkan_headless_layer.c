@@ -892,101 +892,11 @@ static VkResult headless_GetPhysicalDeviceProperties(
 }
 
 /* ============================================================================
- * Section 7c: Physical Device Feature & Format Spoofing
+ * Section 7c: Physical Device Feature & Format Passthrough (diagnostic only)
  *
- * Spoof features that DXVK requires but the thunk chain may not expose:
- * - textureCompressionBC: Mali doesn't support BC natively, but Vortek may
- *   transcode BC→ASTC/RGBA internally. DXVK requires this to accept device.
- * - depthClipEnable (VK_EXT_depth_clip_enable): Required for D3D11's
- *   DepthClipEnable rasterizer state. Mali supports this natively but
- *   FEX thunks may not expose the extension.
- * - customBorderColors (VK_EXT_custom_border_color): Required for D3D11
- *   sampler border colors.
+ * NO SPOOFING — report the GPU's real capabilities so DXVK can degrade
+ * gracefully instead of creating pipelines/shaders the GPU can't handle.
  * ============================================================================ */
-
-/* sType values for pNext chain feature structs */
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT 1000102000
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT 1000287002
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT 1000028000
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT 1000286000
-
-/* Generic pNext chain walker: find a struct by sType */
-static void* find_pnext(void* pFeatures, int target_stype) {
-    /* pFeatures points to VkPhysicalDeviceFeatures2 or similar with {sType, pNext, ...} */
-    typedef struct { int sType; void* pNext; } VkBaseOutStructure;
-    VkBaseOutStructure* s = (VkBaseOutStructure*)pFeatures;
-    s = (VkBaseOutStructure*)s->pNext; /* skip the root struct */
-    while (s) {
-        if (s->sType == target_stype)
-            return s;
-        s = (VkBaseOutStructure*)s->pNext;
-    }
-    return NULL;
-}
-
-/* Feature struct layouts for spoofing (only the fields we need) */
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 depthClipEnable;
-} VkPhysicalDeviceDepthClipEnableFeaturesEXT;
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 customBorderColors;
-    VkBool32 customBorderColorWithoutFormatFeature;
-} VkPhysicalDeviceCustomBorderColorFeaturesEXT;
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 transformFeedback;
-    VkBool32 geometryStreams;
-} VkPhysicalDeviceTransformFeedbackFeaturesEXT;
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 robustBufferAccess2;
-    VkBool32 robustImageAccess2;
-    VkBool32 nullDescriptor;
-} VkPhysicalDeviceRobustness2FeaturesEXT;
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 maintenance5;
-} VkPhysicalDeviceMaintenance5FeaturesKHR;
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 maintenance6;
-} VkPhysicalDeviceMaintenance6FeaturesKHR;
-
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR 1000470000
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR 1000545000
-
-typedef struct {
-    int sType;
-    void* pNext;
-    VkBool32 nonSeamlessCubeMap;
-} VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT;
-
-#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT 1000411000
-
-static int is_bc_format(int format) {
-    return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
-}
-
-/* Spoofed BC format features: sampling + linear filter + transfer */
-#define BC_FORMAT_FEATURES \
-    (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | \
-     VK_FORMAT_FEATURE_BLIT_SRC_BIT | \
-     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | \
-     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | \
-     VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
 
 static void headless_GetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice,
@@ -994,7 +904,6 @@ static void headless_GetPhysicalDeviceFeatures(
 {
     LOG(">>> GetPhysicalDeviceFeatures CALLED pd=%p pF=%p g_real=%p\n",
         physicalDevice, pFeatures, (void*)g_real_get_features);
-    layer_marker("CALL_GetFeatures");
 
     if (g_real_get_features)
         g_real_get_features(physicalDevice, pFeatures);
@@ -1002,16 +911,8 @@ static void headless_GetPhysicalDeviceFeatures(
         LOG("!!! GetPhysicalDeviceFeatures: g_real_get_features is NULL!\n");
 
     if (pFeatures) {
-        LOG("    BC before spoof: %d\n", pFeatures->textureCompressionBC);
-        if (!pFeatures->textureCompressionBC) {
-            pFeatures->textureCompressionBC = VK_TRUE;
-            LOG("Spoofed textureCompressionBC = VK_TRUE\n");
-            layer_marker("SPOOF_BC_FEATURES");
-        }
-        if (!pFeatures->vertexPipelineStoresAndAtomics) {
-            pFeatures->vertexPipelineStoresAndAtomics = VK_TRUE;
-            LOG("Spoofed vertexPipelineStoresAndAtomics = VK_TRUE\n");
-        }
+        LOG("    [REAL] textureCompressionBC=%d vertexPipelineStoresAndAtomics=%d\n",
+            pFeatures->textureCompressionBC, pFeatures->vertexPipelineStoresAndAtomics);
     }
 }
 
@@ -1021,109 +922,18 @@ static void headless_GetPhysicalDeviceFeatures2(
 {
     LOG(">>> GetPhysicalDeviceFeatures2 CALLED pd=%p pF=%p g_real=%p\n",
         physicalDevice, pFeatures, (void*)g_real_get_features2);
-    layer_marker("CALL_GetFeatures2");
 
     if (g_real_get_features2) {
-        LOG(">>> Calling g_real_get_features2=%p ...\n", (void*)g_real_get_features2);
         g_real_get_features2(physicalDevice, pFeatures);
-        LOG(">>> g_real_get_features2 RETURNED\n");
-        layer_marker("RETURNED_GetFeatures2");
     } else {
         LOG("!!! GetPhysicalDeviceFeatures2: g_real_get_features2 is NULL!\n");
-        layer_marker("GetFeatures2_NULL_REAL");
     }
 
+    /* NO SPOOFING — just log what the GPU really reports */
     if (pFeatures) {
-        LOG("    BC before spoof: %d\n", pFeatures->features.textureCompressionBC);
-        if (!pFeatures->features.textureCompressionBC) {
-            pFeatures->features.textureCompressionBC = VK_TRUE;
-            LOG("Spoofed textureCompressionBC = VK_TRUE (Features2)\n");
-            layer_marker("SPOOF_BC_FEATURES2");
-        }
-        if (!pFeatures->features.vertexPipelineStoresAndAtomics) {
-            pFeatures->features.vertexPipelineStoresAndAtomics = VK_TRUE;
-            LOG("Spoofed vertexPipelineStoresAndAtomics = VK_TRUE (Features2)\n");
-        }
-
-        /* Walk pNext chain to spoof extension features DXVK requires */
-        VkPhysicalDeviceDepthClipEnableFeaturesEXT* dce =
-            (VkPhysicalDeviceDepthClipEnableFeaturesEXT*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
-        if (dce && !dce->depthClipEnable) {
-            dce->depthClipEnable = VK_TRUE;
-            LOG("Spoofed depthClipEnable = VK_TRUE\n");
-        }
-
-        VkPhysicalDeviceCustomBorderColorFeaturesEXT* cbc =
-            (VkPhysicalDeviceCustomBorderColorFeaturesEXT*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
-        if (cbc) {
-            if (!cbc->customBorderColors) {
-                cbc->customBorderColors = VK_TRUE;
-                LOG("Spoofed customBorderColors = VK_TRUE\n");
-            }
-            if (!cbc->customBorderColorWithoutFormatFeature) {
-                cbc->customBorderColorWithoutFormatFeature = VK_TRUE;
-                LOG("Spoofed customBorderColorWithoutFormatFeature = VK_TRUE\n");
-            }
-        }
-
-        VkPhysicalDeviceTransformFeedbackFeaturesEXT* tfb =
-            (VkPhysicalDeviceTransformFeedbackFeaturesEXT*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT);
-        if (tfb) {
-            if (!tfb->transformFeedback) {
-                tfb->transformFeedback = VK_TRUE;
-                LOG("Spoofed transformFeedback = VK_TRUE\n");
-            }
-            if (!tfb->geometryStreams) {
-                tfb->geometryStreams = VK_TRUE;
-                LOG("Spoofed geometryStreams = VK_TRUE\n");
-            }
-        }
-
-        VkPhysicalDeviceRobustness2FeaturesEXT* rb2 =
-            (VkPhysicalDeviceRobustness2FeaturesEXT*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
-        if (rb2) {
-            /* DISABLED: Don't spoof robustness2/nullDescriptor.
-             * These cause DXVK to take code paths that may crash when the
-             * real driver doesn't support them. DXVK falls back gracefully
-             * when these are FALSE (creates dummy resources instead of
-             * using VK_NULL_HANDLE descriptors). */
-            LOG("robustness2: robustBuf=%d robustImg=%d nullDesc=%d (NOT spoofed)\n",
-                rb2->robustBufferAccess2, rb2->robustImageAccess2, rb2->nullDescriptor);
-        }
-
-        VkPhysicalDeviceMaintenance5FeaturesKHR* m5 =
-            (VkPhysicalDeviceMaintenance5FeaturesKHR*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
-        if (m5) {
-            if (!m5->maintenance5) {
-                m5->maintenance5 = VK_TRUE;
-                LOG("Spoofed maintenance5 = VK_TRUE\n");
-            }
-        }
-
-        VkPhysicalDeviceMaintenance6FeaturesKHR* m6 =
-            (VkPhysicalDeviceMaintenance6FeaturesKHR*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR);
-        if (m6) {
-            if (!m6->maintenance6) {
-                m6->maintenance6 = VK_TRUE;
-                LOG("Spoofed maintenance6 = VK_TRUE\n");
-            }
-        }
-
-        VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT* nscm =
-            (VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT*)find_pnext(pFeatures,
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT);
-        if (nscm) {
-            if (!nscm->nonSeamlessCubeMap) {
-                nscm->nonSeamlessCubeMap = VK_TRUE;
-                LOG("Spoofed nonSeamlessCubeMap = VK_TRUE\n");
-            }
-        }
+        LOG("    [REAL] textureCompressionBC=%d vertexPipelineStoresAndAtomics=%d\n",
+            pFeatures->features.textureCompressionBC,
+            pFeatures->features.vertexPipelineStoresAndAtomics);
 
         /* Log ALL sTypes in pNext chain so we can see what DXVK queries */
         {
@@ -1138,7 +948,6 @@ static void headless_GetPhysicalDeviceFeatures2(
             LOG("  pNext chain total: %d structs\n", idx);
         }
     }
-    layer_marker("GetFeatures2_DONE");
     LOG(">>> GetPhysicalDeviceFeatures2 COMPLETE\n");
 }
 
@@ -1147,19 +956,9 @@ static void headless_GetPhysicalDeviceFormatProperties(
     int format,
     VkFormatProperties* pFormatProperties)
 {
-    if (is_bc_format(format)) {
-        LOG(">>> GetFormatProperties CALLED format=%d (BC!) pd=%p g_real=%p\n",
-            format, physicalDevice, (void*)g_real_get_format_props);
-    }
-
+    /* Pure passthrough — no format spoofing */
     if (g_real_get_format_props)
         g_real_get_format_props(physicalDevice, format, pFormatProperties);
-
-    if (pFormatProperties && is_bc_format(format) &&
-        pFormatProperties->optimalTilingFeatures == 0) {
-        pFormatProperties->optimalTilingFeatures = BC_FORMAT_FEATURES;
-        LOG("Spoofed BC format %d optimal tiling features\n", format);
-    }
 }
 
 static void headless_GetPhysicalDeviceFormatProperties2(
@@ -1167,19 +966,9 @@ static void headless_GetPhysicalDeviceFormatProperties2(
     int format,
     VkFormatProperties2* pFormatProperties)
 {
-    if (is_bc_format(format)) {
-        LOG(">>> GetFormatProperties2 CALLED format=%d (BC!) pd=%p g_real=%p\n",
-            format, physicalDevice, (void*)g_real_get_format_props2);
-    }
-
+    /* Pure passthrough — no format spoofing */
     if (g_real_get_format_props2)
         g_real_get_format_props2(physicalDevice, format, pFormatProperties);
-
-    if (pFormatProperties && is_bc_format(format) &&
-        pFormatProperties->formatProperties.optimalTilingFeatures == 0) {
-        pFormatProperties->formatProperties.optimalTilingFeatures = BC_FORMAT_FEATURES;
-        LOG("Spoofed BC format %d optimal tiling features (FP2)\n", format);
-    }
 }
 
 /* ============================================================================
@@ -1952,7 +1741,11 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
     if (!g_dump_mode && !g_dump_max_frames) {
         const char *dump_env = getenv("HEADLESS_DUMP_FRAMES");
         if (dump_env) {
-            g_dump_max_frames = atoi(dump_env);
+            { /* manual parse — avoid __isoc23_strtol@GLIBC_2.38 from atoi */
+                int _v = 0; const char* _p = dump_env;
+                while (*_p >= '0' && *_p <= '9') { _v = _v * 10 + (*_p - '0'); _p++; }
+                g_dump_max_frames = _v;
+            }
             if (g_dump_max_frames > 0) {
                 g_dump_mode = 1;
                 g_dump_frame_count = 0;
@@ -2310,18 +2103,10 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
     };
     static const int num_filter = sizeof(filter_exts) / sizeof(filter_exts[0]);
 
-    /* Extensions to inject if missing */
+    /* Only inject VK_KHR_swapchain — the layer actually implements this.
+     * All other extensions must come from the real GPU/ICD. */
     static const struct { const char* name; uint32_t specVersion; } inject_exts[] = {
         { "VK_KHR_swapchain", 70 },
-        { "VK_EXT_depth_clip_enable", 1 },
-        { "VK_EXT_custom_border_color", 12 },
-        { "VK_EXT_transform_feedback", 1 },
-        { "VK_EXT_robustness2", 1 },
-        { "VK_KHR_maintenance5", 1 },
-        { "VK_KHR_maintenance6", 1 },
-        { "VK_KHR_pipeline_library", 1 },
-        { "VK_EXT_non_seamless_cube_map", 1 },
-        { "VK_EXT_graphics_pipeline_library", 1 },
     };
     static const int num_inject = sizeof(inject_exts) / sizeof(inject_exts[0]);
 
@@ -2472,7 +2257,9 @@ static VkResult headless_CreateInstance(
         if (strcmp(ext, "VK_KHR_surface") == 0 ||
             strcmp(ext, "VK_KHR_xcb_surface") == 0 ||
             strcmp(ext, "VK_KHR_xlib_surface") == 0 ||
-            strcmp(ext, "VK_EXT_headless_surface") == 0) {
+            strcmp(ext, "VK_EXT_headless_surface") == 0 ||
+            strcmp(ext, "VK_KHR_get_surface_capabilities2") == 0 ||
+            strcmp(ext, "VK_EXT_surface_maintenance1") == 0) {
             LOG("Filtering extension: %s (we provide it)\n", ext);
         } else {
             filtered[fc++] = ext;
@@ -2749,7 +2536,7 @@ static PFN_vkVoidFunction headless_GetPhysicalDeviceProcAddr(VkInstance instance
 {
     if (!pName) return NULL;
 
-    /* textureCompressionBC spoofing for DXVK */
+    /* Feature/format diagnostic passthroughs (no spoofing, just logging) */
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures;
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
@@ -2862,29 +2649,17 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)headless_QueuePresentKHR;
 
-    /* Physical device features & format spoofing (textureCompressionBC for DXVK) */
-    if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0) {
-        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFeatures (g_real=%p)\n",
-            pName, (void*)g_real_get_features);
+    /* Feature/format diagnostic passthroughs (no spoofing, just logging) */
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures;
-    }
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
-        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0) {
-        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFeatures2 (g_real=%p)\n",
-            pName, (void*)g_real_get_features2);
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFeatures2;
-    }
-    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0) {
-        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFormatProperties (g_real=%p)\n",
-            pName, (void*)g_real_get_format_props);
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties;
-    }
     if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
-        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0) {
-        LOG("GIPA INTERCEPT: %s -> headless_GetPhysicalDeviceFormatProperties2 (g_real=%p)\n",
-            pName, (void*)g_real_get_format_props2);
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties2;
-    }
 
     /* Forward everything else */
     if (g_next_gipa) {
@@ -3121,7 +2896,11 @@ static void layer_init(void) {
     /* Dump mode: HEADLESS_DUMP_FRAMES=N writes first N frames as PPM to /tmp/ */
     const char *dump_env = getenv("HEADLESS_DUMP_FRAMES");
     if (dump_env) {
-        g_dump_max_frames = atoi(dump_env);
+        { /* manual parse — avoid __isoc23_strtol@GLIBC_2.38 from atoi */
+            int _v = 0; const char* _p = dump_env;
+            while (*_p >= '0' && *_p <= '9') { _v = _v * 10 + (*_p - '0'); _p++; }
+            g_dump_max_frames = _v;
+        }
         if (g_dump_max_frames > 0) {
             g_dump_mode = 1;
             g_dump_frame_count = 0;

@@ -179,6 +179,7 @@ class ProtonManager(private val context: Context) {
             "DXVK_ASYNC" to "1",
             "DXVK_STATE_CACHE" to "1",
             "DXVK_LOG_LEVEL" to dxvkLogLevel,
+            "DXVK_LOG_PATH" to "/tmp/dxvk",
             "DXVK_HUD" to if (enableDxvkHud) "fps,devinfo" else "",
 
             // VKD3D (DirectX 12 -> Vulkan translation)
@@ -442,19 +443,26 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export DXVK_ASYNC=1
             export DXVK_STATE_CACHE=1
             export DXVK_LOG_LEVEL=trace
+            export DXVK_LOG_PATH=/tmp/dxvk
             export DXVK_HUD=fps,devinfo
 
             # Proton compatibility — esync ENABLED (Android kernel supports eventfd)
             export PROTON_NO_FSYNC=1
             export PROTON_USE_WINED3D=0
 
-            # Vulkan ICD: x86-64 shim → FEX thunks → host Vortek → Mali GPU
-            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
+            # Vulkan ICD — colon-separated: guest path + host path.
+            # Both loaders (guest x86-64 + host ARM64 thunk) read VK_ICD_FILENAMES.
+            # Host path is needed for FEX thunk chain to find Vortek.
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
+            export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
             export MALI_NO_ASYNC_COMPUTE=1
 
             # Headless frame capture → TCP 19850 → Android SurfaceView
             # Use Vulkan implicit layer instead of LD_PRELOAD (LD_PRELOAD blocked by AT_SECURE on Android)
             export HEADLESS_LAYER=1
+            # Disable the HOST-side headless layer (the guest layer handles surfaces;
+            # the HOST copy creates a second instance that corrupts the heap)
+            export DISABLE_HOST_HEADLESS=1
 
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
@@ -468,6 +476,9 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             # Misc
             export XDG_RUNTIME_DIR=/tmp
             export TMPDIR=/tmp
+            # Heap debug: detect corruption at the call that caused it
+            export MALLOC_CHECK_=3
+            export LIBC_FATAL_STDERR_=1
 
             # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
             if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
@@ -519,6 +530,10 @@ d3d11.reproducibleCommandStream = True
 # Memory limits: Vortek/FEX thunks have ~174MB host-visible mapping limit.
 # Reduce chunk sizes so DXVK creates smaller allocations (8MB instead of 64MB).
 dxvk.maxChunkSize = 8
+
+# Disable graphics pipeline library — Mali/Vortek doesn't expose
+# VK_KHR_pipeline_library, and we no longer spoof it.
+dxvk.enableGraphicsPipelineLibrary = False
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
@@ -740,6 +755,7 @@ DXVKEOF
             export DXVK_ASYNC=1
             export DXVK_STATE_CACHE=1
             export DXVK_LOG_LEVEL=trace
+            export DXVK_LOG_PATH=/tmp/dxvk
             export DXVK_HUD=fps,devinfo
 
             # Proton compatibility — disable both fsync AND esync, use plain wineserver sync
@@ -750,12 +766,14 @@ DXVKEOF
             # Wine debug — trace exceptions to find crash cause
             export WINEDEBUG=+seh,err+all
 
-            # Vulkan ICD
-            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
+            # Vulkan ICD (both vars — see normal launch comment)
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
+            export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
             export MALI_NO_ASYNC_COMPUTE=1
 
             # Headless layer + DUMP MODE (skip TCP, write PPMs)
             export HEADLESS_LAYER=1
+            export DISABLE_HOST_HEADLESS=1
             export HEADLESS_DUMP_FRAMES=$dumpFrames
 
             # DLL overrides (same as normal launch)
@@ -803,6 +821,7 @@ dxvk.numCompilerThreads = 1
 dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
 dxvk.maxChunkSize = 8
+dxvk.enableGraphicsPipelineLibrary = False
 DXVKEOF
 
             # Game-specific stub DLLs
@@ -952,9 +971,11 @@ DXVKEOF
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
-            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/fex_thunk_icd.json
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
+            export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
             export MALI_NO_ASYNC_COMPUTE=1
             export HEADLESS_LAYER=1
+            export DISABLE_HOST_HEADLESS=1
             export HEADLESS_DUMP_PPM=1
             export PROTON_NO_FSYNC=1
             export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d"

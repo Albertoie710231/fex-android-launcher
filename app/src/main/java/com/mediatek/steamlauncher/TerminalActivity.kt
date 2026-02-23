@@ -47,6 +47,7 @@ class TerminalActivity : AppCompatActivity() {
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
     private var frameSocketServer: FrameSocketServer? = null
     private var x11Server: X11Server? = null
+    private var framebufferBridge: FramebufferBridge? = null
     private var isDisplayMode = false
     private var surfaceReady = false
 
@@ -83,6 +84,8 @@ class TerminalActivity : AppCompatActivity() {
                 if (android.os.Build.VERSION.SDK_INT >= 30) {
                     holder.surface.setFrameRate(120f, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
                 }
+                // Connect FramebufferBridge to the surface for Vortek rendering
+                framebufferBridge?.setOutputSurface(holder.surface)
                 if (isDisplayMode) {
                     frameSocketServer?.setOutputSurface(holder.surface)
                     Log.i(TAG, "Vulkan display surface created and connected")
@@ -90,6 +93,7 @@ class TerminalActivity : AppCompatActivity() {
             }
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                framebufferBridge?.setOutputSurface(holder.surface)
                 if (isDisplayMode) {
                     frameSocketServer?.setOutputSurface(holder.surface)
                     Log.i(TAG, "Vulkan display surface changed: ${width}x${height}")
@@ -98,6 +102,7 @@ class TerminalActivity : AppCompatActivity() {
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 surfaceReady = false
+                framebufferBridge?.setOutputSurface(null)
                 frameSocketServer?.setOutputSurface(null)
                 Log.i(TAG, "Vulkan display surface destroyed")
             }
@@ -684,14 +689,17 @@ class TerminalActivity : AppCompatActivity() {
         if (VortekRenderer.start(socketPath, this)) {
             Log.i(TAG, "VortekRenderer started at: $socketPath")
 
-            // Set a dummy WindowInfoProvider for headless Vulkan (e.g., vulkaninfo).
-            // Without this, VortekRenderer rejects client connections.
-            VortekRenderer.setWindowInfoProvider(object : com.winlator.xenvironment.components.VortekRendererComponent.WindowInfoProvider {
-                override fun getWindowWidth(windowId: Int): Int = 1920
-                override fun getWindowHeight(windowId: Int): Int = 1080
-                override fun getWindowHardwareBuffer(windowId: Int): Long = 0
-                override fun updateWindowContent(windowId: Int) {}
-            })
+            // Create FramebufferBridge with real HardwareBuffers for Vortek rendering.
+            // Vortek REQUIRES a valid AHardwareBuffer — returning null crashes
+            // AsyncPipelineCreator in Mali driver (null VkDevice at offset 0xb8).
+            val bridge = FramebufferBridge(
+                vulkanSurface.holder.surface,  // may be null if surface not ready yet
+                1280,  // default width (matches Wine virtual desktop)
+                720    // default height
+            )
+            framebufferBridge = bridge
+            VortekRenderer.setWindowInfoProvider(bridge)
+            Log.i(TAG, "FramebufferBridge connected to VortekRenderer")
 
             // Create .vortek/V0 symlink (expected by VORTEK_SERVER_PATH env var)
             try {
@@ -751,6 +759,8 @@ class TerminalActivity : AppCompatActivity() {
         x11Server?.stop()
         x11Server = null
         VortekRenderer.stop()
+        framebufferBridge?.release()
+        framebufferBridge = null
         super.onDestroy()
     }
 }

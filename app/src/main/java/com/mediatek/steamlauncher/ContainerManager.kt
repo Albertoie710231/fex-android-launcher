@@ -510,8 +510,11 @@ class ContainerManager(private val context: Context) {
 }
         """.trimIndent())
 
-        // Thunks config: enable Vulkan passthrough, disable GL (no host GL available)
-        File(configDir, "thunks.json").writeText("""{"ThunksDB": {"GL": 0, "Vulkan": 1}}""")
+        // Thunks config: disable both GL and Vulkan thunking.
+        // Vulkan MUST be 0 so Wine's winevulkan.so dlopen's the real x86-64 Ubuntu
+        // Vulkan loader (which has xlib surface support). With Vulkan: 1, FEX overlays
+        // libvulkan.so with the guest thunk → HOST ARM64 loader → no xlib → -9 error.
+        File(configDir, "thunks.json").writeText("""{"ThunksDB": {"GL": 0, "Vulkan": 0}}""")
 
         // Deploy ThunksDB.json — FEX's LoadThunkDatabase() looks for it at
         // $HOME/.fex-emu/ThunksDB.json on the HOST filesystem

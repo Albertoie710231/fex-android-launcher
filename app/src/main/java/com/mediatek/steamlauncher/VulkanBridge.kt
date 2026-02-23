@@ -154,32 +154,11 @@ object VulkanBridge {
      * @return true if setup was successful
      */
     fun setupVortekIcd(rootfsPath: String): Boolean {
-        return try {
-            // Create ICD directory
-            val icdDir = File(rootfsPath, "usr/share/vulkan/icd.d")
-            icdDir.mkdirs()
-
-            // Vortek ICD configuration
-            // Points to the ARM64 Vulkan ICD that communicates with Android's VortekRenderer
-            // (Box64 handles the x86→ARM64 translation layer)
-            val vortekIcd = """
-                {
-                    "file_format_version": "1.0.0",
-                    "ICD": {
-                        "library_path": "/lib/libvulkan_vortek.so",
-                        "api_version": "1.1.128"
-                    }
-                }
-            """.trimIndent()
-
-            File(icdDir, "vortek_icd.json").writeText(vortekIcd)
-            Log.i(TAG, "Vortek ICD configuration created")
-            true
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to setup Vortek ICD", e)
-            false
-        }
+        // No-op: the x86-64 guest loader must ONLY use fex_thunk_icd.json
+        // (which filters extensions). A second ICD would let DXVK see unfiltered
+        // extensions (e.g. VK_EXT_robustness2) and fail.
+        // The HOST ARM64 loader uses vortek_host_icd.json via VK_ICD_FILENAMES.
+        return true
     }
 
     /**

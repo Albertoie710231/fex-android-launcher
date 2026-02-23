@@ -470,14 +470,12 @@ static void in_process_vulkan_test(void) {
 /* Watchdog thread: reports call counts + thread IPs + profile spinning thread */
 static DWORD WINAPI watchdog_thread(LPVOID arg) {
     (void)arg;
-    /* Re-enabled: watchdog vulkan test was not the cause of the Mali crash.
-     * Root cause was vkMapMemory failure at ~174MB → DEVICE_LOST.
-     * Keeping the test for diagnostics (confirms Vulkan pipeline works). */
+    /* DISABLED: in-process Vulkan test causes malloc() heap corruption
+     * ("corrupted top size") which poisons DXVK's allocator and prevents
+     * it from even opening its log file. The watchdog Vulkan test uses the
+     * same loader/ICD/layer stack concurrently with DXVK init. */
     Sleep(2000);
-    fprintf(stderr, "\n[steam_api64] === WATCHDOG t+2s (Vulkan test) ===\n");
-    fflush(stderr);
-    in_process_vulkan_test();
-    fprintf(stderr, "[steam_api64] === END EARLY TEST ===\n");
+    fprintf(stderr, "\n[steam_api64] === WATCHDOG t+2s (Vulkan test SKIPPED) ===\n");
     fflush(stderr);
 
     for (int iter = 0; iter < 3; iter++) { /* 30 seconds total */

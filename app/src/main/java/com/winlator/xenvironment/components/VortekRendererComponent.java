@@ -41,6 +41,7 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
     // JNI native methods - must match libvortekrenderer.so exports
     private native long createVkContext(int fd, Options options);
     private native void destroyVkContext(long contextPtr);
+    private native boolean handleExtraDataRequest(long contextPtr, int requestId, int requestLength);
     private native void initVulkanWrapper(String nativeLibDir, String libvulkanPath);
 
     static {
@@ -59,7 +60,7 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
     @Keep
     public static class Options {
         public int vkMaxVersion = VK_MAX_VERSION;
-        public short maxDeviceMemory = 4096;  // MB
+        public short maxDeviceMemory = 0;  // 0 = use actual device memory (Winlator v11 default)
         public short imageCacheSize = 256;    // MB
         public byte resourceMemoryType = 0;
         public String[] exposedDeviceExtensions = null;
@@ -117,7 +118,7 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
 
         try {
             connector = new XConnectorEpoll(socketConfig, this, this);
-            connector.setInitialInputBufferCapacity(1);
+            connector.setInitialInputBufferCapacity(8);
             connector.setInitialOutputBufferCapacity(0);
             connector.start();
             Log.i(TAG, "Vortek server started on: " + socketConfig.path);
@@ -172,11 +173,13 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
     @Override
     public boolean handleRequest(ConnectedClient client) throws IOException {
         XInputStream inputStream = client.getInputStream();
-        if (inputStream == null || inputStream.available() < 1) {
+        if (inputStream == null || inputStream.available() < 8) {
             return false;
         }
 
-        byte requestCode = inputStream.readByte();
+        int requestCode = inputStream.readInt();
+        int requestLength = inputStream.readInt();
+
         if (requestCode == 1) {
             // Guard: Check if Vulkan was initialized successfully
             if (!vulkanInitialized) {
@@ -201,8 +204,9 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
             try {
                 long contextPtr = createVkContext(client.fd, options);
                 Log.d(TAG, "createVkContext returned: " + contextPtr + " (0x" + Long.toHexString(contextPtr) + ")");
-                // Note: contextPtr is a native pointer, which can have the high bit set
-                // on 64-bit systems. Check for != 0 instead of > 0.
+                // Note: contextPtr is a native pointer which can have high bits set
+                // (ARM64 MTE tagged pointers), making it negative as signed long.
+                // Check != 0 instead of > 0.
                 if (contextPtr != 0) {
                     client.setTag(Long.valueOf(contextPtr));
                     clientContexts.put(client.fd, contextPtr);
@@ -214,6 +218,13 @@ public class VortekRendererComponent implements ConnectionHandler, RequestHandle
             } catch (Exception e) {
                 Log.e(TAG, "Exception creating Vulkan context: " + e.getMessage());
                 connector.killConnection(client);
+            }
+        } else if (requestCode > 32767 && (requestCode >> 16) == 2) {
+            int requestId = 65535 & requestCode;
+            boolean success = handleExtraDataRequest(
+                ((Long) client.getTag()).longValue(), requestId, requestLength);
+            if (!success) {
+                throw new IOException("Failed to handle extra data request.");
             }
         }
 

@@ -58,6 +58,9 @@ static void log_timestamp(FILE* f) {
     if (g_icd_log) { log_timestamp(g_icd_log); fprintf(g_icd_log, "fex_thunk_icd: " __VA_ARGS__); fflush(g_icd_log); } \
 } while(0)
 
+/* Forward declaration: injected extensions list (defined near extension filter) */
+static const char* g_injected_extensions[];
+
 /* ==== Handle Wrapper ====
  *
  * 16-byte struct that stands in for dispatchable handles (VkDevice, VkQueue,
@@ -360,20 +363,71 @@ static void wrapped_GetPhysicalDeviceFeatures2(void* physDev, void* pFeatures) {
         LOG("GetFeatures2: real function is NULL!\n");
     }
 
-    /* Log Vulkan 1.3 feature values (no longer blocking — using converters instead) */
+    /* Spoof core features for D3D_FEATURE_LEVEL_11_1.
+     * VkPhysicalDeviceFeatures2 layout: sType(4)+pad(4)+pNext(8)+features(...)
+     * VkPhysicalDeviceFeatures offsets: logicOp=32, vertexPipelineStoresAndAtomics=100 */
+    if (pFeatures) {
+        uint32_t* logicOp = (uint32_t*)((uint8_t*)pFeatures + 16 + 32);
+        uint32_t* vertPSA = (uint32_t*)((uint8_t*)pFeatures + 16 + 100);
+        LOG("  Core: logicOp=%u vertexPSA=%u\n", *logicOp, *vertPSA);
+        if (!*logicOp) {
+            *logicOp = 1;
+            LOG("  -> SPOOFED logicOp=1\n");
+        }
+        if (!*vertPSA) {
+            *vertPSA = 1;
+            LOG("  -> SPOOFED vertexPipelineStoresAndAtomics=1\n");
+        }
+    }
+
+    /* Walk pNext chain: spoof features DXVK requires */
     if (pFeatures) {
         typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } VkBase;
         VkBase* node = (VkBase*)(*(void**)((uint8_t*)pFeatures + 8)); /* pNext */
+        int found_robust2 = 0;
+        int chain_len = 0;
         while (node) {
+            chain_len++;
             if (node->sType == 53) { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES */
                 uint32_t sync2 = *(uint32_t*)((uint8_t*)node + 52);
                 uint32_t dynRender = *(uint32_t*)((uint8_t*)node + 64);
-                LOG("  Vulkan13Features: synchronization2=%u dynamicRendering=%u (kept)\n",
+                LOG("  Vulkan13Features: synchronization2=%u dynamicRendering=%u\n",
                     sync2, dynRender);
-                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT = 1000286000
+             * Layout: sType(4)+pad(4)+pNext(8)+robustBufferAccess2(4)+robustImageAccess2(4)+nullDescriptor(4) */
+            if (node->sType == 1000286000) {
+                found_robust2 = 1;
+                uint32_t* robustBuf = (uint32_t*)((uint8_t*)node + 16);
+                uint32_t* robustImg = (uint32_t*)((uint8_t*)node + 20);
+                uint32_t* nullDesc  = (uint32_t*)((uint8_t*)node + 24);
+                LOG("  Robustness2: buf=%u img=%u null=%u", *robustBuf, *robustImg, *nullDesc);
+                if (!*robustBuf) {
+                    *robustBuf = 1;
+                    LOG(" -> SPOOFED buf=1");
+                }
+                if (!*robustImg) {
+                    *robustImg = 1;
+                    LOG(" -> SPOOFED img=1");
+                }
+                if (!*nullDesc) {
+                    *nullDesc = 1;
+                    LOG(" -> SPOOFED null=1");
+                }
+                LOG("\n");
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR = 1000470000
+             * Layout: sType(4)+pad(4)+pNext(8)+maintenance5(4) */
+            if (node->sType == 1000470000) {
+                uint32_t* maint5 = (uint32_t*)((uint8_t*)node + 16);
+                if (!*maint5) {
+                    *maint5 = 1;
+                    LOG("  Maintenance5: SPOOFED=1\n");
+                }
             }
             node = (VkBase*)node->pNext;
         }
+        LOG("GetFeatures2 EXIT: chain=%d found_robust2=%d\n", chain_len, found_robust2);
     }
 }
 
@@ -558,7 +612,126 @@ static VkResult wrapped_CreateDevice(void* physDev, const void* pCreateInfo,
         return 0;
     }
 
+    /* Strip injected extensions from the create info — the real device
+     * doesn't actually support them, so passing them through would cause
+     * VK_ERROR_EXTENSION_NOT_PRESENT.
+     *
+     * VkDeviceCreateInfo layout (relevant fields):
+     *   sType(4) + pad(4) + pNext(8) + flags(4) + queueCreateInfoCount(4)
+     *   + pQueueCreateInfos(8) + enabledLayerCount(4) + pad(4)
+     *   + ppEnabledLayerNames(8) + enabledExtensionCount(4) + pad(4)
+     *   + ppEnabledExtensionNames(8) + pEnabledFeatures(8)
+     * enabledExtensionCount at offset 48, ppEnabledExtensionNames at offset 56 */
+    uint32_t orig_ext_count = *(uint32_t*)((uint8_t*)pCreateInfo + 48);
+    const char* const* orig_ext_names = *(const char* const**)((uint8_t*)pCreateInfo + 56);
+
+    /* Build filtered extension list (strip injected ones) */
+    const char** filtered_names = NULL;
+    uint32_t filtered_count = 0;
+    if (orig_ext_count > 0 && orig_ext_names) {
+        filtered_names = (const char**)malloc(orig_ext_count * sizeof(char*));
+        if (filtered_names) {
+            for (uint32_t i = 0; i < orig_ext_count; i++) {
+                int injected = 0;
+                for (int j = 0; g_injected_extensions[j]; j++) {
+                    if (strcmp(orig_ext_names[i], g_injected_extensions[j]) == 0) {
+                        injected = 1;
+                        LOG("CD: stripping injected ext [%s]\n", orig_ext_names[i]);
+                        break;
+                    }
+                }
+                if (!injected)
+                    filtered_names[filtered_count++] = orig_ext_names[i];
+            }
+            /* Patch the create info (temporarily) */
+            *(uint32_t*)((uint8_t*)pCreateInfo + 48) = filtered_count;
+            *(const char***)((uint8_t*)pCreateInfo + 56) = filtered_names;
+        }
+    }
+
+    /* Strip spoofed features from pEnabledFeatures and pNext chain.
+     * We spoof features in GetFeatures2 so DXVK accepts the adapter,
+     * but the real driver doesn't support them — passing them through
+     * would cause VK_ERROR_FEATURE_NOT_PRESENT.
+     *
+     * VkPhysicalDeviceFeatures offsets: logicOp=32, vertexPipelineStoresAndAtomics=100
+     * pEnabledFeatures at offset 64 in VkDeviceCreateInfo */
+    typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } PNBase;
+
+    /* Case A: pEnabledFeatures (flat VkPhysicalDeviceFeatures pointer) */
+    void* pEnabledFeatures = *(void**)((uint8_t*)pCreateInfo + 64);
+    uint32_t save_pef_logicOp = 0, save_pef_vertPSA = 0;
+    if (pEnabledFeatures) {
+        uint32_t* lo = (uint32_t*)((uint8_t*)pEnabledFeatures + 32);
+        uint32_t* vp = (uint32_t*)((uint8_t*)pEnabledFeatures + 100);
+        save_pef_logicOp = *lo; save_pef_vertPSA = *vp;
+        if (*lo) { *lo = 0; LOG("CD: stripped pEnabledFeatures.logicOp\n"); }
+        if (*vp) { *vp = 0; LOG("CD: stripped pEnabledFeatures.vertexPSA\n"); }
+    }
+
+    /* Case B: Walk pNext chain for VkPhysicalDeviceFeatures2 and extension features */
+    uint32_t save_f2_logicOp = 0, save_f2_vertPSA = 0;
+    uint32_t save_robust[3] = {0, 0, 0};
+    uint32_t save_maint5 = 0;
+    {
+        PNBase* pn = (PNBase*)(*(void**)((uint8_t*)pCreateInfo + 8));
+        while (pn) {
+            if (pn->sType == 51) { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 */
+                uint32_t* lo = (uint32_t*)((uint8_t*)pn + 16 + 32);
+                uint32_t* vp = (uint32_t*)((uint8_t*)pn + 16 + 100);
+                save_f2_logicOp = *lo; save_f2_vertPSA = *vp;
+                if (*lo) { *lo = 0; LOG("CD: stripped features2.logicOp\n"); }
+                if (*vp) { *vp = 0; LOG("CD: stripped features2.vertexPSA\n"); }
+            }
+            if (pn->sType == 1000286000) { /* VkPhysicalDeviceRobustness2FeaturesEXT */
+                uint32_t* f = (uint32_t*)((uint8_t*)pn + 16);
+                save_robust[0] = f[0]; save_robust[1] = f[1]; save_robust[2] = f[2];
+                if (f[0] || f[1] || f[2]) {
+                    LOG("CD: stripped robustness2 (%u,%u,%u)\n", f[0], f[1], f[2]);
+                    f[0] = f[1] = f[2] = 0;
+                }
+            }
+            if (pn->sType == 1000470000) { /* VkPhysicalDeviceMaintenance5FeaturesKHR */
+                uint32_t* f = (uint32_t*)((uint8_t*)pn + 16);
+                save_maint5 = *f;
+                if (*f) { *f = 0; LOG("CD: stripped maintenance5\n"); }
+            }
+            pn = (PNBase*)pn->pNext;
+        }
+    }
+
     VkResult res = real_create_device(physDev, pCreateInfo, pAllocator, pDevice);
+
+    /* Restore all stripped features */
+    if (pEnabledFeatures) {
+        *(uint32_t*)((uint8_t*)pEnabledFeatures + 32) = save_pef_logicOp;
+        *(uint32_t*)((uint8_t*)pEnabledFeatures + 100) = save_pef_vertPSA;
+    }
+    {
+        PNBase* pn = (PNBase*)(*(void**)((uint8_t*)pCreateInfo + 8));
+        while (pn) {
+            if (pn->sType == 51) {
+                *(uint32_t*)((uint8_t*)pn + 16 + 32) = save_f2_logicOp;
+                *(uint32_t*)((uint8_t*)pn + 16 + 100) = save_f2_vertPSA;
+            }
+            if (pn->sType == 1000286000) {
+                uint32_t* f = (uint32_t*)((uint8_t*)pn + 16);
+                f[0] = save_robust[0]; f[1] = save_robust[1]; f[2] = save_robust[2];
+            }
+            if (pn->sType == 1000470000) {
+                *(uint32_t*)((uint8_t*)pn + 16) = save_maint5;
+            }
+            pn = (PNBase*)pn->pNext;
+        }
+    }
+
+    /* Restore original extensions */
+    if (filtered_names) {
+        *(uint32_t*)((uint8_t*)pCreateInfo + 48) = orig_ext_count;
+        *(const char* const**)((uint8_t*)pCreateInfo + 56) = orig_ext_names;
+        free(filtered_names);
+    }
+
     if (res == 0 && pDevice && *pDevice) {
         void* real_device = *pDevice;
         shared_real_device = real_device;
@@ -2331,15 +2504,29 @@ static int ext_logged = 0;
  *
  * VK_KHR_synchronization2: CmdPipelineBarrier2 + QueueSubmit2 — suspected thunk marshaling bugs
  * VK_KHR_dynamic_rendering: CmdBeginRendering — suspected thunk marshaling bugs
- *
- * Hiding these forces DXVK to use CmdPipelineBarrier(v1), QueueSubmit(v1),
- * and legacy VkRenderPass — all of which work through the thunk (vkcube, test_wine_vulkan).
  */
 static const char* g_hidden_extensions[] = {
     "VK_KHR_synchronization2",
     "VK_KHR_dynamic_rendering",
     NULL
 };
+#define NUM_HIDDEN_EXTENSIONS 2
+
+/* Extensions to INJECT — advertise even though Vortek doesn't report them.
+ *
+ * VK_EXT_robustness2: DXVK unconditionally requires robustBufferAccess2.
+ *   Mali-G720 doesn't advertise this extension, but newer DXVK hard-requires
+ *   the feature. We inject the extension and spoof the features in GetFeatures2.
+ *   robustBufferAccess2 is a safety guarantee (OOB reads return 0, OOB writes
+ *   are discarded) — Mali GPUs generally handle this gracefully anyway.
+ */
+static const char* g_injected_extensions[] = {
+    "VK_EXT_robustness2",
+    "VK_KHR_maintenance5",
+    "VK_KHR_pipeline_library",
+    NULL
+};
+#define NUM_INJECTED_EXTENSIONS 3
 
 static int is_hidden_extension(const char* name) {
     for (int i = 0; g_hidden_extensions[i]; i++) {
@@ -2352,44 +2539,64 @@ static int is_hidden_extension(const char* name) {
 static VkResult wrapped_EnumerateDeviceExtensionProperties(
         void* physDev, const char* pLayerName,
         uint32_t* pCount, void* pProps) {
-    VkResult res = real_enum_dev_ext_props(physDev, pLayerName, pCount, pProps);
-    if (res == 0 && pProps && pCount && *pCount > 0) {
-        /* Log extensions on first enumeration */
-        if (!ext_logged) {
-            ext_logged = 1;
-            LOG("=== Vortek Device Extensions (%u) ===\n", *pCount);
-            for (uint32_t i = 0; i < *pCount; i++) {
-                const char* name = (const char*)pProps + i * VK_EXT_PROPS_SIZE;
-                uint32_t ver = *(uint32_t*)((const char*)pProps + i * VK_EXT_PROPS_SIZE + 256);
-                LOG("  ext[%u] %s (v%u)\n", i, name, ver);
-            }
-            LOG("=== End Extensions ===\n");
+    if (!pProps) {
+        /* Count-only: get real count, subtract hidden, add injected */
+        VkResult res = real_enum_dev_ext_props(physDev, pLayerName, pCount, NULL);
+        if (res == 0 && pCount) {
+            int adjusted = (int)*pCount - NUM_HIDDEN_EXTENSIONS + NUM_INJECTED_EXTENSIONS;
+            *pCount = (uint32_t)(adjusted > 0 ? adjusted : 0);
         }
-
-        /* Filter out hidden extensions by compacting the array */
-        uint32_t orig = *pCount;
-        uint32_t dst = 0;
-        for (uint32_t src = 0; src < orig; src++) {
-            const char* name = (const char*)pProps + src * VK_EXT_PROPS_SIZE;
-            if (is_hidden_extension(name)) {
-                LOG("EXT FILTER: hiding %s\n", name);
-                continue;
-            }
-            if (dst != src)
-                memcpy((char*)pProps + dst * VK_EXT_PROPS_SIZE,
-                       (char*)pProps + src * VK_EXT_PROPS_SIZE,
-                       VK_EXT_PROPS_SIZE);
-            dst++;
-        }
-        *pCount = dst;
-        if (dst != orig)
-            LOG("EXT FILTER: %u -> %u extensions (hid %u)\n", orig, dst, orig - dst);
-    } else if (res == 0 && !pProps && pCount) {
-        /* Count-only query: reduce count by number of hidden extensions.
-         * We don't know which ones are present without enumerating, so
-         * just let the count be slightly higher — DXVK will re-enumerate. */
+        return res;
     }
-    return res;
+
+    /* Fill query: enumerate into our OWN buffer (with padding) to avoid
+     * FEX thunk overwriting past the caller's allocation and corrupting
+     * the glibc heap. The thunk may use a larger stride than 260 bytes
+     * per VkExtensionProperties on the ARM64 host side. */
+    uint32_t max_count = *pCount + NUM_HIDDEN_EXTENSIONS + 3;
+    size_t buf_size = (size_t)max_count * VK_EXT_PROPS_SIZE + 4096;
+    uint8_t* tmp = (uint8_t*)malloc(buf_size);
+    if (!tmp) return -1; /* VK_ERROR_OUT_OF_HOST_MEMORY */
+    memset(tmp, 0, buf_size);
+
+    uint32_t tmp_count = max_count;
+    VkResult res = real_enum_dev_ext_props(physDev, pLayerName, &tmp_count, tmp);
+    if (res != 0) {
+        free(tmp);
+        return res;
+    }
+
+    /* Filter from tmp → caller's pProps (hide extensions) */
+    uint32_t dst = 0;
+    uint32_t limit = *pCount;
+    for (uint32_t src = 0; src < tmp_count && dst < limit; src++) {
+        const char* name = (const char*)(tmp + src * VK_EXT_PROPS_SIZE);
+        if (is_hidden_extension(name)) {
+            LOG("EXT FILTER: hiding [%s]\n", name);
+            continue;
+        }
+        memcpy((char*)pProps + dst * VK_EXT_PROPS_SIZE,
+               tmp + src * VK_EXT_PROPS_SIZE,
+               VK_EXT_PROPS_SIZE);
+        dst++;
+    }
+
+    /* Inject extensions that Vortek doesn't report but DXVK requires */
+    for (int i = 0; g_injected_extensions[i] && dst < limit; i++) {
+        uint8_t* entry = (uint8_t*)pProps + dst * VK_EXT_PROPS_SIZE;
+        memset(entry, 0, VK_EXT_PROPS_SIZE);
+        /* extensionName at offset 0 (char[256]), specVersion at offset 256 (uint32_t) */
+        strncpy((char*)entry, g_injected_extensions[i], 255);
+        *(uint32_t*)(entry + 256) = 1; /* spec_version = 1 */
+        LOG("EXT FILTER: injected [%s]\n", g_injected_extensions[i]);
+        dst++;
+    }
+
+    *pCount = dst;
+    LOG("EXT FILTER: %u -> %u (buf=%u)\n", tmp_count, dst, max_count);
+
+    free(tmp);
+    return 0;
 }
 
 /* ==== ICD entry points ==== */
@@ -2439,7 +2646,7 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
     }
     if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) {
         real_enum_dev_ext_props = (PFN_vkEnumDevExtProps)real_gipa(instance, pName);
-        LOG("GIPA: vkEnumerateDeviceExtensionProperties -> logging wrapper\n");
+        LOG("GIPA: vkEnumerateDeviceExtensionProperties -> no-op wrapper\n");
         return real_enum_dev_ext_props ? (PFN_vkVoidFunction)wrapped_EnumerateDeviceExtensionProperties : NULL;
     }
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
