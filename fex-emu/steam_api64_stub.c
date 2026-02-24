@@ -872,6 +872,101 @@ void __cdecl SteamAPI_ManualDispatch_FreeLastCallback(HSteamPipe pipe) {
 }
 
 /* ========================================================================
+ * Vectored Exception Handler — fix NULL entity table in ys9.exe
+ *
+ * Multiple functions read the entity table pointer from
+ * [global_at_0x140780c78 + 0x26ddb98] + 0x1109e8. When the entity system
+ * isn't initialized yet, this pointer is NULL, causing ACCESS_VIOLATION
+ * at small addresses (NULL + stride*index + field_offset).
+ *
+ * Known crash sites: +0x174206, +0x364900 (and likely more).
+ *
+ * Fix: on first entity-table crash, allocate a zero-filled dummy table
+ * and write it to the entity table slot. All zero fields cause the
+ * iteration code's own null/type checks to skip each entry harmlessly.
+ * Then re-execute the crashing instruction — it now finds valid memory.
+ * ======================================================================== */
+
+/* 1000 entities * 0x58 (88) bytes each */
+#define ENTITY_TABLE_SIZE (1000 * 0x58)
+static char *dummy_entity_table = NULL;
+static volatile LONG veh_entity_fix_count = 0;
+
+static LONG CALLBACK ys9_null_table_veh(EXCEPTION_POINTERS *ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    DWORD64 rip = ep->ContextRecord->Rip;
+    ULONG_PTR fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+
+    /* Only handle crashes in ys9.exe (base 0x140000000, size 0x936000)
+     * with small fault addresses (NULL + small offset) */
+    if (rip < 0x140000000 || rip >= 0x140936000 || fault_addr >= 0x10000)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Try to patch the entity table pointer in the global chain:
+     * [0x140780c78] -> global -> [+0x26ddb98] -> sub_obj -> [+0x1109e8] -> table
+     */
+    LONG n = InterlockedIncrement(&veh_entity_fix_count);
+    fprintf(stderr, "[steam_api64] VEH: NULL deref in ys9.exe+0x%llx "
+            "(fault=0x%llx, fix #%ld)\n",
+            (unsigned long long)(rip - 0x140000000),
+            (unsigned long long)fault_addr, (long)n);
+    fflush(stderr);
+
+    /* Allocate dummy table once */
+    if (!dummy_entity_table) {
+        dummy_entity_table = (char *)VirtualAlloc(NULL, ENTITY_TABLE_SIZE,
+                                                   MEM_COMMIT | MEM_RESERVE,
+                                                   PAGE_READWRITE);
+        if (dummy_entity_table) {
+            memset(dummy_entity_table, 0, ENTITY_TABLE_SIZE);
+            fprintf(stderr, "[steam_api64] VEH: allocated dummy entity table at %p\n",
+                    dummy_entity_table);
+        }
+    }
+
+    if (dummy_entity_table) {
+        /* Walk the global pointer chain and patch the entity table slot.
+         * Use IsBadReadPtr/IsBadWritePtr for safety (no __try in MinGW). */
+        uint64_t *global_ptr_slot = (uint64_t *)0x140780c78;
+        if (!IsBadReadPtr(global_ptr_slot, 8)) {
+            uint64_t global_val = *global_ptr_slot;
+            if (global_val && !IsBadReadPtr((void *)(global_val + 0x26ddb98), 8)) {
+                uint64_t sub_obj = *(uint64_t *)(global_val + 0x26ddb98);
+                if (sub_obj && !IsBadWritePtr((void *)(sub_obj + 0x1109e8), 8)) {
+                    uint64_t *entity_slot = (uint64_t *)(sub_obj + 0x1109e8);
+                    if (*entity_slot == 0) {
+                        *entity_slot = (uint64_t)dummy_entity_table;
+                        fprintf(stderr, "[steam_api64] VEH: patched entity table at "
+                                "%p: 0 -> %p\n", (void *)entity_slot, dummy_entity_table);
+                        fflush(stderr);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: skip known crash sites by jumping to their epilogues */
+    if (rip == 0x140174206) {
+        ep->ContextRecord->Rip = 0x1401742b0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (rip == 0x140364900) {
+        ep->ContextRecord->Rip = 0x140364d62;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* Unknown crash site in ys9.exe with small fault addr — log but don't handle */
+    fprintf(stderr, "[steam_api64] VEH: unhandled NULL deref at +0x%llx, passing\n",
+            (unsigned long long)(rip - 0x140000000));
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ========================================================================
  * DllMain
  * ======================================================================== */
 
@@ -882,12 +977,94 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(hDll);
         init_mocks();
 
+        /* Install VEH to handle entity table NULL crashes */
+        AddVectoredExceptionHandler(1, ys9_null_table_veh);
+
         char exename[MAX_PATH];
         GetModuleFileNameA(NULL, exename, MAX_PATH);
         fprintf(stderr, "[steam_api64] Stub loaded in PID %lu (%s)\n",
                 GetCurrentProcessId(), exename);
         fprintf(stderr, "[steam_api64] SteamAPI_Init() will return true with mock interfaces\n");
         fflush(stderr);
+
+        /* === FILE ACCESS DIAGNOSTIC === */
+        {
+            char cwd[MAX_PATH];
+            GetCurrentDirectoryA(MAX_PATH, cwd);
+            fprintf(stderr, "[steam_api64] CWD: %s\n", cwd);
+
+            /* Derive exe directory */
+            char exedir[MAX_PATH];
+            strncpy(exedir, exename, MAX_PATH);
+            char *lastslash = strrchr(exedir, '\\');
+            if (!lastslash) lastslash = strrchr(exedir, '/');
+            if (lastslash) *lastslash = '\0';
+            fprintf(stderr, "[steam_api64] EXE dir: %s\n", exedir);
+
+            /* Test 1: relative path from CWD */
+            HANDLE h1 = CreateFileA("text\\item.tbb", GENERIC_READ, FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, 0, NULL);
+            fprintf(stderr, "[steam_api64] CreateFileA(\"text\\item.tbb\"): %s (err=%lu)\n",
+                    h1 != INVALID_HANDLE_VALUE ? "OK" : "FAILED", GetLastError());
+            if (h1 != INVALID_HANDLE_VALUE) {
+                DWORD sz = GetFileSize(h1, NULL);
+                unsigned char hdr[8] = {0};
+                DWORD rd = 0;
+                ReadFile(h1, hdr, 8, &rd, NULL);
+                fprintf(stderr, "[steam_api64]   size=%lu header=%.8s\n", sz, (char*)hdr);
+                CloseHandle(h1);
+            }
+
+            /* Test 2: absolute path from exe directory */
+            char fullpath[MAX_PATH];
+            snprintf(fullpath, MAX_PATH, "%s\\text\\item.tbb", exedir);
+            HANDLE h2 = CreateFileA(fullpath, GENERIC_READ, FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, 0, NULL);
+            fprintf(stderr, "[steam_api64] CreateFileA(\"%s\"): %s (err=%lu)\n",
+                    fullpath, h2 != INVALID_HANDLE_VALUE ? "OK" : "FAILED", GetLastError());
+            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+
+            /* Test 3: enumerate text\ directory */
+            char searchpath[MAX_PATH];
+            snprintf(searchpath, MAX_PATH, "%s\\text\\*.tbb", exedir);
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = FindFirstFileA(searchpath, &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                int count = 0;
+                do {
+                    if (count < 5)
+                        fprintf(stderr, "[steam_api64]   found: %s (%lu bytes)\n",
+                                fd.cFileName, fd.nFileSizeLow);
+                    count++;
+                } while (FindNextFileA(hFind, &fd));
+                FindClose(hFind);
+                fprintf(stderr, "[steam_api64]   total .tbb files found: %d\n", count);
+            } else {
+                fprintf(stderr, "[steam_api64] FindFirstFileA(\"%s\"): FAILED (err=%lu)\n",
+                        searchpath, GetLastError());
+            }
+
+            /* Test 4: list top-level files/dirs in CWD */
+            WIN32_FIND_DATAA fd2;
+            HANDLE hFind2 = FindFirstFileA("*", &fd2);
+            if (hFind2 != INVALID_HANDLE_VALUE) {
+                int count = 0;
+                fprintf(stderr, "[steam_api64] CWD listing:\n");
+                do {
+                    if (count < 20)
+                        fprintf(stderr, "[steam_api64]   %s%s\n",
+                                fd2.cFileName,
+                                (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "/" : "");
+                    count++;
+                } while (FindNextFileA(hFind2, &fd2));
+                FindClose(hFind2);
+                fprintf(stderr, "[steam_api64]   total entries: %d\n", count);
+            } else {
+                fprintf(stderr, "[steam_api64] CWD listing FAILED (err=%lu)\n", GetLastError());
+            }
+            fflush(stderr);
+        }
+        /* === END FILE ACCESS DIAGNOSTIC === */
 
         /* Start watchdog thread to report call counts */
         CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);

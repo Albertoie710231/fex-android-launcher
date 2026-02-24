@@ -307,7 +307,7 @@ class TerminalActivity : AppCompatActivity() {
             // Switch to display mode to show frames on SurfaceView
             if (!isDisplayMode) toggleDisplayMode()
             executeCommand(protonManager.getLaunchCommand(
-                "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
+                "/home/user/Steam/steamapps/common/Ys IX Monstrum Nox/ys9.exe"
             ))
         }
 
@@ -323,7 +323,7 @@ class TerminalActivity : AppCompatActivity() {
             }
             // Do NOT start FrameSocketServer or toggle display mode
             executeCommand(protonManager.getDumpModeLaunchCommand(
-                "/home/user/Steam/steamapps/downloading/1351630/ys9.exe"
+                "/home/user/Steam/steamapps/common/Ys IX Monstrum Nox/ys9.exe"
             ))
         }
     }

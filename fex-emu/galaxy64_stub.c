@@ -51,9 +51,37 @@ static long long mock_method(void) {
     return 0;
 }
 
+/* Return 1 (true) for methods that need to report success */
+static long long __cdecl mock_method_true(void) {
+    return 1;
+}
+
+/* Return a fake GalaxyID (non-zero, prevents "invalid user" checks) */
+static unsigned long long __cdecl mock_get_galaxy_id(void) {
+    /* Return a valid-looking Galaxy user ID */
+    return 0x0110000100000001ULL;
+}
+
 /* Shared vtable: 128 entries all pointing to mock_method.
  * GOG Galaxy interfaces have ~20-40 virtual methods each. */
 static void *mock_vtable[128];
+
+/* IUser vtable: auth methods return true, GetGalaxyID returns valid ID.
+ *
+ * GOG Galaxy SDK IUser vtable layout (with virtual destructor at [0]):
+ *   [0] ~IUser()            [1] SignedIn()          [2] GetGalaxyID()
+ *   [3-15] SignIn variants   [16] SignOut()
+ *   [17] RequestUserData()   [18] IsUserDataAvailable()
+ *   [19-24] UserData methods [25] IsLoggedOn()
+ *   [26+] EncryptedAppTicket, tokens, etc.
+ *
+ * We cover BOTH layouts (with/without virtual destructor) by setting
+ * both possible offsets. Returning 1 from a destructor is harmless
+ * (void return, caller ignores value). */
+static void *galaxy_user_vtable[128];
+
+/* IApps vtable: ownership checks return true */
+static void *galaxy_apps_vtable[128];
 
 typedef struct { void **vptr; } MockObj;
 
@@ -72,14 +100,35 @@ static MockObj mock_logger;
 
 static void init_mocks(void)
 {
+    /* Default vtable: all methods return 0 */
     for (int i = 0; i < 128; i++)
         mock_vtable[i] = (void *)mock_method;
 
-    mock_user.vptr = mock_vtable;
+    /* IUser vtable: override auth-related methods */
+    for (int i = 0; i < 128; i++)
+        galaxy_user_vtable[i] = (void *)mock_method;
+
+    /* With virtual destructor at [0]:
+     *   [1] = SignedIn, [2] = GetGalaxyID, [18] = IsUserDataAvailable, [25] = IsLoggedOn
+     * Without virtual destructor:
+     *   [0] = SignedIn, [1] = GetGalaxyID, [17] = IsUserDataAvailable, [24] = IsLoggedOn */
+    galaxy_user_vtable[0]  = (void *)mock_method_true;    /* SignedIn (no-dtor) or dtor (harmless) */
+    galaxy_user_vtable[1]  = (void *)mock_method_true;    /* SignedIn (with-dtor) or GetGalaxyID (non-zero=valid) */
+    galaxy_user_vtable[2]  = (void *)mock_get_galaxy_id;  /* GetGalaxyID (with-dtor) */
+    galaxy_user_vtable[17] = (void *)mock_method_true;    /* IsUserDataAvailable (no-dtor) */
+    galaxy_user_vtable[18] = (void *)mock_method_true;    /* IsUserDataAvailable (with-dtor) */
+    galaxy_user_vtable[24] = (void *)mock_method_true;    /* IsLoggedOn (no-dtor) */
+    galaxy_user_vtable[25] = (void *)mock_method_true;    /* IsLoggedOn (with-dtor) */
+
+    /* IApps vtable: most queries should return true (ownership, subscriptions) */
+    for (int i = 0; i < 128; i++)
+        galaxy_apps_vtable[i] = (void *)mock_method_true;
+
+    mock_user.vptr = galaxy_user_vtable;
     mock_friends.vptr = mock_vtable;
     mock_stats.vptr = mock_vtable;
     mock_utils.vptr = mock_vtable;
-    mock_apps.vptr = mock_vtable;
+    mock_apps.vptr = galaxy_apps_vtable;
     mock_storage.vptr = mock_vtable;
     mock_networking.vptr = mock_vtable;
     mock_matchmaking.vptr = mock_vtable;
@@ -397,7 +446,7 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
         GetModuleFileNameA(NULL, exename, MAX_PATH);
         fprintf(stderr, "[Galaxy64+VEH] SIGILL trap installed in PID %lu (%s)\n",
                 GetCurrentProcessId(), exename);
-        fprintf(stderr, "[Galaxy64] Mock interfaces active (User, Friends, etc. return non-NULL)\n");
+        fprintf(stderr, "[Galaxy64] Mock interfaces active: User(SignedIn=true,IsLoggedOn=true), Apps(all true)\n");
         fflush(stderr);
     }
     return TRUE;

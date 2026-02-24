@@ -326,12 +326,63 @@ static void wrapped_GetPhysicalDeviceMemoryProperties2(void* physDev, void* pPro
     if (pProps2) split_unified_heaps((uint8_t*)pProps2 + 16);
 }
 
-/* ==== GetPhysicalDeviceFeatures2 diagnostic wrapper ====
+/* ==== API Version Cap ====
+ *
+ * VK_KHR_dynamic_rendering and VK_KHR_synchronization2 have suspected FEX thunk
+ * marshaling issues. We hide them as extensions (g_hidden_extensions) and zero
+ * their features in GetPhysicalDeviceFeatures2 to force DXVK legacy paths.
+ *
+ * Note: We CANNOT cap to Vulkan 1.2 because DXVK in Proton-GE requires 1.3
+ * and refuses to start with 1.2. Keep apiVersion at the real value (1.3).
+ */
+#define TARGET_API_VERSION 0x00FFFFFF  /* effectively disabled — never lower than real */
+
+typedef void (*PFN_vkGetPhysDeviceProps)(void*, void*);
+static PFN_vkGetPhysDeviceProps real_get_phys_dev_props = NULL;
+
+static void wrapped_GetPhysicalDeviceProperties(void* physDev, void* pProps) {
+    real_get_phys_dev_props(physDev, pProps);
+    if (pProps) {
+        /* VkPhysicalDeviceProperties: apiVersion at offset 0 (uint32_t) */
+        uint32_t* apiVer = (uint32_t*)pProps;
+        uint32_t orig = *apiVer;
+        if (orig > TARGET_API_VERSION) {
+            *apiVer = TARGET_API_VERSION;
+            LOG("GetPhysDeviceProps: apiVersion capped 0x%x -> 0x%x (1.%d.%d -> 1.2.0)\n",
+                orig, TARGET_API_VERSION,
+                (orig >> 12) & 0x3FF, orig & 0xFFF);
+        }
+    }
+}
+
+typedef void (*PFN_vkGetPhysDeviceProps2)(void*, void*);
+static PFN_vkGetPhysDeviceProps2 real_get_phys_dev_props2 = NULL;
+
+static void wrapped_GetPhysicalDeviceProperties2(void* physDev, void* pProps2) {
+    real_get_phys_dev_props2(physDev, pProps2);
+    if (pProps2) {
+        /* VkPhysicalDeviceProperties2: sType(4)+pad(4)+pNext(8)+properties(...)
+         * apiVersion is at offset 16 (start of VkPhysicalDeviceProperties) */
+        uint32_t* apiVer = (uint32_t*)((uint8_t*)pProps2 + 16);
+        uint32_t orig = *apiVer;
+        if (orig > TARGET_API_VERSION) {
+            *apiVer = TARGET_API_VERSION;
+            LOG("GetPhysDeviceProps2: apiVersion capped 0x%x -> 0x%x\n",
+                orig, TARGET_API_VERSION);
+        }
+    }
+}
+
+/* ==== GetPhysicalDeviceFeatures2 wrapper ====
  *
  * DXVK sends a large pNext chain (Vulkan11/12/13 features + extensions).
  * FEX thunks need to marshal each struct. If a struct is unknown or the
  * chain is too deep, the thunk could hang or crash. This wrapper logs
- * entry/exit to detect hangs in the thunk layer. */
+ * entry/exit to detect hangs in the thunk layer.
+ *
+ * With API version capped to 1.2, DXVK shouldn't query Vulkan 1.3 features,
+ * but as a safety measure we also zero out dynamicRendering and synchronization2
+ * in VkPhysicalDeviceVulkan13Features if present in the pNext chain. */
 
 typedef void (*PFN_vkGetPhysDeviceFeatures2)(void*, void*);
 static PFN_vkGetPhysDeviceFeatures2 real_get_features2 = NULL;
@@ -1895,10 +1946,12 @@ static void trace_CmdBeginRendering(void* cmdBuf, const void* pRenderingInfo) {
     LOG("[CMD#%d] CmdBeginRendering: cb=%p %ux%u colorAtts=%u view=0x%llx img=0x%llx\n",
         op, real, w, h, colorCount,
         (unsigned long long)att0_view, (unsigned long long)att0_src_img);
-    /* Save for EndCommandBuffer RED clear diagnostic */
+    /* Save for diagnostics */
     g_last_render_image = att0_src_img;
-    g_last_render_cb = cmdBuf;  /* wrapped handle — compared at EndCommandBuffer */
+    g_last_render_cb = cmdBuf;
     real_cmd_begin_rendering(real, pRenderingInfo);
+
+    /* GREEN diagnostic removed — render pass confirmed working */
 }
 
 /* --- CmdEndRendering + RED clear diagnostic --- */
@@ -1918,75 +1971,12 @@ static void trace_CmdEndRendering(void* cmdBuf) {
         op, real, (unsigned long long)g_last_render_image);
 }
 
-/* ---- EndCommandBuffer with RED clear diagnostic ---- */
+/* ---- EndCommandBuffer ---- */
 static VkResult trace_EndCommandBuffer(void* cmdBuf) {
     void* real = unwrap(cmdBuf);
-
-    /* DIAGNOSTIC: Inject RED clear as the LAST command before EndCommandBuffer.
-     * Only for the CB that rendered to the tracked swapchain image.
-     * Image is in PRESENT_SRC_KHR after DXVK's final barrier.
-     *
-     * If headless layer reads RED → QueueSubmit2 WORKS, issue is DXVK draw cmds
-     * If headless layer reads BLACK → QueueSubmit2 doesn't execute commands */
-    static int diag_ecb_count = 0;
-    if (cmdBuf == g_last_render_cb && g_last_render_image
-        && real_cmd_pipeline_barrier_v1 && diag_ecb_count < 500) {
-
-        /* Lazily resolve CmdClearColorImage */
-        if (!real_cmd_clear_color && thunk_lib)
-            real_cmd_clear_color = (PFN_vkCmdClearColorImage)dlsym(thunk_lib, "vkCmdClearColorImage");
-
-        if (real_cmd_clear_color) {
-            diag_ecb_count++;
-            uint64_t img = g_last_render_image;
-            if (diag_ecb_count <= 5)
-                LOG("[DIAG-ECB#%d] step1: barrier PRESENT_SRC→TRANSFER_DST img=0x%llx cb=%p\n",
-                    diag_ecb_count, (unsigned long long)img, real);
-
-            /* Barrier: PRESENT_SRC_KHR(1000001002) → TRANSFER_DST(7) */
-            uint8_t imb[72];
-            memset(imb, 0, 72);
-            *(uint32_t*)(imb + 0) = 45; /* VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER */
-            *(uint32_t*)(imb + 16) = 0x400; /* srcAccess */
-            *(uint32_t*)(imb + 20) = 0x200; /* dstAccess = TRANSFER_WRITE */
-            *(uint32_t*)(imb + 24) = 1000001002; /* oldLayout = PRESENT_SRC_KHR */
-            *(uint32_t*)(imb + 28) = 7;          /* newLayout = TRANSFER_DST */
-            *(uint32_t*)(imb + 32) = 0xFFFFFFFF;
-            *(uint32_t*)(imb + 36) = 0xFFFFFFFF;
-            *(uint64_t*)(imb + 40) = img;
-            *(uint32_t*)(imb + 48) = 1;  /* COLOR */
-            *(uint32_t*)(imb + 56) = 1;  /* levelCount */
-            *(uint32_t*)(imb + 64) = 1;  /* layerCount */
-            real_cmd_pipeline_barrier_v1(real,
-                0x400, 0x1000, 0, 0, NULL, 0, NULL, 1, imb);
-            if (diag_ecb_count <= 5)
-                LOG("[DIAG-ECB#%d] step2: barrier done, clearing RED\n", diag_ecb_count);
-
-            float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
-            uint8_t range[20];
-            memset(range, 0, 20);
-            *(uint32_t*)(range + 0) = 1;   /* COLOR */
-            *(uint32_t*)(range + 8) = 1;   /* levelCount */
-            *(uint32_t*)(range + 16) = 1;  /* layerCount */
-            real_cmd_clear_color(real, img, 7, red, 1, range);
-            if (diag_ecb_count <= 5)
-                LOG("[DIAG-ECB#%d] step3: clear done, restoring PRESENT_SRC\n", diag_ecb_count);
-
-            /* Barrier: TRANSFER_DST(7) → PRESENT_SRC_KHR */
-            *(uint32_t*)(imb + 16) = 0x200;
-            *(uint32_t*)(imb + 20) = 0;
-            *(uint32_t*)(imb + 24) = 7;
-            *(uint32_t*)(imb + 28) = 1000001002;
-            real_cmd_pipeline_barrier_v1(real,
-                0x1000, 0x2000, 0, 0, NULL, 0, NULL, 1, imb);
-            if (diag_ecb_count <= 5)
-                LOG("[DIAG-ECB#%d] step4: ALL DONE — RED injected at EndCB\n", diag_ecb_count);
-        }
-    }
-
     VkResult res = real_end_cmd_buf(real);
-    LOG("[D%d] vkEndCommandBuffer: cmdBuf=%p(real=%p) result=%d diag=%d\n",
-        g_device_count, cmdBuf, real, res, diag_ecb_count);
+    LOG("[D%d] vkEndCommandBuffer: cmdBuf=%p(real=%p) result=%d\n",
+        g_device_count, cmdBuf, real, res);
     return res;
 }
 
@@ -3525,6 +3515,18 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
         LOG("GIPA: %s -> heap-split wrapper (thunk=%p, stored=%p)\n",
             pName, (void*)fn2, (void*)real_get_mem_props2);
         return real_get_mem_props2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceMemoryProperties2 : NULL;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
+        real_get_phys_dev_props = (PFN_vkGetPhysDeviceProps)real_gipa(instance, pName);
+        LOG("GIPA: vkGetPhysicalDeviceProperties -> apiVersion cap wrapper\n");
+        return real_get_phys_dev_props ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceProperties : NULL;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0) {
+        PFN_vkGetPhysDeviceProps2 fn2 = (PFN_vkGetPhysDeviceProps2)real_gipa(instance, pName);
+        if (fn2) real_get_phys_dev_props2 = fn2;
+        LOG("GIPA: %s -> apiVersion cap wrapper (thunk=%p)\n", pName, (void*)fn2);
+        return real_get_phys_dev_props2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceProperties2 : NULL;
     }
     if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0) {
         real_enum_dev_ext_props = (PFN_vkEnumDevExtProps)real_gipa(instance, pName);

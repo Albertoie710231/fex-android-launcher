@@ -590,6 +590,10 @@ DXVKEOF
             cd "$exeDir"
             export DXVK_CONFIG_FILE="$exeDir/dxvk.conf"
 
+            # Wine returns "unix\home\user\..." from GetModuleFileName. The game
+            # builds absolute paths from it that fail. This symlink makes them resolve.
+            ln -sf / "$exeDir/unix" 2>/dev/null
+
             # Create steam_appid.txt BEFORE wine launch (prevents Steam client check)
             echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
 
@@ -702,13 +706,8 @@ DXVKEOF
                 echo "=== end check ==="
             done
 
-            # Kill Wine after 3-minute monitoring window
-            if [ -d /proc/${'$'}WINE_PID ]; then
-                echo "=== Killing Wine after 3-minute timeout ==="
-                kill ${'$'}WINE_PID 2>/dev/null
-                sleep 2
-                kill -9 ${'$'}WINE_PID 2>/dev/null
-            fi
+            # Wait for Wine to exit on its own (no timeout kill)
+            echo "=== Monitoring complete, waiting for Wine to exit ==="
             wait ${'$'}WINE_PID 2>/dev/null
             WINE_EXIT=${'$'}?
             echo ""
