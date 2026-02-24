@@ -1018,8 +1018,7 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
         return r;
     }
 
-    /* Create temp copies of VkSubmitInfo2 with unwrapped cmdBuf handles.
-     * VkCommandBufferSubmitInfo structs are also copied to patch the handle. */
+    /* Create temp copies of VkSubmitInfo2 with unwrapped cmdBuf handles. */
     ICD_VkSubmitInfo2* tmp = (ICD_VkSubmitInfo2*)alloca(
         submitCount * sizeof(ICD_VkSubmitInfo2));
     ICD_VkCommandBufferSubmitInfo* cbInfos = (ICD_VkCommandBufferSubmitInfo*)alloca(
@@ -1041,16 +1040,6 @@ static VkResult wrapper_QueueSubmit2(void* queue, uint32_t submitCount,
     int sn = ++submit_count_global;
     LOG("[D%d] vkQueueSubmit2 #%d: queue=%p submits=%u cmdBufs=%u (cmd_ops_so_far=%d)\n",
         g_device_count, sn, real_queue, submitCount, total, g_cmd_op_count);
-
-    /* Log the actual CB handle order in the submit array */
-    ci = 0;
-    for (uint32_t s = 0; s < submitCount; s++) {
-        for (uint32_t c = 0; c < tmp[s].commandBufferInfoCount; c++) {
-            LOG("[D%d]   submit2 #%d CB[%u]: real=%p\n",
-                g_device_count, sn, ci, tmp[s].pCommandBufferInfos[c].commandBuffer);
-            ci++;
-        }
-    }
 
     pthread_mutex_lock(&queue_mutex);
     VkResult res = real_queue_submit2(real_queue, submitCount, tmp, fence);
@@ -1291,6 +1280,15 @@ typedef VkResult (*PFN_vkMapMemory)(void*, uint64_t, uint64_t, uint64_t, uint32_
 static PFN_vkMapMemory real_map_memory = NULL;
 typedef void (*PFN_vkUnmapMemory)(void*, uint64_t);
 static PFN_vkUnmapMemory real_unmap_memory;
+
+/* Cache coherence fix: on ARM (Vortek/Mali), HOST_COHERENT may not guarantee
+ * that GPU writes are visible to CPU without explicit invalidation.
+ * Call InvalidateMappedMemoryRanges after every successful REAL MapMemory. */
+typedef VkResult (*PFN_vkInvalidateMappedMemoryRanges)(void*, uint32_t, const void*);
+static PFN_vkInvalidateMappedMemoryRanges real_invalidate_mapped = NULL;
+typedef VkResult (*PFN_vkFlushMappedMemoryRanges)(void*, uint32_t, const void*);
+static PFN_vkFlushMappedMemoryRanges real_flush_mapped = NULL;
+
 static uint64_t g_total_mapped_bytes = 0;
 static int g_map_count = 0;
 
@@ -1359,6 +1357,14 @@ static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
         }
     }
 
+    /* Lazily resolve invalidate/flush fn ptrs via dlsym if GDPA hasn't captured them */
+    if (!real_invalidate_mapped && thunk_lib)
+        real_invalidate_mapped = (PFN_vkInvalidateMappedMemoryRanges)
+            dlsym(thunk_lib, "vkInvalidateMappedMemoryRanges");
+    if (!real_flush_mapped && thunk_lib)
+        real_flush_mapped = (PFN_vkFlushMappedMemoryRanges)
+            dlsym(thunk_lib, "vkFlushMappedMemoryRanges");
+
     VkResult res = real_map_memory(real, memory, offset, size, flags, ppData);
     /* Convert DEVICE_LOST from VA exhaustion to recoverable error */
     if (res == -4) {
@@ -1385,6 +1391,21 @@ static VkResult trace_MapMemory(void* device, uint64_t memory, uint64_t offset,
         LOG("  !!! MapMemory FAILED (result=%d) after %llu MB total mapped\n",
             res, (unsigned long long)(g_total_mapped_bytes / (1024*1024)));
     }
+
+    /* Cache coherence fix: invalidate CPU cache for newly mapped memory.
+     * On ARM/Vortek, HOST_COHERENT may not guarantee GPU→CPU visibility
+     * through FEX thunk shared memory without explicit invalidation. */
+    if (res == 0 && real_invalidate_mapped) {
+        uint8_t mmr[40]; /* VkMappedMemoryRange */
+        memset(mmr, 0, 40);
+        *(uint32_t*)(mmr + 0) = 6;       /* VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE */
+        *(uint64_t*)(mmr + 16) = memory;  /* memory */
+        *(uint64_t*)(mmr + 24) = offset;  /* offset */
+        *(uint64_t*)(mmr + 32) = size;    /* size */
+        VkResult inv = real_invalidate_mapped(real, 1, mmr);
+        (void)inv; /* ignore result — best effort */
+    }
+
     return res;
 }
 
@@ -1486,28 +1507,48 @@ static VkResult trace_BeginCommandBuffer(void* cmdBuf, const void* pBeginInfo) {
     return res;
 }
 
-/* Trace: vkEndCommandBuffer */
+/* Trace: vkEndCommandBuffer — prototype (definition after all Cmd wrappers) */
 typedef VkResult (*PFN_vkEndCmdBuf)(void*);
 static PFN_vkEndCmdBuf real_end_cmd_buf = NULL;
+static VkResult trace_EndCommandBuffer(void* cmdBuf); /* defined below */
 
-static VkResult trace_EndCommandBuffer(void* cmdBuf) {
-    void* real = unwrap(cmdBuf);
-    VkResult res = real_end_cmd_buf(real);
-    LOG("[D%d] vkEndCommandBuffer: cmdBuf=%p(real=%p) result=%d\n",
-        g_device_count, cmdBuf, real, res);
-    return res;
-}
-
-/* Trace: vkCreateImageView */
+/* Trace: vkCreateImageView — with imageView→image tracking */
 typedef VkResult (*PFN_vkCreateImageView)(void*, const void*, const void*, uint64_t*);
 static PFN_vkCreateImageView real_create_image_view = NULL;
+
+/* Track imageView→image for the last N views (ring buffer) */
+#define IV_TRACK_MAX 256
+static struct { uint64_t view; uint64_t image; } g_iv_track[IV_TRACK_MAX];
+static int g_iv_idx = 0;
+
+static uint64_t iv_lookup_image(uint64_t view) {
+    for (int i = 0; i < IV_TRACK_MAX; i++)
+        if (g_iv_track[i].view == view) return g_iv_track[i].image;
+    return 0;
+}
 
 static VkResult trace_CreateImageView(void* device, const void* pCreateInfo,
                                       const void* pAllocator, uint64_t* pView) {
     void* real = unwrap(device);
+    /* VkImageViewCreateInfo x86-64:
+     * offset 0: sType(4) pad(4)
+     * offset 8: pNext(8)
+     * offset 16: flags(4) pad(4)
+     * offset 24: image(8)
+     * offset 32: viewType(4)
+     * offset 36: format(4) */
+    uint64_t src_image = 0;
+    if (pCreateInfo)
+        src_image = *(const uint64_t*)((const char*)pCreateInfo + 24);
     VkResult res = real_create_image_view(real, pCreateInfo, pAllocator, pView);
-    LOG("[D%d] vkCreateImageView: dev=%p result=%d view=0x%llx\n",
-        g_device_count, real, res, pView ? (unsigned long long)*pView : 0);
+    if (res == 0 && pView) {
+        g_iv_track[g_iv_idx % IV_TRACK_MAX].view = *pView;
+        g_iv_track[g_iv_idx % IV_TRACK_MAX].image = src_image;
+        g_iv_idx++;
+    }
+    LOG("[D%d] vkCreateImageView: dev=%p img=0x%llx view=0x%llx result=%d\n",
+        g_device_count, real, (unsigned long long)src_image,
+        pView ? (unsigned long long)*pView : 0, res);
     return res;
 }
 
@@ -1688,6 +1729,14 @@ static void converter_CmdPipelineBarrier2(void* cmdBuf, const void* pDependencyI
     int op = ++g_cmd_op_count;
     LOG("[CMD#%d] Barrier2->v1: cb=%p src=0x%x dst=0x%x dep=0x%x mem=%u buf=%u img=%u\n",
         op, real, srcStages, dstStages, depFlags, memCount, bufCount, imgCount);
+    /* Log image barrier layout transitions (first 4) to diagnose rendering */
+    for (uint32_t i = 0; i < imgCount && i < 4; i++) {
+        uint32_t old_l = *(uint32_t*)(imgV1 + i * 72 + 24);
+        uint32_t new_l = *(uint32_t*)(imgV1 + i * 72 + 28);
+        uint64_t img_h = *(uint64_t*)(imgV1 + i * 72 + 40);
+        LOG("[CMD#%d]   img[%u] 0x%llx layout %u->%u\n",
+            op, i, (unsigned long long)img_h, old_l, new_l);
+    }
 
     real_cmd_pipeline_barrier_v1(real, srcStages, dstStages, depFlags,
         memCount, memCount ? (const void*)memV1 : NULL,
@@ -1723,9 +1772,20 @@ static void trace_CmdCopyBufferToImage(void* cmdBuf, uint64_t buffer, uint64_t i
     real_cmd_copy_buf_to_img(real, buffer, image, imageLayout, regionCount, pRegions);
 }
 
+/* Forward declarations for CmdCopyImageToBuffer + CmdEndRendering diagnostics */
+typedef void (*PFN_vkCmdClearColorImage)(void*, uint64_t, uint32_t, const void*, uint32_t, const void*);
+static PFN_vkCmdClearColorImage real_cmd_clear_color = NULL;
+static uint64_t g_last_render_image = 0;
+
 /* --- CmdCopyImageToBuffer --- */
 typedef void (*PFN_vkCmdCopyImgToBuf)(void*, uint64_t, uint32_t, uint64_t, uint32_t, const void*);
 static PFN_vkCmdCopyImgToBuf real_cmd_copy_img_to_buf = NULL;
+
+/* Diagnostic: inject CmdClearColorImage RED before CopyImageToBuffer
+ * to verify the copy pipeline works. If staging reads red, the pipeline
+ * works but DXVK renders black. If staging reads zero, pipeline is broken. */
+static int g_citb_diag_done = 0;
+static void* g_last_render_cb = NULL; /* wrapped CB handle that last called CmdBeginRendering */
 
 static void trace_CmdCopyImageToBuffer(void* cmdBuf, uint64_t image, uint32_t imageLayout,
                                          uint64_t buffer, uint32_t regionCount,
@@ -1735,12 +1795,34 @@ static void trace_CmdCopyImageToBuffer(void* cmdBuf, uint64_t image, uint32_t im
     LOG("[CMD#%d] CmdCopyImageToBuffer: cb=%p img=0x%llx layout=%u buf=0x%llx regions=%u\n",
         op, real, (unsigned long long)image, imageLayout,
         (unsigned long long)buffer, regionCount);
+
+    /* DIAGNOSTIC: fill the STAGING BUFFER directly with 0xDEADBEEF via CmdFillBuffer
+     * BEFORE the image copy. This tests whether the buffer↔memory mapping works:
+     * - If staging reads 0xDEADBEEF → buffer is connected to mapped memory, image copy writes zeros
+     * - If staging reads 0x00000000 → buffer↔memory mapping is BROKEN (GPU writes don't reach CPU map) */
+    static int citb_count = 0;
+    citb_count++;
+    if (!g_citb_diag_done) {
+        g_citb_diag_done = 1;
+        typedef void (*PFN_CmdFillBuf)(void*, uint64_t, uint64_t, uint64_t, uint32_t);
+        PFN_CmdFillBuf fn_fill = NULL;
+        if (thunk_lib)
+            fn_fill = (PFN_CmdFillBuf)dlsym(thunk_lib, "vkCmdFillBuffer");
+        if (fn_fill) {
+            LOG("[DIAG] CmdFillBuffer 0xDEADBEEF → buf=0x%llx (BEFORE copy, frame %d)\n",
+                (unsigned long long)buffer, citb_count);
+            /* Fill entire buffer with 0xDEADBEEF — this is a GPU command in the same CB */
+            fn_fill(real, buffer, 0, (uint64_t)-1, 0xDEADBEEF);
+        } else {
+            LOG("[DIAG] Could not resolve vkCmdFillBuffer!\n");
+        }
+    }
+
     real_cmd_copy_img_to_buf(real, image, imageLayout, buffer, regionCount, pRegions);
 }
 
 /* --- CmdClearColorImage --- */
-typedef void (*PFN_vkCmdClearColorImage)(void*, uint64_t, uint32_t, const void*, uint32_t, const void*);
-static PFN_vkCmdClearColorImage real_cmd_clear_color = NULL;
+/* (typedef + declaration moved to forward decl before CmdCopyImageToBuffer) */
 
 static void trace_CmdClearColorImage(void* cmdBuf, uint64_t image, uint32_t layout,
                                       const void* pColor, uint32_t rangeCount,
@@ -1800,20 +1882,112 @@ static void trace_CmdBeginRendering(void* cmdBuf, const void* pRenderingInfo) {
         pDepth = *(const void**)((const char*)pRenderingInfo + 56);
         pStencil = *(const void**)((const char*)pRenderingInfo + 64);
     }
-    LOG("[CMD#%d] CmdBeginRendering: cb=%p %ux%u layers=%u colorAtts=%u depth=%p stencil=%p flags=0x%x\n",
-        op, real, w, h, layers, colorCount, pDepth, pStencil, flags);
+    /* Extract imageView from first color attachment to trace render target.
+     * VkRenderingAttachmentInfo x86-64: offset 16 = imageView (uint64_t) */
+    uint64_t att0_view = 0, att0_src_img = 0;
+    if (colorCount > 0) {
+        const char* pColorAtts = *(const char**)((const char*)pRenderingInfo + 48);
+        if (pColorAtts) {
+            att0_view = *(const uint64_t*)(pColorAtts + 16);
+            att0_src_img = iv_lookup_image(att0_view);
+        }
+    }
+    LOG("[CMD#%d] CmdBeginRendering: cb=%p %ux%u colorAtts=%u view=0x%llx img=0x%llx\n",
+        op, real, w, h, colorCount,
+        (unsigned long long)att0_view, (unsigned long long)att0_src_img);
+    /* Save for EndCommandBuffer RED clear diagnostic */
+    g_last_render_image = att0_src_img;
+    g_last_render_cb = cmdBuf;  /* wrapped handle — compared at EndCommandBuffer */
     real_cmd_begin_rendering(real, pRenderingInfo);
 }
 
-/* --- CmdEndRendering --- */
+/* --- CmdEndRendering + RED clear diagnostic --- */
 typedef void (*PFN_vkCmdEndRendering)(void*);
 static PFN_vkCmdEndRendering real_cmd_end_rendering = NULL;
 
 static void trace_CmdEndRendering(void* cmdBuf) {
     void* real = unwrap(cmdBuf);
-    int op = ++g_cmd_op_count;
-    LOG("[CMD#%d] CmdEndRendering: cb=%p\n", op, real);
     real_cmd_end_rendering(real);
+
+    /* Lazily resolve CmdClearColorImage if not yet available */
+    if (!real_cmd_clear_color && thunk_lib)
+        real_cmd_clear_color = (PFN_vkCmdClearColorImage)dlsym(thunk_lib, "vkCmdClearColorImage");
+
+    int op = ++g_cmd_op_count;
+    LOG("[CMD#%d] CmdEndRendering: cb=%p img=0x%llx\n",
+        op, real, (unsigned long long)g_last_render_image);
+}
+
+/* ---- EndCommandBuffer with RED clear diagnostic ---- */
+static VkResult trace_EndCommandBuffer(void* cmdBuf) {
+    void* real = unwrap(cmdBuf);
+
+    /* DIAGNOSTIC: Inject RED clear as the LAST command before EndCommandBuffer.
+     * Only for the CB that rendered to the tracked swapchain image.
+     * Image is in PRESENT_SRC_KHR after DXVK's final barrier.
+     *
+     * If headless layer reads RED → QueueSubmit2 WORKS, issue is DXVK draw cmds
+     * If headless layer reads BLACK → QueueSubmit2 doesn't execute commands */
+    static int diag_ecb_count = 0;
+    if (cmdBuf == g_last_render_cb && g_last_render_image
+        && real_cmd_pipeline_barrier_v1 && diag_ecb_count < 500) {
+
+        /* Lazily resolve CmdClearColorImage */
+        if (!real_cmd_clear_color && thunk_lib)
+            real_cmd_clear_color = (PFN_vkCmdClearColorImage)dlsym(thunk_lib, "vkCmdClearColorImage");
+
+        if (real_cmd_clear_color) {
+            diag_ecb_count++;
+            uint64_t img = g_last_render_image;
+            if (diag_ecb_count <= 5)
+                LOG("[DIAG-ECB#%d] step1: barrier PRESENT_SRC→TRANSFER_DST img=0x%llx cb=%p\n",
+                    diag_ecb_count, (unsigned long long)img, real);
+
+            /* Barrier: PRESENT_SRC_KHR(1000001002) → TRANSFER_DST(7) */
+            uint8_t imb[72];
+            memset(imb, 0, 72);
+            *(uint32_t*)(imb + 0) = 45; /* VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER */
+            *(uint32_t*)(imb + 16) = 0x400; /* srcAccess */
+            *(uint32_t*)(imb + 20) = 0x200; /* dstAccess = TRANSFER_WRITE */
+            *(uint32_t*)(imb + 24) = 1000001002; /* oldLayout = PRESENT_SRC_KHR */
+            *(uint32_t*)(imb + 28) = 7;          /* newLayout = TRANSFER_DST */
+            *(uint32_t*)(imb + 32) = 0xFFFFFFFF;
+            *(uint32_t*)(imb + 36) = 0xFFFFFFFF;
+            *(uint64_t*)(imb + 40) = img;
+            *(uint32_t*)(imb + 48) = 1;  /* COLOR */
+            *(uint32_t*)(imb + 56) = 1;  /* levelCount */
+            *(uint32_t*)(imb + 64) = 1;  /* layerCount */
+            real_cmd_pipeline_barrier_v1(real,
+                0x400, 0x1000, 0, 0, NULL, 0, NULL, 1, imb);
+            if (diag_ecb_count <= 5)
+                LOG("[DIAG-ECB#%d] step2: barrier done, clearing RED\n", diag_ecb_count);
+
+            float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+            uint8_t range[20];
+            memset(range, 0, 20);
+            *(uint32_t*)(range + 0) = 1;   /* COLOR */
+            *(uint32_t*)(range + 8) = 1;   /* levelCount */
+            *(uint32_t*)(range + 16) = 1;  /* layerCount */
+            real_cmd_clear_color(real, img, 7, red, 1, range);
+            if (diag_ecb_count <= 5)
+                LOG("[DIAG-ECB#%d] step3: clear done, restoring PRESENT_SRC\n", diag_ecb_count);
+
+            /* Barrier: TRANSFER_DST(7) → PRESENT_SRC_KHR */
+            *(uint32_t*)(imb + 16) = 0x200;
+            *(uint32_t*)(imb + 20) = 0;
+            *(uint32_t*)(imb + 24) = 7;
+            *(uint32_t*)(imb + 28) = 1000001002;
+            real_cmd_pipeline_barrier_v1(real,
+                0x1000, 0x2000, 0, 0, NULL, 0, NULL, 1, imb);
+            if (diag_ecb_count <= 5)
+                LOG("[DIAG-ECB#%d] step4: ALL DONE — RED injected at EndCB\n", diag_ecb_count);
+        }
+    }
+
+    VkResult res = real_end_cmd_buf(real);
+    LOG("[D%d] vkEndCommandBuffer: cmdBuf=%p(real=%p) result=%d diag=%d\n",
+        g_device_count, cmdBuf, real, res, diag_ecb_count);
+    return res;
 }
 
 /* --- CmdBindPipeline --- */
@@ -3010,6 +3184,15 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
     if (strcmp(pName, "vkUnmapMemory") == 0) {
         real_unmap_memory = (PFN_vkUnmapMemory)fn;
         return (PFN_vkVoidFunction)trace_UnmapMemory;
+    }
+    /* Capture Invalidate/Flush for cache coherence fix */
+    if (strcmp(pName, "vkInvalidateMappedMemoryRanges") == 0) {
+        real_invalidate_mapped = (PFN_vkInvalidateMappedMemoryRanges)fn;
+        return make_unwrap_trampoline(fn);
+    }
+    if (strcmp(pName, "vkFlushMappedMemoryRanges") == 0) {
+        real_flush_mapped = (PFN_vkFlushMappedMemoryRanges)fn;
+        return make_unwrap_trampoline(fn);
     }
     if (strcmp(pName, "vkBindBufferMemory") == 0) {
         real_bind_buf_mem = (PFN_vkBindBufferMemory)fn;
