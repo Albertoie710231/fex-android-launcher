@@ -518,10 +518,45 @@ typedef void (*PFN_GetFeatures)(VkPhysicalDevice, VkPhysicalDeviceFeatures*);
 typedef void (*PFN_GetFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
 typedef void (*PFN_GetFormatProps)(VkPhysicalDevice, int, VkFormatProperties*);
 typedef void (*PFN_GetFormatProps2)(VkPhysicalDevice, int, VkFormatProperties2*);
+
+/* vkGetPhysicalDeviceImageFormatProperties2 — DXVK uses THIS to validate BC textures */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 1000059004
+#define VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 1000059003
+#define VK_ERROR_FORMAT_NOT_SUPPORTED (-11)
+
+typedef struct VkExtent3D { uint32_t width; uint32_t height; uint32_t depth; } VkExtent3D;
+
+typedef struct VkPhysicalDeviceImageFormatInfo2 {
+    int sType;
+    const void* pNext;
+    int format;         /* VkFormat */
+    int type;           /* VkImageType */
+    int tiling;         /* VkImageTiling */
+    uint32_t usage;     /* VkImageUsageFlags */
+    uint32_t flags;     /* VkImageCreateFlags */
+} VkPhysicalDeviceImageFormatInfo2;
+
+typedef struct VkImageFormatProperties {
+    VkExtent3D maxExtent;
+    uint32_t maxMipLevels;
+    uint32_t maxArrayLayers;
+    uint32_t sampleCounts;  /* VkSampleCountFlags */
+    VkDeviceSize maxResourceSize;
+} VkImageFormatProperties;
+
+typedef struct VkImageFormatProperties2 {
+    int sType;
+    void* pNext;
+    VkImageFormatProperties imageFormatProperties;
+} VkImageFormatProperties2;
+
+typedef VkResult (*PFN_GetImageFormatProps2)(VkPhysicalDevice, const VkPhysicalDeviceImageFormatInfo2*, VkImageFormatProperties2*);
+
 static PFN_GetFeatures g_real_get_features = NULL;
 static PFN_GetFeatures2 g_real_get_features2 = NULL;
 static PFN_GetFormatProps g_real_get_format_props = NULL;
 static PFN_GetFormatProps2 g_real_get_format_props2 = NULL;
+static PFN_GetImageFormatProps2 g_real_get_image_format_props2 = NULL;
 
 /* Logging */
 #define LOG_TAG "[HeadlessLayer] "
@@ -892,27 +927,27 @@ static VkResult headless_GetPhysicalDeviceProperties(
 }
 
 /* ============================================================================
- * Section 7c: Physical Device Feature & Format Passthrough (diagnostic only)
+ * Section 7c: Physical Device Feature Passthrough
  *
- * NO SPOOFING — report the GPU's real capabilities so DXVK can degrade
- * gracefully instead of creating pipelines/shaders the GPU can't handle.
+ * textureCompressionBC MUST stay TRUE — DXVK rejects adapters without it.
+ * Mali doesn't truly support BC, but Vortek reports BC=1. We keep it as-is.
  * ============================================================================ */
 
 static void headless_GetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures* pFeatures)
 {
-    LOG(">>> GetPhysicalDeviceFeatures CALLED pd=%p pF=%p g_real=%p\n",
-        physicalDevice, pFeatures, (void*)g_real_get_features);
-
     if (g_real_get_features)
         g_real_get_features(physicalDevice, pFeatures);
-    else
-        LOG("!!! GetPhysicalDeviceFeatures: g_real_get_features is NULL!\n");
 
     if (pFeatures) {
-        LOG("    [REAL] textureCompressionBC=%d vertexPipelineStoresAndAtomics=%d\n",
-            pFeatures->textureCompressionBC, pFeatures->vertexPipelineStoresAndAtomics);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "GetFeatures v1: BC=%d ETC2=%d ASTC=%d",
+            pFeatures->textureCompressionBC,
+            pFeatures->textureCompressionETC2,
+            pFeatures->textureCompressionASTC_LDR);
+        layer_marker(buf);
     }
 }
 
@@ -920,55 +955,151 @@ static void headless_GetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures2* pFeatures)
 {
-    LOG(">>> GetPhysicalDeviceFeatures2 CALLED pd=%p pF=%p g_real=%p\n",
-        physicalDevice, pFeatures, (void*)g_real_get_features2);
-
     if (g_real_get_features2) {
         g_real_get_features2(physicalDevice, pFeatures);
-    } else {
-        LOG("!!! GetPhysicalDeviceFeatures2: g_real_get_features2 is NULL!\n");
     }
 
-    /* NO SPOOFING — just log what the GPU really reports */
     if (pFeatures) {
-        LOG("    [REAL] textureCompressionBC=%d vertexPipelineStoresAndAtomics=%d\n",
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "GetFeatures v2: BC=%d ETC2=%d ASTC=%d",
             pFeatures->features.textureCompressionBC,
-            pFeatures->features.vertexPipelineStoresAndAtomics);
-
-        /* Log ALL sTypes in pNext chain so we can see what DXVK queries */
-        {
-            typedef struct { int sType; void* pNext; } BaseS;
-            BaseS* s = (BaseS*)pFeatures->pNext;
-            int idx = 0;
-            while (s) {
-                LOG("  pNext[%d] sType=%d (0x%x)\n", idx, s->sType, s->sType);
-                s = (BaseS*)s->pNext;
-                idx++;
-            }
-            LOG("  pNext chain total: %d structs\n", idx);
-        }
+            pFeatures->features.textureCompressionETC2,
+            pFeatures->features.textureCompressionASTC_LDR);
+        layer_marker(buf);
     }
-    LOG(">>> GetPhysicalDeviceFeatures2 COMPLETE\n");
 }
+
+/* BC format range: VK_FORMAT_BC1_RGB_UNORM_BLOCK(131) through VK_FORMAT_BC7_SRGB_BLOCK(146) */
+#define IS_BC_FORMAT(f) ((f) >= 131 && (f) <= 146)
+
+/* Standard features for BC compressed textures (optimal tiling):
+ * SAMPLED_IMAGE(0x1) | BLIT_SRC(0x400) | FILTER_LINEAR(0x1000) |
+ * TRANSFER_SRC(0x4000) | TRANSFER_DST(0x8000) */
+#define BC_OPTIMAL_FEATS 0xD401
+
+static int g_fmt_v1_calls = 0;
 
 static void headless_GetPhysicalDeviceFormatProperties(
     VkPhysicalDevice physicalDevice,
     int format,
     VkFormatProperties* pFormatProperties)
 {
-    /* Pure passthrough — no format spoofing */
+    g_fmt_v1_calls++;
+
     if (g_real_get_format_props)
         g_real_get_format_props(physicalDevice, format, pFormatProperties);
+
+    /* FEX thunks may not forward BC format properties correctly.
+     * If textureCompressionBC=1 but format query returns 0, inject features. */
+    if (pFormatProperties && IS_BC_FORMAT(format)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "FmtProps v1: fmt=%d optimal=0x%x",
+                 format, pFormatProperties->optimalTilingFeatures);
+        layer_marker(buf);
+        if (pFormatProperties->optimalTilingFeatures == 0) {
+            pFormatProperties->optimalTilingFeatures = BC_OPTIMAL_FEATS;
+            snprintf(buf, sizeof(buf), "FmtProps v1: fmt=%d INJECTED 0x%x", format, BC_OPTIMAL_FEATS);
+            layer_marker(buf);
+        }
+    }
+
+    /* Log all calls */
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "FmtProps v1 call #%d fmt=%d", g_fmt_v1_calls, format);
+        layer_marker(buf);
+    }
 }
+
+static int g_fmt_v2_calls = 0;
 
 static void headless_GetPhysicalDeviceFormatProperties2(
     VkPhysicalDevice physicalDevice,
     int format,
     VkFormatProperties2* pFormatProperties)
 {
-    /* Pure passthrough — no format spoofing */
+    g_fmt_v2_calls++;
+
     if (g_real_get_format_props2)
         g_real_get_format_props2(physicalDevice, format, pFormatProperties);
+
+    if (pFormatProperties && IS_BC_FORMAT(format)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "FmtProps v2: fmt=%d optimal=0x%x",
+                 format, pFormatProperties->formatProperties.optimalTilingFeatures);
+        layer_marker(buf);
+        if (pFormatProperties->formatProperties.optimalTilingFeatures == 0) {
+            pFormatProperties->formatProperties.optimalTilingFeatures = BC_OPTIMAL_FEATS;
+            snprintf(buf, sizeof(buf), "FmtProps v2: fmt=%d INJECTED 0x%x", format, BC_OPTIMAL_FEATS);
+            layer_marker(buf);
+        }
+    }
+
+    /* Log all calls */
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "FmtProps v2 call #%d fmt=%d", g_fmt_v2_calls, format);
+        layer_marker(buf);
+    }
+}
+
+/* ============================================================================
+ * Section 7d: vkGetPhysicalDeviceImageFormatProperties2 — BC format injection
+ *
+ * DXVK uses THIS (not vkGetPhysicalDeviceFormatProperties2) to validate
+ * texture creation. If the ICD returns VK_ERROR_FORMAT_NOT_SUPPORTED for
+ * BC formats, inject a successful result so DXVK proceeds to vkCreateImage,
+ * where Vortek's BCn decompression converts BC→RGBA on the fly.
+ * ============================================================================ */
+
+static int g_img_fmt_calls = 0;
+
+static VkResult headless_GetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice physicalDevice,
+    const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo,
+    VkImageFormatProperties2* pImageFormatProperties)
+{
+    g_img_fmt_calls++;
+    int format = pImageFormatInfo ? pImageFormatInfo->format : -1;
+    int is_bc = IS_BC_FORMAT(format);
+
+    VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (g_real_get_image_format_props2)
+        result = g_real_get_image_format_props2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
+
+    /* Log BC queries and first few non-BC */
+    if (is_bc || g_img_fmt_calls <= 5) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "ImgFmtProps2 #%d: fmt=%d type=%d tiling=%d usage=0x%x result=%d%s",
+            g_img_fmt_calls, format,
+            pImageFormatInfo ? pImageFormatInfo->type : -1,
+            pImageFormatInfo ? pImageFormatInfo->tiling : -1,
+            pImageFormatInfo ? pImageFormatInfo->usage : 0,
+            result, is_bc ? " [BC]" : "");
+        layer_marker(buf);
+    }
+
+    /* If BC format failed, inject valid limits so DXVK proceeds to vkCreateImage
+     * where Vortek's BCn decompressor handles the actual BC→RGBA conversion */
+    if (is_bc && result == VK_ERROR_FORMAT_NOT_SUPPORTED && pImageFormatProperties) {
+        pImageFormatProperties->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        pImageFormatProperties->imageFormatProperties.maxExtent.width  = 16384;
+        pImageFormatProperties->imageFormatProperties.maxExtent.height = 16384;
+        pImageFormatProperties->imageFormatProperties.maxExtent.depth  = 1;
+        pImageFormatProperties->imageFormatProperties.maxMipLevels     = 15;
+        pImageFormatProperties->imageFormatProperties.maxArrayLayers   = 2048;
+        pImageFormatProperties->imageFormatProperties.sampleCounts     = VK_SAMPLE_COUNT_1_BIT;
+        pImageFormatProperties->imageFormatProperties.maxResourceSize  = (VkDeviceSize)1 << 31;
+        result = VK_SUCCESS;
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), "ImgFmtProps2: fmt=%d BC INJECTED success", format);
+        layer_marker(buf);
+    }
+
+    return result;
 }
 
 /* ============================================================================
@@ -1924,6 +2055,16 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                             center_off, px[center_off], px[center_off+1],
                             px[center_off+2], px[center_off+3]);
 
+                        /* Force alpha=255 — DXVK doesn't write swapchain alpha
+                         * (irrelevant on desktop), but our readback captures it
+                         * as transparent. Set every 4th byte to 0xFF. */
+                        {
+                            uint8_t *dst = (uint8_t *)mapped;
+                            uint32_t npx = sc->width * sc->height;
+                            for (uint32_t i = 0; i < npx; i++)
+                                dst[i * 4 + 3] = 0xFF;
+                        }
+
                         if (g_dump_mode) {
                             /* Dump mode: write PPM files, skip TCP */
                             if (g_dump_frame_count < g_dump_max_frames) {
@@ -2297,9 +2438,13 @@ static VkResult headless_CreateInstance(
         g_real_get_format_props2 = (PFN_GetFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2");
         if (!g_real_get_format_props2)
             g_real_get_format_props2 = (PFN_GetFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2KHR");
-        LOG("BC spoof: features=%p features2=%p fmtprops=%p fmtprops2=%p\n",
+        g_real_get_image_format_props2 = (PFN_GetImageFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceImageFormatProperties2");
+        if (!g_real_get_image_format_props2)
+            g_real_get_image_format_props2 = (PFN_GetImageFormatProps2)next_gipa(*pInstance, "vkGetPhysicalDeviceImageFormatProperties2KHR");
+        LOG("BC spoof: features=%p features2=%p fmtprops=%p fmtprops2=%p imgfmtprops2=%p\n",
             (void*)g_real_get_features, (void*)g_real_get_features2,
-            (void*)g_real_get_format_props, (void*)g_real_get_format_props2);
+            (void*)g_real_get_format_props, (void*)g_real_get_format_props2,
+            (void*)g_real_get_image_format_props2);
 
         LOG("Instance created: %p (instance #%d)\n", *pInstance, g_instance_count);
         char buf[256];
@@ -2336,6 +2481,7 @@ static void headless_DestroyInstance(VkInstance instance, const VkAllocationCall
     g_real_get_features2 = NULL;
     g_real_get_format_props = NULL;
     g_real_get_format_props2 = NULL;
+    g_real_get_image_format_props2 = NULL;
     g_instance_count--;
 }
 
@@ -2547,6 +2693,9 @@ static PFN_vkVoidFunction headless_GetPhysicalDeviceProcAddr(VkInstance instance
     if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
         strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceImageFormatProperties2;
 
     /* Surface queries (physical device level) */
     if (strcmp(pName, "vkGetPhysicalDeviceXcbPresentationSupportKHR") == 0)
@@ -2660,6 +2809,9 @@ static PFN_vkVoidFunction headless_GetInstanceProcAddr(VkInstance instance, cons
     if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
         strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
         return (PFN_vkVoidFunction)headless_GetPhysicalDeviceFormatProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)headless_GetPhysicalDeviceImageFormatProperties2;
 
     /* Forward everything else */
     if (g_next_gipa) {

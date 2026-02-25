@@ -209,7 +209,7 @@ static void ensure_init(void) {
 
 #define STAGING_HEAP_CAP (512ULL * 1024 * 1024)  /* 512 MiB — generous; real limit is Vortek/Mali, not memory */
 #define MAP_BYTE_LIMIT  (512ULL * 1024 * 1024)  /* 512 MiB — no artificial limit */
-#define ALLOC_BYTE_CAP  (512ULL * 1024 * 1024)  /* 512 MiB — no artificial limit */
+#define ALLOC_BYTE_CAP  (2048ULL * 1024 * 1024)  /* 2 GiB — BC→RGBA 4x memory increase */
 
 /* Tracks the virtual type we added so other wrappers can patch accordingly */
 static int g_added_type_index = -1;    /* index of added DEVICE_LOCAL-only type, -1 if none */
@@ -324,6 +324,131 @@ static PFN_vkGetPhysDeviceMemProps2 real_get_mem_props2 = NULL;
 static void wrapped_GetPhysicalDeviceMemoryProperties2(void* physDev, void* pProps2) {
     real_get_mem_props2(physDev, pProps2);
     if (pProps2) split_unified_heaps((uint8_t*)pProps2 + 16);
+}
+
+/* ==== vkGetPhysicalDeviceFormatProperties wrapper ====
+ *
+ * FEX thunks may not correctly forward VkFormatProperties for all formats.
+ * BC (Block Compression) formats are critical for DXVK game rendering.
+ * If textureCompressionBC=1 is reported but format properties return 0,
+ * we inject the standard BC format features so DXVK can create textures. */
+
+typedef void (*PFN_vkGetPhysDeviceFormatProps)(void*, uint32_t, void*);
+static PFN_vkGetPhysDeviceFormatProps real_get_format_props = NULL;
+
+/* VkFormatFeatureFlagBits */
+#define MY_VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT          0x0001
+#define MY_VK_FORMAT_FEATURE_BLIT_SRC_BIT               0x0400
+#define MY_VK_FORMAT_FEATURE_TRANSFER_SRC_BIT           0x4000
+#define MY_VK_FORMAT_FEATURE_TRANSFER_DST_BIT           0x8000
+#define MY_VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT 0x1000
+
+/* Standard features for BC compressed textures (optimal tiling) */
+#define BC_OPTIMAL_FEATURES (MY_VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | \
+                             MY_VK_FORMAT_FEATURE_BLIT_SRC_BIT | \
+                             MY_VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | \
+                             MY_VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | \
+                             MY_VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+
+/* BC format range: VK_FORMAT_BC1_RGB_UNORM_BLOCK(131) through VK_FORMAT_BC7_SRGB_BLOCK(146) */
+static int is_bc_format(uint32_t format) {
+    return format >= 131 && format <= 146;
+}
+
+/* BC→RGBA format substitution: Mali doesn't support BC formats.
+ * Map BC formats to uncompressed equivalents so vkCreateImage succeeds.
+ * SRGB variants: 132, 134, 136, 138, 146 → R8G8B8A8_SRGB (43)
+ * UNORM variants: everything else → R8G8B8A8_UNORM (37) */
+static uint32_t bc_to_rgba_format(uint32_t bc_fmt) {
+    switch (bc_fmt) {
+        case 132: case 134: case 136: case 138: case 146:
+            return 43; /* VK_FORMAT_R8G8B8A8_SRGB */
+        default:
+            return 37; /* VK_FORMAT_R8G8B8A8_UNORM */
+    }
+}
+
+/* Track BC-substituted images: image handle → original BC format */
+#define BC_IMG_MAX 4096
+static struct {
+    uint64_t image;
+    uint32_t bc_format;
+    uint32_t rgba_format;
+} g_bc_images[BC_IMG_MAX];
+static int g_bc_img_count = 0;
+
+static void bc_img_track(uint64_t image, uint32_t bc_fmt, uint32_t rgba_fmt) {
+    if (g_bc_img_count < BC_IMG_MAX) {
+        g_bc_images[g_bc_img_count].image = image;
+        g_bc_images[g_bc_img_count].bc_format = bc_fmt;
+        g_bc_images[g_bc_img_count].rgba_format = rgba_fmt;
+        g_bc_img_count++;
+    }
+}
+
+static int bc_img_lookup(uint64_t image) {
+    for (int i = 0; i < g_bc_img_count; i++)
+        if (g_bc_images[i].image == image)
+            return i;
+    return -1;
+}
+
+static int fmt_prop_call_count = 0;
+
+static void wrapped_GetPhysicalDeviceFormatProperties(void* physDev, uint32_t format, void* pProps) {
+    fmt_prop_call_count++;
+    if (fmt_prop_call_count <= 5 || is_bc_format(format)) {
+        LOG("FormatProperties CALLED #%d: fmt=%u pd=%p pProps=%p\n",
+            fmt_prop_call_count, format, physDev, pProps);
+    }
+
+    if (real_get_format_props) {
+        real_get_format_props(physDev, format, pProps);
+    }
+
+    if (pProps && is_bc_format(format)) {
+        /* VkFormatProperties: { linearTilingFeatures(4), optimalTilingFeatures(4), bufferFeatures(4) } */
+        uint32_t* linear  = (uint32_t*)((uint8_t*)pProps + 0);
+        uint32_t* optimal = (uint32_t*)((uint8_t*)pProps + 4);
+        uint32_t* buffer  = (uint32_t*)((uint8_t*)pProps + 8);
+
+        LOG("FormatProperties: fmt=%u (BC) linear=0x%x optimal=0x%x buf=0x%x\n",
+            format, *linear, *optimal, *buffer);
+        if (*optimal == 0) {
+            LOG("FormatProperties: fmt=%u -> INJECTING optimal=0x%x\n",
+                format, BC_OPTIMAL_FEATURES);
+            *optimal = BC_OPTIMAL_FEATURES;
+        }
+    }
+}
+
+/* vkGetPhysicalDeviceFormatProperties2 wrapper */
+typedef void (*PFN_vkGetPhysDeviceFormatProps2)(void*, uint32_t, void*);
+static PFN_vkGetPhysDeviceFormatProps2 real_get_format_props2 = NULL;
+
+static int fmt_prop2_call_count = 0;
+
+static void wrapped_GetPhysicalDeviceFormatProperties2(void* physDev, uint32_t format, void* pProps) {
+    fmt_prop2_call_count++;
+    if (fmt_prop2_call_count <= 5 || is_bc_format(format)) {
+        LOG("FormatProperties2 CALLED #%d: fmt=%u pd=%p\n",
+            fmt_prop2_call_count, format, physDev);
+    }
+
+    if (real_get_format_props2) {
+        real_get_format_props2(physDev, format, pProps);
+    }
+
+    /* VkFormatProperties2: sType(4)+pad(4)+pNext(8)+formatProperties(12) */
+    if (pProps && is_bc_format(format)) {
+        uint32_t* optimal = (uint32_t*)((uint8_t*)pProps + 20);
+        LOG("FormatProperties2: fmt=%u (BC) optimal=0x%x\n", format, *optimal);
+        if (*optimal == 0) {
+            LOG("FormatProperties2: fmt=%u -> INJECTING optimal=0x%x\n",
+                format, BC_OPTIMAL_FEATURES);
+            *optimal = BC_OPTIMAL_FEATURES;
+        }
+    }
 }
 
 /* ==== API Version Cap ====
@@ -1186,10 +1311,10 @@ static VkResult trace_AllocateMemory(void* device, const void* pAllocInfo,
     }
 
     /* Pre-flight: reject staging allocations that would exceed ALLOC_BYTE_CAP.
-     * At ~215MB staging, Mali's internal mmap fails and kills CreateImage.
-     * By capping at 210MB we leave ~5-10MB VA headroom for images/metadata.
+     * Use mem_type (original, before remap) so that virtual DEVICE_LOCAL-only
+     * type (g_added_type_index) is NOT capped — it's for the large texture heap.
      * DXVK handles -1 by retrying smaller chunk sizes (16→8→4→2→1 MB). */
-    if (is_staging_type(real_type) && g_staging_alloc_total + alloc_size > ALLOC_BYTE_CAP) {
+    if (is_staging_type(mem_type) && g_staging_alloc_total + alloc_size > ALLOC_BYTE_CAP) {
         LOG("[D%d] vkAllocateMemory: CAPPED type=%u size=%llu staging=%llu MB (cap=%llu MB) -> OOM\n",
             g_device_count, mem_type, (unsigned long long)alloc_size,
             (unsigned long long)(g_staging_alloc_total / (1024*1024)),
@@ -1289,7 +1414,30 @@ static VkResult trace_CreateImage(void* device, const void* pCreateInfo,
         tiling = *(const uint32_t*)((const char*)pCreateInfo + 52);
         usage = *(const uint32_t*)((const char*)pCreateInfo + 56);
     }
-    VkResult res = real_create_image(real, pCreateInfo, pAllocator, pImage);
+
+    /* BC format substitution: Mali doesn't support BC, substitute with RGBA.
+     * Create a mutable copy of the create info and change the format. */
+    char ci_copy[128]; /* VkImageCreateInfo is ~72 bytes on x86-64, 128 is safe */
+    const void* actual_ci = pCreateInfo;
+    uint32_t rgba_fmt = 0;
+    if (pCreateInfo && is_bc_format(fmt)) {
+        rgba_fmt = bc_to_rgba_format(fmt);
+        memcpy(ci_copy, pCreateInfo, 72); /* copy enough for VkImageCreateInfo base */
+        /* Preserve pNext chain: it's at offset 8, already copied */
+        *(uint32_t*)(ci_copy + 24) = rgba_fmt;  /* substitute format */
+        actual_ci = ci_copy;
+    }
+
+    VkResult res = real_create_image(real, actual_ci, pAllocator, pImage);
+
+    /* Track BC-substituted images */
+    if (res == 0 && rgba_fmt && pImage) {
+        bc_img_track(*pImage, fmt, rgba_fmt);
+        LOG("[D%d] vkCreateImage: BC SUBST fmt=%u->%u %ux%u result=0 img=0x%llx\n",
+            g_device_count, fmt, rgba_fmt, w, h, (unsigned long long)*pImage);
+        return res;
+    }
+
     /* Convert DEVICE_LOST: query fault info, then return recoverable error */
     if (res == -4) {
         LOG("[D%d] vkCreateImage: DEVICE_LOST! fmt=%u %ux%u tiling=%u usage=0x%x\n",
@@ -1587,19 +1735,42 @@ static VkResult trace_CreateImageView(void* device, const void* pCreateInfo,
      * offset 16: flags(4) pad(4)
      * offset 24: image(8)
      * offset 32: viewType(4)
-     * offset 36: format(4) */
+     * offset 36: format(4)
+     * offset 40: components (4x4=16 bytes)
+     * offset 56: subresourceRange (5x4=20 bytes) */
     uint64_t src_image = 0;
-    if (pCreateInfo)
+    uint32_t view_fmt = 0;
+    if (pCreateInfo) {
         src_image = *(const uint64_t*)((const char*)pCreateInfo + 24);
-    VkResult res = real_create_image_view(real, pCreateInfo, pAllocator, pView);
+        view_fmt = *(const uint32_t*)((const char*)pCreateInfo + 36);
+    }
+
+    /* If this image was BC-substituted, fix the view format too */
+    char ivci_copy[80];
+    const void* actual_ci = pCreateInfo;
+    int bc_idx = bc_img_lookup(src_image);
+    if (bc_idx >= 0 && pCreateInfo && is_bc_format(view_fmt)) {
+        memcpy(ivci_copy, pCreateInfo, 76); /* VkImageViewCreateInfo is ~76 bytes */
+        *(uint32_t*)(ivci_copy + 36) = g_bc_images[bc_idx].rgba_format;
+        actual_ci = ivci_copy;
+    }
+
+    VkResult res = real_create_image_view(real, actual_ci, pAllocator, pView);
     if (res == 0 && pView) {
         g_iv_track[g_iv_idx % IV_TRACK_MAX].view = *pView;
         g_iv_track[g_iv_idx % IV_TRACK_MAX].image = src_image;
         g_iv_idx++;
     }
-    LOG("[D%d] vkCreateImageView: dev=%p img=0x%llx view=0x%llx result=%d\n",
-        g_device_count, real, (unsigned long long)src_image,
-        pView ? (unsigned long long)*pView : 0, res);
+    if (bc_idx >= 0) {
+        LOG("[D%d] vkCreateImageView: BC img=0x%llx fmt=%u->%u view=0x%llx result=%d\n",
+            g_device_count, (unsigned long long)src_image, view_fmt,
+            g_bc_images[bc_idx].rgba_format,
+            pView ? (unsigned long long)*pView : 0, res);
+    } else {
+        LOG("[D%d] vkCreateImageView: dev=%p img=0x%llx view=0x%llx result=%d\n",
+            g_device_count, real, (unsigned long long)src_image,
+            pView ? (unsigned long long)*pView : 0, res);
+    }
     return res;
 }
 
@@ -1817,10 +1988,62 @@ static void trace_CmdCopyBufferToImage(void* cmdBuf, uint64_t buffer, uint64_t i
                                          const void* pRegions) {
     void* real = unwrap(cmdBuf);
     int op = ++g_cmd_op_count;
+
+    /* Skip copy for BC-substituted images: the buffer contains BC-compressed data
+     * but the image is now RGBA. Direct copy would read past buffer bounds → crash.
+     * Textures will be uninitialized (black) until we add BC7 decoding. */
+    int bc_idx = bc_img_lookup(image);
+    if (bc_idx >= 0) {
+        static int bc_skip_count = 0;
+        bc_skip_count++;
+        if (bc_skip_count <= 5) {
+            LOG("[CMD#%d] CmdCopyBufferToImage: SKIP BC img=0x%llx (bc_fmt=%u, #%d)\n",
+                op, (unsigned long long)image, g_bc_images[bc_idx].bc_format, bc_skip_count);
+        }
+        return; /* skip the copy */
+    }
+
     LOG("[CMD#%d] CmdCopyBufferToImage: cb=%p buf=0x%llx img=0x%llx layout=%u regions=%u\n",
         op, real, (unsigned long long)buffer, (unsigned long long)image,
         imageLayout, regionCount);
     real_cmd_copy_buf_to_img(real, buffer, image, imageLayout, regionCount, pRegions);
+}
+
+/* --- CmdCopyBufferToImage2 (Vulkan 1.3 / KHR) --- */
+/* VkCopyBufferToImageInfo2 layout (x86-64):
+ *   offset 0:  sType (uint32_t) + pad
+ *   offset 8:  pNext (pointer)
+ *   offset 16: srcBuffer (uint64_t)
+ *   offset 24: dstImage (uint64_t)
+ *   offset 32: dstImageLayout (uint32_t)
+ *   offset 36: regionCount (uint32_t)
+ *   offset 40: pRegions (pointer)
+ */
+typedef void (*PFN_vkCmdCopyBufToImg2)(void*, const void*);
+static PFN_vkCmdCopyBufToImg2 real_cmd_copy_buf_to_img2 = NULL;
+
+static void trace_CmdCopyBufferToImage2(void* cmdBuf, const void* pCopyInfo) {
+    void* real = unwrap(cmdBuf);
+    int op = ++g_cmd_op_count;
+
+    uint64_t dst_image = 0;
+    if (pCopyInfo)
+        dst_image = *(const uint64_t*)((const char*)pCopyInfo + 24);
+
+    int bc_idx = bc_img_lookup(dst_image);
+    if (bc_idx >= 0) {
+        static int bc_skip_count2 = 0;
+        bc_skip_count2++;
+        if (bc_skip_count2 <= 10) {
+            LOG("[CMD#%d] CmdCopyBufferToImage2: SKIP BC img=0x%llx (bc_fmt=%u, #%d)\n",
+                op, (unsigned long long)dst_image, g_bc_images[bc_idx].bc_format, bc_skip_count2);
+        }
+        return; /* skip — BC data can't be copied into RGBA image */
+    }
+
+    LOG("[CMD#%d] CmdCopyBufferToImage2: cb=%p img=0x%llx\n",
+        op, real, (unsigned long long)dst_image);
+    real_cmd_copy_buf_to_img2(real, pCopyInfo);
 }
 
 /* Forward declarations for CmdCopyImageToBuffer + CmdEndRendering diagnostics */
@@ -3282,6 +3505,15 @@ static PFN_vkVoidFunction wrapped_GDPA(void* device, const char* pName) {
         real_cmd_copy_buf_to_img = (PFN_vkCmdCopyBufToImg)fn;
         return (PFN_vkVoidFunction)trace_CmdCopyBufferToImage;
     }
+    /* DISABLED: CopyBufferToImage2 intercept — investigating if it kills HUD rendering.
+     * BC data flows through as garbage for now. */
+    /*
+    if (strcmp(pName, "vkCmdCopyBufferToImage2") == 0 ||
+        strcmp(pName, "vkCmdCopyBufferToImage2KHR") == 0) {
+        real_cmd_copy_buf_to_img2 = (PFN_vkCmdCopyBufToImg2)fn;
+        return (PFN_vkVoidFunction)trace_CmdCopyBufferToImage2;
+    }
+    */
     if (strcmp(pName, "vkCmdCopyImageToBuffer") == 0) {
         real_cmd_copy_img_to_buf = (PFN_vkCmdCopyImgToBuf)fn;
         return (PFN_vkVoidFunction)trace_CmdCopyImageToBuffer;
@@ -3503,6 +3735,18 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
         LOG("GIPA: vkGetDeviceProcAddr -> wrapped_GDPA\n");
         return (PFN_vkVoidFunction)wrapped_GDPA;
     }
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0) {
+        real_get_format_props = (PFN_vkGetPhysDeviceFormatProps)real_gipa(instance, pName);
+        LOG("GIPA: vkGetPhysicalDeviceFormatProperties -> BC format wrapper\n");
+        return real_get_format_props ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFormatProperties : NULL;
+    }
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0) {
+        PFN_vkGetPhysDeviceFormatProps2 fn2 = (PFN_vkGetPhysDeviceFormatProps2)real_gipa(instance, pName);
+        if (fn2) real_get_format_props2 = fn2;
+        LOG("GIPA: %s -> BC format wrapper (thunk=%p)\n", pName, (void*)fn2);
+        return real_get_format_props2 ? (PFN_vkVoidFunction)wrapped_GetPhysicalDeviceFormatProperties2 : NULL;
+    }
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0) {
         real_get_mem_props = (PFN_vkGetPhysDeviceMemProps)real_gipa(instance, pName);
         LOG("GIPA: vkGetPhysicalDeviceMemoryProperties -> heap-split wrapper\n");
@@ -3547,6 +3791,29 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
 
 __attribute__((visibility("default")))
 void* vk_icdGetPhysicalDeviceProcAddr(void *instance, const char *pName) {
-    (void)instance; (void)pName;
+    if (!pName) return NULL;
+
+    /* Return our wrappers for physical device functions we intercept.
+     * The loader uses GPDPA as primary dispatch for phys-dev functions.
+     * Returning NULL here would skip our GIPA wrappers. */
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+    if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0)
+        return (void*)vk_icdGetInstanceProcAddr(instance, pName);
+
     return NULL;
 }
