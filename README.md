@@ -1,309 +1,256 @@
-# FEX Android Launcher
+# Steam Launcher for Android (MediaTek)
 
-Run x86-64 Linux applications on Android with Vulkan GPU passthrough at 120 FPS.
-
-An Android app that uses [FEX-Emu](https://github.com/FEX-Emu/FEX) for x86-64 emulation and [Vortek](https://github.com/brunodev85/winlator) for Vulkan IPC passthrough to the ARM Mali GPU. Tested on MediaTek Dimensity 9300+ with Mali-G720-Immortalis MC12.
-
-## What Works
-
-- **Full x86-64 emulation** via FEX-Emu (Ubuntu 22.04 rootfs)
-- **Vulkan GPU passthrough** — x86-64 Vulkan calls → FEX thunks → Vortek → Mali GPU
-- **Live display at 120 FPS** — 1:1 frame delivery via non-blocking TCP streaming
-- **vulkaninfo** detects Vortek (Mali-G720-Immortalis MC12), Vulkan 1.3.128
-- **vkcube** renders the LunarG spinning cube with correct colors at 118 FPS
-- **dpkg/apt** work inside the FEX rootfs (overlay filesystem fixes applied)
-- **Interactive terminal** with Display/Terminal toggle for Vulkan output
+Run Windows/Steam games on Android via x86-64 emulation with GPU-accelerated Vulkan.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                   Android App (Kotlin)                        │
-├──────────────────────────────────────────────────────────────┤
-│  TerminalActivity              │  ContainerManager            │
-│  - Interactive FEX terminal    │  - Rootfs download & setup   │
-│  - Display/Terminal toggle     │  - Config.json, ICD JSON     │
-│  - SurfaceView (120Hz)         │  - Auto-refresh stale paths  │
-├──────────────────────────────────────────────────────────────┤
-│              Frame Display Pipeline (118 FPS)                 │
-│  ┌──────────────────────────────────────────────────────────┐│
-│  │ FrameSocketServer                                        ││
-│  │  - TCP 19850 receiver (non-blocking sender)              ││
-│  │  - Direct lockHardwareCanvas rendering (no Choreographer)││
-│  │  - R↔B color swizzle via GPU ColorMatrix                 ││
-│  │  - 1:1 frame delivery (recv = display = 118 FPS)         ││
-│  └──────────────────────────────────────────────────────────┘│
-├──────────────────────────────────────────────────────────────┤
-│              Vortek Renderer (Android-side)                   │
-│  ┌──────────────────────────────────────────────────────────┐│
-│  │ VortekRendererComponent (libvortekrenderer.so)           ││
-│  │  - Receives Vulkan commands via Unix socket              ││
-│  │  - Executes on Mali GPU (/vendor/lib64/hw/vulkan.mali)   ││
-│  └──────────────────────────────────────────────────────────┘│
-├──────────────────────────────────────────────────────────────┤
-│              FEX-Emu (x86-64 emulation, no PRoot)            │
-│  ┌──────────────────────────────────────────────────────────┐│
-│  │ FEXLoader (ARM64 native, invoked via ld.so wrapper)      ││
-│  │  ├── x86-64 rootfs (Ubuntu 22.04)                        ││
-│  │  ├── Vulkan ICD loader → vortek_icd_wrapper.so           ││
-│  │  │   └── Calls vortekInitOnce() + maps vk→vt_call_*     ││
-│  │  ├── FEX thunks (guest x86-64 ↔ host ARM64 Vulkan)      ││
-│  │  └── LD_PRELOAD headless wrapper (frame capture)         ││
-│  └──────────────────────────────────────────────────────────┘│
-├──────────────────────────────────────────────────────────────┤
-│              Mali-G720-Immortalis MC12 (Vulkan 1.3.128)      │
-└──────────────────────────────────────────────────────────────┘
+Windows Game (.exe)
+  → Wine/Proton-GE 10-30 (Windows compatibility layer)
+    → DXVK 2.6+ (DirectX 11 → Vulkan translation)
+      → winevulkan (Wine's Vulkan dispatch)
+        → x86-64 Ubuntu Vulkan loader (v1.3.204)
+          → Implicit Layer: VK_LAYER_HEADLESS_surface (surfaces, swapchain, frame capture)
+            → ICD: fex_thunk_icd.so (x86-64 shim, feature spoofing, handle wrapping)
+              → FEX-Emu thunks (x86-64 → ARM64 bridge)
+                → Vortek (glibc↔Bionic IPC, Vulkan command serialization)
+                  → Mali-G720 Immortalis MC12 GPU
 ```
 
-### Vulkan Pipeline (Full Chain)
+### Display Pipeline
 
-```
-x86-64 app (vkcube)
-    │  LD_PRELOAD: libvulkan_headless.so (fake swapchain + frame capture)
-    ↓
-FEX thunks (x86-64 guest → ARM64 host Vulkan calls)
-    ↓
-Vulkan ICD loader (libvulkan.so.1 → libvulkan_loader.so)
-    ↓
-vortek_icd_wrapper.so (vortekInitOnce + vk→vt_call_ mapping)
-    ↓
-libvulkan_vortek.so (serializes Vulkan → Unix socket + ashmem)
-    ↓
-VortekRendererComponent (deserializes → Mali GPU)
-    ↓
-Mali-G720 GPU (renders frames)
-    ↓
-headless wrapper: vkMapMemory → TCP 19850 (non-blocking, frame dropping)
-    ↓
-FrameSocketServer → lockHardwareCanvas → SurfaceView (120Hz)
-```
+Two separate pipelines work together for Wine/DXVK games:
 
-## Requirements
+| Pipeline | Purpose | Transport | Renderer |
+|----------|---------|-----------|----------|
+| **Vulkan/3D** | Game frames (DXVK) | Headless layer → TCP 19850 | FrameSocketServer → SurfaceView |
+| **X11** | Window management, input, 2D | libXlorie (ARM64 native) → abstract socket | LorieView |
 
-- Android device with:
-  - ARM64 SoC with Mali GPU (tested on MediaTek Dimensity 9300+)
-  - Vulkan 1.1+ support
-  - 8GB+ RAM recommended
-  - Android 8.0+ (API 26+)
-- Build tools:
-  - Android Studio with SDK 34, NDK, CMake 3.22.1+
-  - Docker (for cross-compiling x86-64 headless wrapper)
+### Dual-Loader Architecture
+
+Vulkan thunks are **disabled** for Wine (`"Vulkan": 0` in thunks.json). This forces Wine's
+`dlopen("libvulkan.so.1")` to load the real x86-64 Ubuntu Vulkan loader (not the FEX thunk
+overlay). The x86-64 loader supports `VK_KHR_xlib_surface` (compiled-in), which the ARM64
+host loader filters out at compile time (`wsi_unsupported_instance_extension()` in
+`Vulkan-Loader/loader/wsi.c`). No environment variable can bypass this ARM64 filter.
+
+## What Works
+
+- **Full x86-64 emulation** via FEX-Emu (FEX-2601, Ubuntu 22.04 rootfs)
+- **Vulkan GPU passthrough** — vkcube at 118 FPS via FEX thunks → Vortek → Mali
+- **32-bit Vulkan** — verified via test_vulkan32 (4 extensions)
+- **Wine/Proton-GE 10-30** — boots with 15+ processes, services running
+- **Wine Vulkan test** — all 7 stages pass (including multi-threaded ACB)
+- **DXVK initialization** — device creation, pipeline compilation, 55k+ queue submits
+- **Game rendering on-screen** — Ys IX menu visible at ~10 FPS (FEX emulation speed)
+- **Frame capture pipeline** — headless layer → TCP → FrameSocketServer → SurfaceView
+- **X11 windowing** — libXlorie handles text overlays, 2D UI, input
+- **Live display** — 1:1 frame delivery via lockHardwareCanvas, R↔B swizzle, alpha=255 fix
+- **dpkg/apt** inside rootfs (overlay filesystem + linkat fallback)
+- **Interactive terminal** with Display/Terminal toggle
+
+## Current Status: Exploded Vertices
+
+The game menu (Ys IX) renders with scattered/exploded white triangles. Text overlays
+render correctly (2D path works). 3D mesh geometry has wrong vertex positions.
+
+**Ruled out** (tested, no improvement):
+- BC format substitution vs passthrough — identical result either way
+- Dynamic rendering (Vulkan 1.3) — DXVK hard-requires it
+- Maintenance5 / inline shaders — DXVK hard-requires it
+- Vulkan 1.2 API cap — breaks DXVK entirely
+
+**Likely causes**:
+- robustness2 spoofing (OOB reads returning garbage instead of 0 on Mali)
+- Vertex/index buffer handle unwrapping in Cmd intercepts
+- Push constant or descriptor set data corruption through thunk/IPC chain
+- Vortek vertex input format handling
+
+## Components
+
+### Android App (Kotlin)
+
+| File | Role |
+|------|------|
+| `FexExecutor.kt` | ld.so wrapper, FEXServer lifecycle, FEX config env vars |
+| `ContainerManager.kt` | Rootfs download/setup, ICD JSON, headless layer deploy |
+| `ProtonManager.kt` | Proton-GE download/extract, Wine env, DXVK config, game launch |
+| `TerminalActivity.kt` | VortekRenderer, FrameSocketServer, X11Server (libXlorie) |
+| `FrameSocketServer.kt` | TCP frame receiver, R↔B swizzle, alpha=255 fix, direct rendering |
+
+### x86-64 Vulkan Components
+
+| File | Role |
+|------|------|
+| `fex-emu/fex_thunk_icd.c` | ICD shim: handle wrappers, barrier v2→v1, feature spoofing, inline shader fixup, BC passthrough, cmd tracing |
+| `app/src/main/assets/vulkan_headless_layer.c` | Implicit layer: surfaces, swapchain, frame capture → TCP 19850 |
+| `fex-emu/test_wine_vulkan.c` | 7-stage Wine Vulkan pipeline validation test |
+
+### Native Libraries (ARM64, in `jniLibs/arm64-v8a/`)
+
+| Library | Role |
+|---------|------|
+| `libvortekrenderer.so` | Vortek server: receives serialized Vulkan, executes on Mali GPU |
+| `libvulkan_vortek.so` | Vortek ICD client: serializes Vulkan commands to Unix socket |
+| `libvulkan_loader.so` | glibc ARM64 Vulkan ICD loader (host-side thunk path) |
+| `libvulkan-host.so` | FEX host Vulkan thunk (ARM64, for DT_NEEDED intercept path) |
+| `libFEX.so` | FEX-Emu x86-64 emulator (custom build FEX-2601) |
+| `libXlorie.so` | Termux:X11 native X server |
 
 ## Building
 
-```bash
-# Build the APK
-./gradlew assembleDebug
+### ICD (fex_thunk_icd.so)
 
-# Install on device
+```bash
+cd fex-emu
+x86_64-linux-gnu-gcc -shared -fPIC -O2 \
+    -o fex_thunk_icd.so fex_thunk_icd.c \
+    -ldl -lpthread -Wl,-soname,libfex_thunk_icd.so
+cp fex_thunk_icd.so ../app/src/main/assets/libfex_thunk_icd.so
+cp fex_thunk_icd.so ../app/src/main/assets/libfex_thunk_icd_x86_64.so
+```
+
+### Headless Layer
+
+```bash
+# Must use Ubuntu 22.04 toolchain (glibc ≤2.35)
+docker run --rm -v "$(pwd)/app/src/main/assets:/work" ubuntu:22.04 bash -c "
+    apt-get update -qq &&
+    apt-get install -y -qq gcc-x86-64-linux-gnu > /dev/null 2>&1 &&
+    x86_64-linux-gnu-gcc -shared -fPIC -O2 \
+        -o /work/libvulkan_headless_layer_x86_64.so \
+        /work/vulkan_headless_layer.c \
+        -ldl -lpthread
+"
+```
+
+### APK
+
+```bash
+./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### Cross-compile Scripts (Docker)
+## ICD Feature Summary (fex_thunk_icd.c)
 
+### Handle Wrappers
+16-byte struct: offset 0 = loader dispatch (harmless writes by loader), offset 8 = real
+Vortek handle (immutable, write-once). Replaces dispatch-swapping trampolines that had
+race conditions with Wine's multi-threaded dispatch. All Cmd functions unwrap via
+`mov rdi,[rdi+8]; jmp real_fn` trampolines.
+
+### Feature Spoofing
+| Feature | Real | Spoofed | Why |
+|---------|------|---------|-----|
+| `robustBufferAccess2` | 0 | 1 | DXVK hard-requires for adapter selection |
+| `robustImageAccess2` | 0 | 1 | DXVK hard-requires for adapter selection |
+| `nullDescriptor` | 0 | 1 | DXVK requires for unbound descriptors |
+| `maintenance5` | 0 | 1 | DXVK uses inline shaders (ICD converts to real VkShaderModule) |
+| `vertexPipelineStoresAndAtomics` | 0 | 1 | DXVK requires; stripped from CreateDevice |
+| `logicOp` | 1 | 1 | Spoofed in features, stripped from CreateDevice, patched in pipelines |
+
+### Extension Manipulation
+| Action | Extension | Why |
+|--------|-----------|-----|
+| **Inject** | VK_EXT_robustness2 | Mali doesn't advertise; DXVK requires |
+| **Inject** | VK_KHR_maintenance5 | Enables inline shader path in DXVK |
+| **Inject** | VK_KHR_pipeline_library | DXVK pipeline compilation |
+| **Hide** | VK_KHR_dynamic_rendering | Available via Vulkan 1.3 core; hiding avoids double-expose |
+| **Hide** | VK_KHR_synchronization2 | Same — available via 1.3 core |
+
+### Pipeline Fixups
+- **Inline shader conversion**: DXVK embeds `VkShaderModuleCreateInfo` inline in pipeline
+  stages when maintenance5 is available. ICD creates real `VkShaderModule` objects and strips
+  `VkPipelineCreateFlags2CreateInfoKHR` from pNext.
+- **CmdPipelineBarrier2→v1**: DXVK uses v2 (Vulkan 1.3); FEX thunks only support v1. ICD
+  converts barrier structs on the fly.
+- **QueueSubmit2 handle unwrapping**: Unwraps queue + command buffer HandleWrappers.
+- **BC format passthrough**: Vortek handles BCn textures natively.
+
+### Virtual Heap Split
+Mali reports a single large DEVICE_LOCAL heap. ICD splits into:
+- **Heap 0**: Textures (original size, DEVICE_LOCAL)
+- **Heap 2**: Staging (512 MB, HOST_VISIBLE + HOST_COHERENT)
+- **Type 4**: DEVICE_LOCAL-only (no HOST_VISIBLE) for texture allocations
+
+### DXVK Dual Device Pattern
+DXVK creates D1 (feature level 11_1 probe, destroyed) then D2 (real rendering). The ICD
+shares a single real VkDevice across both CreateDevice calls (refcounted), avoiding
+DEVICE_LOST from dual-device HOST state corruption.
+
+## Debugging
+
+### ICD Debug Log
 ```bash
-# Headless Vulkan wrapper (x86-64 .so, deployed to rootfs)
-fex-emu/build_vulkan_headless.sh
-
-# Vulkan ICD loader (ARM64 glibc)
-fex-emu/build_vulkan_loader.sh
-
-# Vortek ICD wrapper (ARM64 glibc)
-fex-emu/build_vortek_wrapper.sh
-
-# FEX-Emu with thunks
-fex-emu/build_fex_thunks.sh
+adb shell "run-as com.mediatek.steamlauncher cat files/fex-rootfs/Ubuntu_22_04/tmp/icd_debug.txt"
 ```
+
+### Logcat
+```bash
+adb logcat -s FrameSocketServer VortekRenderer fex_thunk_icd
+```
+
+### Running FEX Commands via adb
+FEXServer must be running (launch app first). See `gotchas.md` for the full template.
+
+## Key Technical Challenges Solved
+
+| Challenge | Solution |
+|-----------|----------|
+| Android seccomp blocks FEX syscalls | Binary-patch glibc `svc #0` → `movn x0, #37` + SIGSYS handler |
+| Vortek ICD not standard-compliant | `vortek_icd_wrapper.so` calls `vortekInitOnce()` |
+| ARM64 loader filters xlib surface | Disable Vulkan thunks for Wine; use x86-64 loader |
+| LD_PRELOAD blocked by AT_SECURE | Deploy as Vulkan implicit layer instead |
+| FEX child processes lose config | Set FEX_ROOTFS/FEX_THUNK* env vars |
+| Dispatch trampoline races | HandleWrapper (16-byte struct) with immutable real_handle |
+| Black frames (zero alpha) | Force alpha=255 in FrameSocketServer before rendering |
+| DEVICE_LOST from shared device | Refcounted single VkDevice, reject second CreateDevice |
+| Xvnc/Xvfb crash in FEX | Use libXlorie (ARM64 native X11 server) |
+| Stale paths after APK install | `refreshNativeLibPaths()` auto-updates on launch |
 
 ## First Run Setup
 
 1. Launch the app and grant permissions
-2. Click **"Setup Container"** — downloads and extracts:
-   - FEX ARM64 binaries from bundled `fex-bin.tgz`
-   - x86-64 SquashFS rootfs (~995MB) from `rootfs.fex-emu.gg`
-   - Configures FEX (Config.json, thunks, Vortek ICD)
-3. Open **Terminal** and test:
-   ```
-   uname -a    # Should show x86_64
-   vulkaninfo --summary    # Should show Vortek (Mali-G720)
-   ```
-4. Run vkcube with display:
-   ```
-   export LD_PRELOAD=/usr/lib/libvulkan_headless.so DISPLAY=:0; vkcube
-   ```
-   Press **Display** button to see the live rendering
-
-## Key Technical Challenges Solved
-
-### Android Seccomp Blocking FEX Syscalls
-Android's seccomp filter kills processes using blocked syscalls. Two-layer fix:
-- **Layer 1**: Binary-patch glibc to replace `svc #0` with `movn x0, #37` for uncatchable `SECCOMP_RET_KILL`
-- **Layer 2**: SIGSYS handler in FEXCore redirects catchable syscalls (`accept→accept4`, `openat2→openat`)
-
-### Vortek ICD Not Standard-Compliant
-Winlator's `libvulkan_vortek.so` returns NULL from `vk_icdGetInstanceProcAddr` because `vortekInitOnce()` is never called during standard ICD loader protocol. Fix: `vortek_icd_wrapper.so` — thin wrapper that calls `vortekInitOnce()` and maps `vk→vt_call_*`.
-
-### FEX Rootfs Overlay Fallback Bug
-FEX's FileManager tried raw host paths when overlay operations failed, returning wrong errno on Android (e.g., `ENOENT` instead of `EEXIST`). Fix: return overlay result directly when path resolves, don't fall through.
-
-### Hard Links Blocked by SELinux
-Android SELinux blocks `linkat` in app data dirs. dpkg needs backup links. Fix: `LinkatWithCopyFallback` — tries `linkat`, falls back to `sendfile` copy on `EPERM`.
-
-### Stale Paths After APK Reinstall
-Every `adb install` changes `nativeLibDir` (random hash), breaking 3 paths. Fix: `refreshNativeLibPaths()` auto-updates Config.json, libvulkan.so.1 symlink, and ICD JSON on every launch.
-
-### Frame Streaming Optimization
-Evolved through multiple iterations:
-1. **Choreographer + double-buffer** → 50 FPS display (missed vsync deadlines)
-2. **Blocking TCP** → throttled vkcube to 65-90 FPS (variable, caused visual "acceleration")
-3. **Non-blocking TCP + vsync emulation + direct rendering** → 118 FPS 1:1 delivery (current)
-
-## Android 12+ Phantom Process Fix
-
-```bash
-adb shell "settings put global settings_enable_monitor_phantom_procs false"
-adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent"
-adb shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647"
-```
+2. Click **"Setup Container"** — downloads rootfs (~995MB) + configures FEX
+3. Open **Terminal** and test: `uname -a` (should show x86_64)
+4. For Vulkan test: `export DISPLAY=:0; vkcube` then press **Display** button
 
 ## Project Structure
 
 ```
 app/src/main/
 ├── java/com/mediatek/steamlauncher/
-│   ├── SteamLauncherApp.kt         # Application class, path helpers
-│   ├── MainActivity.kt             # Main launcher UI
-│   ├── TerminalActivity.kt         # Terminal + Display toggle, 120Hz, Vortek setup
-│   ├── GameActivity.kt             # Game launcher
-│   ├── SettingsActivity.kt         # Settings & diagnostics
-│   ├── SteamService.kt             # Foreground service (keeps FEX alive)
-│   ├── ContainerManager.kt         # Rootfs setup, Config.json, refreshNativeLibPaths()
-│   ├── FexExecutor.kt              # ld.so wrapper, FEXServer lifecycle, env setup
-│   ├── FrameSocketServer.kt        # TCP frame receiver, direct lockHardwareCanvas render
-│   ├── FramebufferBridge.kt        # HardwareBuffer → Surface blitting
-│   ├── VortekRenderer.kt           # Vortek component wrapper
-│   ├── VortekSurfaceView.kt        # Vortek rendering surface
-│   ├── VulkanBridge.kt             # Vulkan/Vortek ICD setup
-│   ├── X11Server.kt                # X11 server lifecycle
-│   ├── X11SocketHelper.kt          # Unix socket helper
-│   └── X11SocketServer.kt          # X11 socket server
-├── assets/
-│   ├── vulkan_headless.c           # x86-64 headless Vulkan wrapper (LD_PRELOAD)
-│   ├── libvulkan_headless.so       # Compiled headless wrapper
-│   ├── fex-bin.tgz                 # FEX ARM64 binaries + glibc 2.38
-│   └── libvulkan_vortek.so         # Container Vulkan ICD (from Winlator)
-├── jniLibs/arm64-v8a/
-│   ├── libFEX*.so                  # FEX binaries (in nativeLibDir for SELinux exec)
-│   ├── libvortekrenderer.so        # Android Vulkan executor
-│   ├── libvortek_icd_wrapper.so    # ICD wrapper (vortekInitOnce + vk→vt_call_)
-│   ├── libvulkan_loader.so         # Cross-compiled Vulkan ICD loader
-│   ├── libhook_impl.so             # Mali driver hook
+│   ├── TerminalActivity.kt         # Terminal + Display, Vortek, X11
+│   ├── ContainerManager.kt         # Rootfs setup, ICD/layer deploy
+│   ├── FexExecutor.kt              # FEX invocation, env vars
+│   ├── ProtonManager.kt            # Wine/Proton, DXVK config
+│   ├── FrameSocketServer.kt        # TCP frame receiver, rendering
 │   └── ...
-├── cpp/
-│   ├── CMakeLists.txt              # NDK build (includes unsquashfs)
-│   ├── steamlauncher.cpp           # JNI bridge
-│   ├── framebuffer_bridge.cpp      # HardwareBuffer JNI
-│   ├── x11_socket.cpp              # Unix socket JNI
-│   └── vendor/                     # squashfs-tools & xz-utils source
-└── res/layout/                     # UI layouts
+├── assets/
+│   ├── vulkan_headless_layer.c     # x86-64 headless layer source
+│   ├── libfex_thunk_icd.so         # x86-64 ICD shim
+│   └── ...
+├── jniLibs/arm64-v8a/              # ARM64 native libs (SELinux exec)
+└── cpp/                            # NDK build (unsquashfs, JNI)
 
 fex-emu/
-├── build_vulkan_headless.sh        # Cross-compile headless wrapper
-├── build_vulkan_loader.sh          # Cross-compile Vulkan ICD loader
-├── build_vortek_wrapper.sh         # Cross-compile vortek_icd_wrapper.so
-├── build_fex_thunks.sh             # Full FEX build with thunks
-├── vortek_icd_wrapper.c            # ICD wrapper source
-└── ...
-
-scripts/
-├── patch_glibc_seccomp.py          # Binary-patch glibc for seccomp bypass
-├── patch_vortek_socket_path.py     # Binary-patch Vortek socket path + RUNPATH
-└── fetch_unsquashfs_source.sh      # Downloads vendor source for NDK build
+├── fex_thunk_icd.c                 # ICD shim source (main Vulkan interception)
+├── test_wine_vulkan.c              # 7-stage Wine Vulkan test
+├── build_fex_thunks.sh             # Docker FEX build
+└── Vulkan-Loader/                  # Loader source (reference)
 ```
 
-## Device Tested
+## Device
 
-- Samsung tablet, MediaTek Dimensity 9300+ (MT6989)
-- GPU: Mali-G720-Immortalis MC12
-- Android 14
-- 120Hz display
-
-## Testing FEX via ADB
-
-```bash
-# Quick version check
-adb shell run-as com.mediatek.steamlauncher env \
-  LD_LIBRARY_PATH=/data/data/com.mediatek.steamlauncher/files/fex/lib \
-  /data/data/com.mediatek.steamlauncher/files/fex/bin/FEXLoader --version
-# Expected: FEX-Emu (FEX-2506)
-```
-
-For detailed testing, push a script (multiline `sh -c` breaks over ADB):
-
-```bash
-cat > /tmp/fex_test.sh << 'EOF'
-#!/system/bin/sh
-FEXDIR=/data/data/com.mediatek.steamlauncher/files/fex
-TMPDIR=/data/data/com.mediatek.steamlauncher/files/tmp
-HOME=/data/data/com.mediatek.steamlauncher/files/fex-home
-export TMPDIR HOME USE_HEAP=1 FEX_DISABLETELEMETRY=1
-export LD_LIBRARY_PATH=$FEXDIR/lib:$FEXDIR/lib/aarch64-linux-gnu
-unset LD_PRELOAD BOOTCLASSPATH ANDROID_ART_ROOT ANDROID_I18N_ROOT
-unset ANDROID_TZDATA_ROOT COLORTERM DEX2OATBOOTCLASSPATH ANDROID_DATA
-
-$FEXDIR/bin/FEXServer -f -p 300 &
-sleep 3
-
-echo "=== FEXLoader version ==="
-$FEXDIR/bin/FEXLoader --version
-
-echo "=== uname ==="
-$FEXDIR/bin/FEXLoader -- /bin/uname -a
-
-echo "=== os-release ==="
-$FEXDIR/bin/FEXLoader -- /bin/bash -c "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; head -4 /etc/os-release"
-EOF
-
-adb push /tmp/fex_test.sh /data/local/tmp/fex_test.sh
-adb shell run-as com.mediatek.steamlauncher sh /data/local/tmp/fex_test.sh
-```
-
-## Technical Notes
-
-### FEXLoader Invocation on Android
-
-FEX binaries are stored in `jniLibs/arm64-v8a/` (installed to `nativeLibDir`) for SELinux exec permission. They are invoked via the bundled `ld-linux-aarch64.so.1`:
-
-```bash
-ld.so --library-path <nativeLibDir>:<fexDir>/lib libFEX.so /bin/bash -c "command"
-```
-
-`LD_LIBRARY_PATH` must be set explicitly — RPATH alone isn't sufficient on Android's dynamic linker.
-
-### Vortek IPC Architecture
-
-Vortek solves the fundamental problem that Android's Vulkan driver (`vulkan.mali.so`) uses Bionic libc, but container apps use glibc. You cannot load a Bionic library from glibc code.
-
-**Solution:** Serialize Vulkan API calls in the container, send via Unix socket + ashmem ring buffers (4MB commands, 256KB results), deserialize and execute in the Android process.
-
-### Socket Access in FEX
-
-FEX redirects `/tmp` to rootfs `/tmp/`. Symlinks bridge Vortek and X11 sockets:
-
-```
-${fexRootfsDir}/tmp/.vortek/V0 → ${actualTmpDir}/.vortek/V0
-${fexRootfsDir}/tmp/.X11-unix/X0 → ${actualX11SocketDir}/X0
-```
-
-### NDK-built unsquashfs
-
-`unsquashfs` is compiled from squashfs-tools 4.6.1 source via Android NDK as part of the APK build (packaged as `libunsquashfs.so`). Sources are downloaded by `scripts/fetch_unsquashfs_source.sh` into `app/src/main/cpp/vendor/`.
+- Samsung tablet, MediaTek Dimensity 9300+ (MT6989), Android 14
+- GPU: Mali-G720-Immortalis MC12 (Vulkan 1.3.128)
+- Package: `com.mediatek.steamlauncher`
 
 ## Credits
 
-- [FEX-Emu](https://github.com/FEX-Emu/FEX) — x86-64 emulation (custom FEX-2506 build)
+- [FEX-Emu](https://github.com/FEX-Emu/FEX) — x86-64 emulation (custom FEX-2601 build)
 - [Winlator](https://github.com/brunodev85/winlator) — Vortek Vulkan IPC passthrough
-- [Termux:X11](https://github.com/termux/termux-x11) — X11 server inspiration
+- [Termux:X11](https://github.com/termux/termux-x11) — X11 server (libXlorie)
 
 ## License
 
