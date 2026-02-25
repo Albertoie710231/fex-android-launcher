@@ -987,84 +987,64 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
         fprintf(stderr, "[steam_api64] SteamAPI_Init() will return true with mock interfaces\n");
         fflush(stderr);
 
-        /* === FILE ACCESS DIAGNOSTIC === */
+        /* === FIX CWD ===
+         * Wine can't map FEX's virtual CWD (/home/user/...) to Z: drive
+         * because z: readlink returns HOST rootfs path. GetModuleFileName
+         * returns "unix\home\user\...\ys9.exe". Convert to Z: path and
+         * SetCurrentDirectory so relative file access works. */
         {
-            char cwd[MAX_PATH];
-            GetCurrentDirectoryA(MAX_PATH, cwd);
-            fprintf(stderr, "[steam_api64] CWD: %s\n", cwd);
-
-            /* Derive exe directory */
             char exedir[MAX_PATH];
             strncpy(exedir, exename, MAX_PATH);
+            exedir[MAX_PATH-1] = '\0';
             char *lastslash = strrchr(exedir, '\\');
             if (!lastslash) lastslash = strrchr(exedir, '/');
             if (lastslash) *lastslash = '\0';
+
+            char old_cwd[MAX_PATH];
+            GetCurrentDirectoryA(MAX_PATH, old_cwd);
+            fprintf(stderr, "[steam_api64] Original CWD: %s\n", old_cwd);
             fprintf(stderr, "[steam_api64] EXE dir: %s\n", exedir);
 
-            /* Test 1: relative path from CWD */
-            HANDLE h1 = CreateFileA("text\\item.tbb", GENERIC_READ, FILE_SHARE_READ,
-                                     NULL, OPEN_EXISTING, 0, NULL);
-            fprintf(stderr, "[steam_api64] CreateFileA(\"text\\item.tbb\"): %s (err=%lu)\n",
-                    h1 != INVALID_HANDLE_VALUE ? "OK" : "FAILED", GetLastError());
-            if (h1 != INVALID_HANDLE_VALUE) {
-                DWORD sz = GetFileSize(h1, NULL);
-                unsigned char hdr[8] = {0};
-                DWORD rd = 0;
-                ReadFile(h1, hdr, 8, &rd, NULL);
-                fprintf(stderr, "[steam_api64]   size=%lu header=%.8s\n", sz, (char*)hdr);
-                CloseHandle(h1);
+            char fixed_cwd[MAX_PATH];
+            int need_fix = 0;
+
+            /* Check for "unix\..." or "unix/..." prefix */
+            if ((strncmp(exedir, "unix\\", 5) == 0) || (strncmp(exedir, "unix/", 5) == 0)) {
+                snprintf(fixed_cwd, MAX_PATH, "Z:\\%s", exedir + 5);
+                need_fix = 1;
+            }
+            /* Check for "\\?\unix\..." prefix */
+            else if (strncmp(exedir, "\\\\?\\unix\\", 9) == 0) {
+                snprintf(fixed_cwd, MAX_PATH, "Z:\\%s", exedir + 9);
+                need_fix = 1;
             }
 
-            /* Test 2: absolute path from exe directory */
-            char fullpath[MAX_PATH];
-            snprintf(fullpath, MAX_PATH, "%s\\text\\item.tbb", exedir);
-            HANDLE h2 = CreateFileA(fullpath, GENERIC_READ, FILE_SHARE_READ,
-                                     NULL, OPEN_EXISTING, 0, NULL);
-            fprintf(stderr, "[steam_api64] CreateFileA(\"%s\"): %s (err=%lu)\n",
-                    fullpath, h2 != INVALID_HANDLE_VALUE ? "OK" : "FAILED", GetLastError());
-            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+            if (need_fix) {
+                /* Normalize slashes */
+                for (char *p = fixed_cwd; *p; p++)
+                    if (*p == '/') *p = '\\';
 
-            /* Test 3: enumerate text\ directory */
-            char searchpath[MAX_PATH];
-            snprintf(searchpath, MAX_PATH, "%s\\text\\*.tbb", exedir);
-            WIN32_FIND_DATAA fd;
-            HANDLE hFind = FindFirstFileA(searchpath, &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                int count = 0;
-                do {
-                    if (count < 5)
-                        fprintf(stderr, "[steam_api64]   found: %s (%lu bytes)\n",
-                                fd.cFileName, fd.nFileSizeLow);
-                    count++;
-                } while (FindNextFileA(hFind, &fd));
-                FindClose(hFind);
-                fprintf(stderr, "[steam_api64]   total .tbb files found: %d\n", count);
+                if (SetCurrentDirectoryA(fixed_cwd)) {
+                    char new_cwd[MAX_PATH];
+                    GetCurrentDirectoryA(MAX_PATH, new_cwd);
+                    fprintf(stderr, "[steam_api64] CWD FIXED: %s\n", new_cwd);
+                } else {
+                    fprintf(stderr, "[steam_api64] SetCurrentDirectory(%s) FAILED err=%lu\n",
+                            fixed_cwd, GetLastError());
+                }
             } else {
-                fprintf(stderr, "[steam_api64] FindFirstFileA(\"%s\"): FAILED (err=%lu)\n",
-                        searchpath, GetLastError());
+                fprintf(stderr, "[steam_api64] CWD already OK (no unix prefix)\n");
             }
 
-            /* Test 4: list top-level files/dirs in CWD */
-            WIN32_FIND_DATAA fd2;
-            HANDLE hFind2 = FindFirstFileA("*", &fd2);
-            if (hFind2 != INVALID_HANDLE_VALUE) {
-                int count = 0;
-                fprintf(stderr, "[steam_api64] CWD listing:\n");
-                do {
-                    if (count < 20)
-                        fprintf(stderr, "[steam_api64]   %s%s\n",
-                                fd2.cFileName,
-                                (fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "/" : "");
-                    count++;
-                } while (FindNextFileA(hFind2, &fd2));
-                FindClose(hFind2);
-                fprintf(stderr, "[steam_api64]   total entries: %d\n", count);
-            } else {
-                fprintf(stderr, "[steam_api64] CWD listing FAILED (err=%lu)\n", GetLastError());
-            }
+            /* Quick file access test */
+            HANDLE h = CreateFileA("text\\item.tbb", GENERIC_READ, FILE_SHARE_READ,
+                                    NULL, OPEN_EXISTING, 0, NULL);
+            fprintf(stderr, "[steam_api64] Test text\\item.tbb: %s (err=%lu)\n",
+                    h != INVALID_HANDLE_VALUE ? "OK" : "FAILED", GetLastError());
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
             fflush(stderr);
         }
-        /* === END FILE ACCESS DIAGNOSTIC === */
+        /* === END FIX CWD === */
 
         /* Start watchdog thread to report call counts */
         CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);

@@ -51,10 +51,10 @@ class FrameSocketServer(private val port: Int = 19850) {
         isAntiAlias = false
         // Swizzle R↔B: GPU/Vortek outputs RGBA bytes but Android ARGB_8888 expects BGRA
         colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
-            0f, 0f, 1f, 0f, 0f,  // R ← B
-            0f, 1f, 0f, 0f, 0f,  // G ← G
-            1f, 0f, 0f, 0f, 0f,  // B ← R
-            0f, 0f, 0f, 1f, 0f   // A ← A
+            0f, 0f, 1f, 0f, 0f,    // R ← B
+            0f, 1f, 0f, 0f, 0f,    // G ← G
+            1f, 0f, 0f, 0f, 0f,    // B ← R
+            0f, 0f, 0f, 1f, 0f     // A ← A
         )))
     }
 
@@ -196,17 +196,11 @@ class FrameSocketServer(private val port: Int = 19850) {
                     bytesRead += n
                 }
 
-                // Log pixel data for first 3, every 50th, and always save last 3 (rotating)
-                val nonZero = pixelBuffer.take(1024).count { it != 0.toByte() }
-                if (receivedCount < 3L || receivedCount % 50L == 0L) {
+                // Debug logging only on first few frames (avoid per-frame overhead)
+                if (receivedCount < 3L) {
                     val hex = pixelBuffer.take(16).joinToString(" ") { "%02x".format(it) }
-                    val centerOff = (height / 2 * width + width / 2) * 4
-                    val centerHex = pixelBuffer.slice(centerOff until minOf(centerOff + 4, pixelSize))
-                        .joinToString(" ") { "%02x".format(it) }
-                    Log.i(TAG, "Frame ${receivedCount}: ${width}x${height} first16=[$hex] center=[$centerHex] nonZero1K=$nonZero")
+                    Log.i(TAG, "Frame ${receivedCount}: ${width}x${height} first16=[$hex]")
                 }
-                // Always save rotating last 3 frames
-                saveDebugFrame(width, height, pixelBuffer, (receivedCount % 3L).toInt())
 
                 receivedCount++
 
@@ -251,6 +245,16 @@ class FrameSocketServer(private val port: Int = 19850) {
                 bitmapWidth = width
                 bitmapHeight = height
                 Log.i(TAG, "Created frame bitmap: ${width}x${height}")
+            }
+
+            // Force alpha=255 — DXVK doesn't write swapchain alpha.
+            // This runs natively on ARM64 (ART JIT → NEON), unlike the old
+            // x86-64 loop that ran under FEX emulation and killed FPS.
+            var i = 3
+            val end = width * height * 4
+            while (i < end) {
+                pixels[i] = 0xFF.toByte()
+                i += 4
             }
 
             // Copy pixels to bitmap

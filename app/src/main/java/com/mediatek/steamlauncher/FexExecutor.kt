@@ -162,7 +162,7 @@ class FexExecutor(private val context: Context) {
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=0 && ")
                 append("export FEX_HOSTFEATURES='disableavx' && ")
-                append("export FEX_SILENTLOG=0 && ")
+                append("export FEX_SILENTLOG=1 && ")
                 append("export FEX_OUTPUTLOG='$tmpDir/fex-debug.log' && ")
                 // FEX config via env vars for child process re-exec
                 append("export FEX_ROOTFS='Ubuntu_22_04' && ")
@@ -170,6 +170,14 @@ class FexExecutor(private val context: Context) {
                 append("export FEX_THUNKGUESTLIBS='$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks' && ")
                 append("export FEX_THUNKCONFIG='$fexHomeDir/.fex-emu/thunks.json' && ")
                 append("export FEX_X87REDUCEDPRECISION=1 && ")
+                // FEX JIT performance optimizations
+                append("export FEX_TSOENABLED=0 && ")
+                append("export FEX_VECTORTSOENABLED=0 && ")
+                append("export FEX_MEMCPYSETTSOENABLED=0 && ")
+                append("export FEX_MULTIBLOCK=1 && ")
+                append("export FEX_VOLATILEMETADATA=1 && ")
+                append("export FEX_SMCCHECKS=mtrack && ")
+                append("export FEX_MAXINST=5000 && ")
                 // LD_LIBRARY_PATH for FEX native libraries (RPATH alone isn't sufficient)
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD for thunks: host thunk → ICD loader → Vortek
@@ -302,7 +310,7 @@ class FexExecutor(private val context: Context) {
                 append("export USE_HEAP=1 && ")
                 append("export FEX_DISABLETELEMETRY=0 && ")
                 append("export FEX_HOSTFEATURES='disableavx' && ")
-                append("export FEX_SILENTLOG=0 && ")
+                append("export FEX_SILENTLOG=1 && ")
                 append("export FEX_OUTPUTLOG='$tmpDir/fex-debug.log' && ")
                 // FEX config via env vars for child process re-exec
                 append("export FEX_ROOTFS='Ubuntu_22_04' && ")
@@ -310,6 +318,14 @@ class FexExecutor(private val context: Context) {
                 append("export FEX_THUNKGUESTLIBS='$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks' && ")
                 append("export FEX_THUNKCONFIG='$fexHomeDir/.fex-emu/thunks.json' && ")
                 append("export FEX_X87REDUCEDPRECISION=1 && ")
+                // FEX JIT performance optimizations
+                append("export FEX_TSOENABLED=0 && ")
+                append("export FEX_VECTORTSOENABLED=0 && ")
+                append("export FEX_MEMCPYSETTSOENABLED=0 && ")
+                append("export FEX_MULTIBLOCK=1 && ")
+                append("export FEX_VOLATILEMETADATA=1 && ")
+                append("export FEX_SMCCHECKS=mtrack && ")
+                append("export FEX_MAXINST=5000 && ")
                 append("export LD_LIBRARY_PATH='$fexLibPath' && ")
                 // Vulkan host-side ICD + layer path for thunks
                 append("export VK_ICD_FILENAMES='${baseEnv["VK_ICD_FILENAMES"]}' && ")
@@ -568,7 +584,7 @@ class FexExecutor(private val context: Context) {
             "USE_HEAP" to "1",
             "FEX_DISABLETELEMETRY" to "0",
             "FEX_HOSTFEATURES" to "disableavx",
-            "FEX_SILENTLOG" to "0",
+            "FEX_SILENTLOG" to "1",
             "FEX_OUTPUTLOG" to "$tmpDir/fex-debug.log",
 
             // FEX config via env vars — critical for Wine child processes.
@@ -580,6 +596,15 @@ class FexExecutor(private val context: Context) {
             "FEX_THUNKGUESTLIBS" to "$fexRootfsDir/opt/fex/share/fex-emu/GuestThunks",
             "FEX_THUNKCONFIG" to "$fexHomeDir/.fex-emu/thunks.json",
             "FEX_X87REDUCEDPRECISION" to "1",
+
+            // FEX JIT performance optimizations
+            "FEX_TSOENABLED" to "0",           // Disable TSO memory barriers (big speedup)
+            "FEX_VECTORTSOENABLED" to "0",     // No barriers on SSE/AVX stores
+            "FEX_MEMCPYSETTSOENABLED" to "0",  // No barriers on REP MOVS/STOS
+            "FEX_MULTIBLOCK" to "1",           // Multi-block JIT compilation
+            "FEX_VOLATILEMETADATA" to "1",     // Use PE volatile metadata for TSO bypass
+            "FEX_SMCCHECKS" to "mtrack",       // Page-level SMC tracking
+            "FEX_MAXINST" to "5000",           // Max instructions per JIT block
 
             // Library path for FEX native binaries
             "LD_LIBRARY_PATH" to fexLibPath,
