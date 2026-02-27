@@ -426,9 +426,14 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
     fun getLaunchCommand(
         exePath: String,
         winePrefix: String = "/home/user/.wine",
-        extraArgs: String = ""
+        extraArgs: String = "",
+        steamAppId: String = "1351630",
+        dllOverrides: String? = null,
+        useVirtualDesktop: Boolean = true
     ): String {
         val exeDir = File(exePath).parent ?: "/home/user/games"
+        val effectiveDllOverrides = dllOverrides
+            ?: "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
 
         return """
             export WINEPREFIX="$winePrefix"
@@ -465,10 +470,9 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export DISABLE_HOST_HEADLESS=1
 
             # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
-            # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
             # d3dcompiler_47=n: our stub with working D3DReflect (game needs 229 shader reflections)
             # xaudio2_7=n: our stub (mock COM server) — FAudio's version crashes under FEX
-            export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
+            export WINEDLLOVERRIDES="$effectiveDllOverrides"
             # Trace wineserver calls to find what the main thread blocks on
             # +server goes to file to avoid SIGPIPE from pipe flooding
             export WINEDEBUG=err+all
@@ -516,6 +520,15 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             [ -f "/opt/stubs/xaudio2_7.dll" ] && cp "/opt/stubs/xaudio2_7.dll" "${'$'}SYS32/xaudio2_7.dll"
             echo "DXVK standalone DLLs + stubs installed to system32"
 
+            # Install vkd3d-proton DLLs (DX12→Vulkan, for games like RE4 Remake)
+            VKD3D_DIR="$PROTON_INSTALL_DIR/files/lib/wine/vkd3d-proton/x86_64-windows"
+            for dll in d3d12.dll d3d12core.dll; do
+                if [ -f "${'$'}VKD3D_DIR/${'$'}dll" ]; then
+                    cp "${'$'}VKD3D_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
+                    echo "  vkd3d-proton: ${'$'}dll installed"
+                fi
+            done
+
             # Create DXVK config to disable OpenVR/OpenXR (no VR hardware, avoids extension query crash)
             cat > "$exeDir/dxvk.conf" << 'DXVKEOF'
 # DXVK config for Android/FEX-Emu
@@ -537,7 +550,7 @@ dxvk.enableGraphicsPipelineLibrary = False
 DXVKEOF
 
             # Deploy game-specific stub DLLs (backup originals if present)
-            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll steam_api64.dll; do
+            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
                 if [ -f "/opt/stubs/${'$'}stub" ]; then
                     if [ -f "$exeDir/${'$'}stub" ] && [ ! -f "$exeDir/${'$'}{stub}.orig" ]; then
                         cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
@@ -559,18 +572,20 @@ DXVKEOF
             wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
             echo "Disabled XRandR/XVidMode in Wine registry"
 
-            # Enable virtual desktop via registry — CRITICAL for headless rendering.
-            # Without virtual desktop, Wine tries to go fullscreen via X11
-            # (ChangeDisplaySettings → XRandR), which libXlorie doesn't support.
-            # The game's message pump then blocks forever waiting for X11 events.
-            #
-            # Wine virtual desktop needs TWO registry keys:
-            #   1. Explorer\Desktops\<name> = WxH  → defines the desktop size
-            #   2. Explorer\Desktop = <name>        → activates it
-            # Without key #2, Wine ignores the desktop definition entirely!
-            wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
-            wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
-            echo "Virtual desktop: 1280x720 (ACTIVATED)"
+            # Virtual desktop configuration
+            if ${if (useVirtualDesktop) "true" else "false"}; then
+                # Enable virtual desktop via registry — CRITICAL for headless rendering.
+                # Wine virtual desktop needs TWO registry keys:
+                #   1. Explorer\Desktops\<name> = WxH  → defines the desktop size
+                #   2. Explorer\Desktop = <name>        → activates it
+                wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
+                wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
+                echo "Virtual desktop: 1280x720 (ACTIVATED)"
+            else
+                # Disable virtual desktop — delete the activation key
+                wine64 reg delete 'HKCU\Software\Wine\Explorer' /v Desktop /f 2>/dev/null
+                echo "Virtual desktop: DISABLED"
+            fi
 
             # Verify both keys were written
             echo "--- Registry verification ---"
@@ -595,12 +610,40 @@ DXVKEOF
             ln -sf / "$exeDir/unix" 2>/dev/null
 
             # Create steam_appid.txt BEFORE wine launch (prevents Steam client check)
-            echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
+            echo "$steamAppId" > "$exeDir/steam_appid.txt" 2>/dev/null
 
             # Dump game's PE imports to identify which DLLs are loaded
             echo "=== PE IMPORTS ==="
             objdump -p "$exePath" 2>/dev/null | grep "DLL Name" | head -30 || echo "(objdump not available)"
             echo "=== END PE IMPORTS ==="
+
+            # Start Steam client in background for DRM authentication
+            echo "=== Starting Steam client ==="
+            export STEAM_COMPAT_CLIENT_INSTALL_PATH="${'$'}HOME/.steam/steam"
+            export STEAM_COMPAT_DATA_PATH="${'$'}HOME/.steam/steam/steamapps/compatdata/$steamAppId"
+            mkdir -p "${'$'}STEAM_COMPAT_DATA_PATH"
+            if [ -x "${'$'}HOME/.steam/steam/ubuntu12_32/steam" ]; then
+                STEAMDIR="${'$'}HOME/.steam/steam"
+                export LD_LIBRARY_PATH="${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+                export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
+                export LIBGL_ALWAYS_SOFTWARE=1
+                export LIBGL_DRIVERS_PATH=/usr/lib/i386-linux-gnu/dri
+                (cd "${'$'}STEAMDIR" && bash steam.sh -no-browser -no-cef-sandbox -silent -noverifyfiles \
+                    -skipinitialbootstrap -nobootstrapupdate -skipstreamingdrivers \
+                    -console 2>/tmp/steam_client.log) &
+                STEAM_PID=${'$'}!
+                echo "Steam PID: ${'$'}STEAM_PID"
+                echo "Waiting 15s for Steam to initialize..."
+                sleep 15
+                if kill -0 ${'$'}STEAM_PID 2>/dev/null; then
+                    echo "Steam client is running"
+                else
+                    echo "WARNING: Steam client exited early"
+                    cat /tmp/steam_client.log 2>/dev/null | tail -20
+                fi
+            else
+                echo "WARNING: Steam client not found, launching without it"
+            fi
 
             # Launch directly (virtual desktop configured via registry above).
             # +server trace goes to file (too verbose for pipe — would SIGPIPE)
@@ -824,7 +867,7 @@ dxvk.enableGraphicsPipelineLibrary = False
 DXVKEOF
 
             # Game-specific stub DLLs
-            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll steam_api64.dll; do
+            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
                 if [ -f "/opt/stubs/${'$'}stub" ]; then
                     if [ -f "$exeDir/${'$'}stub" ] && [ ! -f "$exeDir/${'$'}{stub}.orig" ]; then
                         cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
