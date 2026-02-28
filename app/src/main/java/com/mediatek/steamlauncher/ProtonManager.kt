@@ -419,6 +419,34 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
     /**
      * Build the command to launch a Windows executable via Wine.
      *
+     * Returns a command to launch Steam client standalone (for login/UI).
+     * Steam runs directly on the X11 display so the user can interact with it.
+     */
+    fun getSteamCommand(loginArgs: String = ""): String {
+        val loginFlag = if (loginArgs.isNotBlank()) "-login $loginArgs" else ""
+        return """
+            export DISPLAY=:0
+            export HOME=/home/user
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export LIBGL_DRIVERS_PATH=/usr/lib/i386-linux-gnu/dri
+            export DBUS_SESSION_BUS_ADDRESS=disabled
+
+            STEAMDIR="${'$'}HOME/.steam/steam"
+            if [ -x "${'$'}STEAMDIR/ubuntu12_32/steam" ]; then
+                export LD_LIBRARY_PATH="${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+                export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
+                echo "=== Starting Steam client ==="
+                cd "${'$'}STEAMDIR"
+                bash steam.sh $loginFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
+                    -nobootstrapupdate -skipstreamingdrivers \
+                    2>&1 | tee /tmp/steam_new.log
+            else
+                echo "ERROR: Steam client not found at ${'$'}STEAMDIR/ubuntu12_32/steam"
+            fi
+        """.trimIndent()
+    }
+
+    /**
      * @param exePath Path to the .exe inside the rootfs (e.g., /home/user/games/ysix/YsIX.exe)
      * @param winePrefix Wine prefix path
      * @param extraArgs Additional arguments for the exe

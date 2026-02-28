@@ -33,6 +33,7 @@ class TerminalActivity : AppCompatActivity() {
     private lateinit var btnSend: Button
     private lateinit var vulkanSurface: SurfaceView
     private lateinit var btnDisplay: Button
+    // LorieView removed — causes ANR when instantiated in TerminalActivity
 
     private val app: SteamLauncherApp by lazy { application as SteamLauncherApp }
     private val protonManager: ProtonManager by lazy { ProtonManager(this) }
@@ -326,6 +327,69 @@ class TerminalActivity : AppCompatActivity() {
                 "/home/user/Steam/steamapps/common/Ys IX Monstrum Nox/ys9.exe"
             ))
         }
+
+        // Launch Steam client with login dialog
+        findViewById<Button>(R.id.btnSteam).setOnClickListener {
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for Steam]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            // Show login dialog
+            val dialogView = android.view.LayoutInflater.from(this).inflate(
+                android.R.layout.simple_list_item_1, null
+            )
+            val layout = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setPadding(50, 30, 50, 10)
+            }
+            val userInput = EditText(this).apply {
+                hint = "Username"
+                setText("sakatepongolas")
+            }
+            val passInput = EditText(this).apply {
+                hint = "Password"
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            layout.addView(userInput)
+            layout.addView(passInput)
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Steam Login")
+                .setMessage("Enter credentials (leave password blank for cached login)")
+                .setView(layout)
+                .setPositiveButton("Login") { _, _ ->
+                    val user = userInput.text.toString().trim()
+                    val pass = passInput.text.toString().trim()
+                    val loginArgs = if (user.isNotEmpty() && pass.isNotEmpty()) "$user $pass" else ""
+                    executeCommand(protonManager.getSteamCommand(loginArgs))
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        findViewById<Button>(R.id.btnLaunchRE4).setOnClickListener {
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for RE4]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            executeCommand(protonManager.getLaunchCommand(
+                exePath = "/home/user/Steam/steamapps/common/RESIDENT EVIL 4  BIOHAZARD RE4/re4.exe",
+                steamAppId = "2050650",
+                dllOverrides = "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=n;d3d12core=n;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d",
+                useVirtualDesktop = false
+            ))
+        }
+    }
+
+    private fun showX11Display() {
+        // LorieView causes ANR — just show terminal output for now
+        // X11 runs headless, auto-clicker handles launcher interaction
+        if (!isDisplayMode) toggleDisplayMode()
     }
 
     private fun toggleDisplayMode() {
