@@ -9,6 +9,11 @@
 #include <sys/resource.h>
 #include <dlfcn.h>
 #include <time.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #ifndef SYS_clone3
 #define SYS_clone3 435
@@ -40,83 +45,87 @@ static void debug_int(const char *prefix, long val) {
     syscall(SYS_write, 2, buf, p - buf);
 }
 
-static void debug_hex(const char *prefix, unsigned long val) {
-    char buf[80];
-    char *p = buf;
-    const char *s = prefix;
-    while (*s) *p++ = *s++;
-    *p++ = '0'; *p++ = 'x';
-    char hex[17];
-    int n = 0;
-    if (val == 0) { hex[n++] = '0'; }
-    else { unsigned long v = val; while (v > 0) { hex[n++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } }
-    for (int i = n - 1; i >= 0; i--) *p++ = hex[i];
-    *p++ = '\n';
-    syscall(SYS_write, 2, buf, p - buf);
-}
+/* NO SIGSYS handler — FEX handles syscall interception via host-level SIGSYS.
+ * Installing a guest SIGSYS handler breaks FEX's syscall translation entirely.
+ * FEX should handle clone3 → ENOSYS natively at the host level. */
 
-/* SIGSYS handler for clone3 */
-static void sigsys_handler(int sig, siginfo_t *info, void *ucontext) {
-    ucontext_t *ctx = (ucontext_t *)ucontext;
-    if (info->si_syscall == SYS_clone3) {
-        ctx->uc_mcontext.gregs[REG_RAX] = (unsigned long)(-38);
-    }
-}
-
-/*
- * Crash handler strategy: PARK the crashing thread.
- *
- * Handles SIGTRAP (int3), SIGILL (ud2), SIGSEGV, and SIGBUS.
- * Parks the thread in infinite nanosleep — keeps process alive,
- * other threads continue normally.
- */
+/* Crash handler: park crashing thread in nanosleep */
 static void crash_handler(int sig, siginfo_t *info, void *ucontext) {
     trap_count++;
-
     if (trap_count > 100) {
-        debug_msg("FIX: >100 crashes total, exiting\n");
         syscall(SYS_exit_group, 0);
         return;
     }
 
-    ucontext_t *ctx = (ucontext_t *)ucontext;
-    unsigned long rip = ctx->uc_mcontext.gregs[REG_RIP];
-
-    const char *signame = "UNKNOWN";
-    if (sig == SIGTRAP) signame = "SIGTRAP";
-    else if (sig == SIGILL) signame = "SIGILL";
-    else if (sig == SIGSEGV) signame = "SIGSEGV";
-    else if (sig == SIGBUS) signame = "SIGBUS";
-
-    debug_msg("FIX: ");
-    debug_msg(signame);
-    debug_int(" — parking thread (crash #", trap_count);
-    debug_hex("  RIP=", rip);
-    if (sig == SIGSEGV || sig == SIGBUS) {
-        debug_hex("  fault_addr=", (unsigned long)info->si_addr);
-    }
-
-    /* Park this thread forever — sleep in 1-hour intervals */
-    struct timespec ts;
-    ts.tv_sec = 3600;
-    ts.tv_nsec = 0;
-    while (1) {
-        syscall(SYS_nanosleep, &ts, NULL);
-    }
+    struct timespec ts = { .tv_sec = 3600, .tv_nsec = 0 };
+    while (1) { syscall(SYS_nanosleep, &ts, NULL); }
 }
 
-/* sigaction wrapper — block overrides of our crash handlers */
+/* sigaction wrapper — block app overrides of our crash handlers
+ * CRITICAL: Do NOT block SIGSYS — FEX needs it for syscall interception.
+ * We only block SIGTRAP/SIGILL/SIGABRT/SIGSEGV/SIGBUS. */
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
-    if (!real_sigaction_ptr) {
+    if (!real_sigaction_ptr)
         real_sigaction_ptr = (real_sigaction_fn)dlsym(RTLD_NEXT, "sigaction");
-    }
     if (act != NULL && (signum == SIGTRAP || signum == SIGILL ||
-                        signum == SIGABRT || signum == SIGSYS ||
+                        signum == SIGABRT ||
                         signum == SIGSEGV || signum == SIGBUS)) {
         if (oldact) memset(oldact, 0, sizeof(*oldact));
         return 0;
     }
+    /* Also protect our chained SIGSYS handler from being overridden by the app */
+    if (act != NULL && signum == SIGSYS) {
+        if (oldact) memset(oldact, 0, sizeof(*oldact));
+        return 0;
+    }
     return real_sigaction_ptr(signum, act, oldact);
+}
+
+/* bind() wrapper — convert filesystem AF_UNIX sockets to abstract sockets.
+ * FEX translates paths for mkdir/stat but NOT for bind(), so the kernel
+ * can't find directories created through FEX's overlay. Abstract sockets
+ * bypass the filesystem entirely. */
+typedef int (*real_bind_fn)(int, const struct sockaddr *, socklen_t);
+static real_bind_fn real_bind_ptr = NULL;
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!real_bind_ptr)
+        real_bind_ptr = (real_bind_fn)dlsym(RTLD_NEXT, "bind");
+
+    if (addr && addr->sa_family == AF_UNIX && addrlen > sizeof(sa_family_t)) {
+        const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+        /* If it's a filesystem path (not already abstract), convert to abstract */
+        if (un->sun_path[0] != '\0') {
+            struct sockaddr_un abstract_addr;
+            memset(&abstract_addr, 0, sizeof(abstract_addr));
+            abstract_addr.sun_family = AF_UNIX;
+            /* Abstract socket: sun_path[0] = '\0', rest is the name */
+            /* Use a hash of the path to keep it short */
+            abstract_addr.sun_path[0] = '\0';
+            /* Copy as much of the path as fits (skip leading dirs for uniqueness) */
+            const char *name = un->sun_path;
+            /* Find last meaningful part of path */
+            const char *p = name;
+            while (*p) p++;
+            /* Walk back to get ~90 chars max */
+            while (p > name && (p - name) > 90) p++;
+            int len = 0;
+            while (*p && len < 105) {
+                abstract_addr.sun_path[1 + len] = *p;
+                len++;
+                p++;
+            }
+            socklen_t abs_len = offsetof(struct sockaddr_un, sun_path) + 1 + len;
+
+            debug_msg("FIX: bind() → abstract socket: ");
+            debug_msg(un->sun_path);
+            debug_msg("\n");
+
+            return real_bind_ptr(sockfd, (struct sockaddr *)&abstract_addr, abs_len);
+        }
+    }
+
+    return real_bind_ptr(sockfd, addr, addrlen);
 }
 
 typedef void (*sighandler_t)(int);
@@ -136,20 +145,6 @@ sighandler_t signal(int signum, sighandler_t handler) {
     return SIG_DFL;
 }
 
-/* PLT close wrapper */
-int close(int fd) {
-    syscall(SYS_close, fd);
-    errno = 0;
-    return 0;
-}
-
-/* PLT flock wrapper */
-int flock(int fd, int op) {
-    syscall(SYS_flock, fd, op);
-    errno = 0;
-    return 0;
-}
-
 __attribute__((constructor))
 static void install_fixes(void) {
     real_sigaction_ptr = (real_sigaction_fn)dlsym(RTLD_NEXT, "sigaction");
@@ -166,43 +161,35 @@ static void install_fixes(void) {
     rl.rlim_max = 65536;
     setrlimit(RLIMIT_NOFILE, &rl);
 
+    /* NO SIGSYS handler — FEX needs SIGSYS for syscall interception */
+
+    /* Install crash handlers for other signals (these are safe) */
     struct sigaction sa;
-
-    /* SIGSYS for clone3 */
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigsys_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    real_sigaction_ptr(SIGSYS, &sa, NULL);
-
-    /* SIGTRAP — park crashing thread */
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     real_sigaction_ptr(SIGTRAP, &sa, NULL);
 
-    /* SIGILL — park crashing thread */
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     real_sigaction_ptr(SIGILL, &sa, NULL);
 
-    /* SIGSEGV — park crashing thread */
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     real_sigaction_ptr(SIGSEGV, &sa, NULL);
 
-    /* SIGBUS — park crashing thread */
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     real_sigaction_ptr(SIGBUS, &sa, NULL);
 
-    /* SIGABRT — ignore */
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_IGN;
     real_sigaction_ptr(SIGABRT, &sa, NULL);
 
     mkdir("/home/user/.steam/debian-installation/config/htmlcache", 0755);
-    debug_msg("FIX-v17: park ALL crashes (TRAP+ILL+SEGV+BUS) + sigaction guard + clone3\n");
+
+    debug_msg("FIX-v50: exec+bind wrapper\n");
 }
