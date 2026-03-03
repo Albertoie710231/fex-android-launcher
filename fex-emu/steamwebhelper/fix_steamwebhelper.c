@@ -27,6 +27,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/mman.h>
 
 typedef int (*real_sigaction_fn)(int, const struct sigaction *, struct sigaction *);
 static real_sigaction_fn real_sigaction_ptr = NULL;
@@ -742,6 +743,9 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
 /* Save the ValveIPCSharedObj fd so heartbeat can monitor it */
 static volatile int valve_ipc_fd = -1;
 
+/* Forward declaration — defined in SHM BRIDGE section below */
+static void track_shm_file(const char *name, const char *path, int fd);
+
 /* shm_open/shm_unlink wrappers: redirect /dev/shm to a real Android path.
  * Under FEX on Android, /dev/shm doesn't exist or isn't a tmpfs.
  * Steam's shmemdrop.h uses shm_open for SteamController_*_mem and chrome IPC.
@@ -806,6 +810,10 @@ int shm_open(const char *name, int oflag, mode_t mode) {
     if (fd >= 0 && strstr(name, "ValveIPCSharedObj") && valve_ipc_fd < 0) {
         valve_ipc_fd = (int)fd;
         debug_int("FIX: saved ValveIPC fd=", fd);
+    }
+    /* Track Shm_ files created by webhelper for bridge to 32-bit side */
+    if (fd >= 0 && (oflag & O_CREAT) && strstr(name, "Shm_")) {
+        track_shm_file(name, path, (int)fd);
     }
     return (int)fd;
 }
@@ -974,17 +982,21 @@ static void *fd11_ready_func(void *arg) {
 }
 
 /* ============================================================
- * FAKE SHMemStream: Creates the shared memory + socket that the
- * steam client polls for. Chromium never fully initializes in
- * single-process mode, so CMsgBrowserReady is never sent and the
- * SHMemStream is never created. We fake it.
+ * SHM BRIDGE: Forward Shm_ file data from 64-bit overlay to
+ * 32-bit overlay via abstract socket.
+ *
+ * Problem: FEX overlay isolation — each FEX process (32-bit
+ * steam client vs 64-bit webhelper) has its own overlay.
+ * Files created in one overlay are invisible to the other.
+ * Abstract sockets ARE shared (kernel namespace).
  *
  * Flow:
- * 1. 32-bit shim detects Shm_ polling failures, writes coordination file
- * 2. This thread reads the coordination file to get the Shm_ name
- * 3. Creates the shared memory file with valid SHMemStream header
- * 4. Creates + binds + listens on the shmem Unix socket
- * 5. Steam client's next poll succeeds → connects to socket
+ * 1. Webhelper's chrome_ipc_server.cpp creates Shm_ file + socket
+ *    (in 64-bit overlay — invisible to 32-bit)
+ * 2. This thread monitors Shm_ files created via our shm_open wrapper
+ * 3. Reads file content and sends over abstract socket "shm_bridge"
+ * 4. 32-bit shim receives data, writes to its own Shm_ file
+ * 5. Steam client reads the 32-bit file → sees real CMsgBrowserReady
  * ============================================================ */
 
 static void int_to_str(char *buf, long val) {
@@ -996,268 +1008,211 @@ static void int_to_str(char *buf, long val) {
     buf[n] = '\0';
 }
 
-static void *fake_shmem_func(void *arg) {
+/* Track Shm_ files created by the webhelper */
+#define MAX_SHM_TRACKED 8
+static struct {
+    char name[64];   /* shm_open name (e.g. "/u1000-Shm_abc123") */
+    char path[256];  /* full redirect path */
+    int shm_fd;      /* fd from shm_open (for fd-sharing across threads) */
+    int active;
+} shm_tracked[MAX_SHM_TRACKED];
+static volatile int shm_tracked_count = 0;
+
+/* Called from shm_open when O_CREAT + name contains "Shm_".
+ * Now also saves the fd for fd-sharing with the 32-bit side. */
+static void track_shm_file(const char *name, const char *path, int fd) {
+    int idx = __sync_fetch_and_add(&shm_tracked_count, 1);
+    if (idx >= MAX_SHM_TRACKED) return;
+    int i = 0;
+    while (name[i] && i < 63) { shm_tracked[idx].name[i] = name[i]; i++; }
+    shm_tracked[idx].name[i] = '\0';
+    i = 0;
+    while (path[i] && i < 255) { shm_tracked[idx].path[i] = path[i]; i++; }
+    shm_tracked[idx].path[i] = '\0';
+    shm_tracked[idx].shm_fd = fd;
+    shm_tracked[idx].active = 1;
+    debug_msg("FIX: BRIDGE: tracking Shm_ file: ");
+    debug_msg(name);
+    debug_int("  fd=", fd);
+}
+
+/* Bridge protocol v98 — SCM_RIGHTS fd passing:
+ * FEX guests have separate fd tables (dup fails with EBADF).
+ * Use sendmsg(SCM_RIGHTS) to pass the REAL fd across the abstract socket.
+ * The 32-bit side receives a new fd pointing to the same open file —
+ * live MAP_SHARED mapping, real-time content updates.
+ *
+ * For each tracked file, we send:
+ *   data: name_len(2) + name (as iov)
+ *   cmsg: SCM_RIGHTS with the fd
+ * Terminator: name_len=0 (no cmsg) */
+#define BRIDGE_SOCK_NAME "\0shm_bridge_64to32"
+#define BRIDGE_SOCK_NAME_LEN 19
+
+/* Helper: send one fd with SCM_RIGHTS along with name data */
+static int send_fd_with_name(int sock, const char *name, int name_len, int fd_to_send) {
+    unsigned char nbuf[66];
+    nbuf[0] = (unsigned char)(name_len & 0xff);
+    nbuf[1] = (unsigned char)((name_len >> 8) & 0xff);
+    memcpy(nbuf + 2, name, name_len);
+
+    struct iovec iov;
+    iov.iov_base = nbuf;
+    iov.iov_len = 2 + name_len;
+
+    /* Build cmsg for SCM_RIGHTS */
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } cmsg_buf;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.buf;
+    msg.msg_controllen = sizeof(cmsg_buf.buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+
+    return sendmsg(sock, &msg, 0);
+}
+
+static void *shm_bridge_func(void *arg) {
     (void)arg;
-    debug_msg("FIX: fake_shmem: watching for poll target...\n");
+    debug_msg("FIX: BRIDGE: starting server (SCM_RIGHTS mode)\n");
 
-    char coord_path[256];
-    build_shm_path(coord_path, sizeof(coord_path), "/_shm_poll_target");
-
-    /* Poll for coordination file from 32-bit shim (every 200ms, up to 120s) */
-    char shm_name[64];
-    memset(shm_name, 0, sizeof(shm_name));
-
-    for (int i = 0; i < 600; i++) {
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L };
-        long ret;
-        __asm__ volatile ("syscall" : "=a"(ret)
-            : "0"((long)SYS_nanosleep), "D"(&ts), "S"((long)0)
-            : "rcx", "r11", "memory");
-
-        long cfd;
-        __asm__ volatile ("syscall" : "=a"(cfd)
-            : "0"((long)SYS_openat), "D"(-100L), "S"(coord_path),
-              "d"((long)O_RDONLY)
-            : "rcx", "r11", "memory");
-
-        if (cfd >= 0) {
-            long n;
-            __asm__ volatile ("syscall" : "=a"(n)
-                : "0"((long)SYS_read), "D"(cfd), "S"(shm_name), "d"(63L)
-                : "rcx", "r11", "memory");
-            __asm__ volatile ("syscall" : "=a"(ret)
-                : "0"((long)SYS_close), "D"(cfd)
-                : "rcx", "r11", "memory");
-            if (n > 0) {
-                shm_name[n] = '\0';
-                debug_msg("FIX: fake_shmem: got poll target: ");
-                debug_msg(shm_name);
-                debug_msg("\n");
-                break;
-            }
-        }
-    }
-
-    if (!shm_name[0]) {
-        debug_msg("FIX: fake_shmem: no poll target found after 120s, giving up\n");
+    int listenfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listenfd < 0) {
+        debug_msg("FIX: BRIDGE: socket() failed\n");
         return NULL;
     }
 
-    /* Parse steam PID from /proc/self/cmdline (-steampid=N) */
-    long spid = 0;
-    {
-        char cmdline[4096];
-        long cmdfd;
-        __asm__ volatile ("syscall" : "=a"(cmdfd)
-            : "0"((long)SYS_openat), "D"(-100L),
-              "S"("/proc/self/cmdline"), "d"((long)O_RDONLY)
-            : "rcx", "r11", "memory");
-        if (cmdfd >= 0) {
-            long n;
-            __asm__ volatile ("syscall" : "=a"(n)
-                : "0"((long)SYS_read), "D"(cmdfd), "S"(cmdline), "d"(4095L)
-                : "rcx", "r11", "memory");
-            long dummy;
-            __asm__ volatile ("syscall" : "=a"(dummy)
-                : "0"((long)SYS_close), "D"(cmdfd)
-                : "rcx", "r11", "memory");
-            if (n > 0) {
-                cmdline[n] = '\0';
-                /* Search for -steampid= in null-separated args */
-                for (long j = 0; j < n - 10; j++) {
-                    if (cmdline[j] == '-' && strncmp(&cmdline[j], "-steampid=", 10) == 0) {
-                        for (long k = j + 10; k < n && cmdline[k] >= '0' && cmdline[k] <= '9'; k++)
-                            spid = spid * 10 + (cmdline[k] - '0');
-                        break;
+    struct sockaddr_un baddr;
+    memset(&baddr, 0, sizeof(baddr));
+    baddr.sun_family = AF_UNIX;
+    memcpy(baddr.sun_path, BRIDGE_SOCK_NAME, BRIDGE_SOCK_NAME_LEN);
+
+    if (!real_bind_ptr)
+        real_bind_ptr = (real_bind_fn)dlsym(RTLD_NEXT, "bind");
+    int bret = real_bind_ptr(listenfd, (struct sockaddr *)&baddr,
+                             offsetof(struct sockaddr_un, sun_path) + BRIDGE_SOCK_NAME_LEN);
+    if (bret < 0) {
+        debug_int("FIX: BRIDGE: bind failed errno=", errno);
+        close(listenfd);
+        return NULL;
+    }
+
+    if (!real_listen_ptr)
+        real_listen_ptr = (real_listen_fn)dlsym(RTLD_NEXT, "listen");
+    real_listen_ptr(listenfd, 10);
+    debug_msg("FIX: BRIDGE: server listening\n");
+
+    int served = 0;
+
+    while (1) {
+        if (!real_accept_ptr)
+            real_accept_ptr = (real_accept_fn)dlsym(RTLD_NEXT, "accept");
+        int cfd = real_accept_ptr(listenfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            debug_int("FIX: BRIDGE: accept error errno=", errno);
+            break;
+        }
+
+        /* Wait for tracked files if none yet */
+        int count = shm_tracked_count;
+        if (count == 0) {
+            debug_msg("FIX: BRIDGE: waiting for tracked files...\n");
+            struct timespec ts = {0, 200000000L};
+            for (int w = 0; w < 75 && shm_tracked_count == 0; w++)
+                nanosleep(&ts, NULL);
+            count = shm_tracked_count;
+            debug_int("FIX: BRIDGE: tracked_count=", count);
+        }
+        if (count > MAX_SHM_TRACKED) count = MAX_SHM_TRACKED;
+
+        int sent = 0;
+        for (int i = 0; i < count; i++) {
+            if (!shm_tracked[i].active) continue;
+            int sfd = shm_tracked[i].shm_fd;
+            if (sfd < 0) continue;
+
+            int name_len = 0;
+            while (shm_tracked[i].name[name_len]) name_len++;
+
+            /* v102: Patch Shm_ header via mmap BEFORE sending fd.
+             * CORRECT SHMemStream header (from local Steam trace):
+             *   hdr[0] = get  (read cursor, 0-based into ring buffer)
+             *   hdr[1] = put  (write cursor, 0-based into ring buffer)
+             *   hdr[2] = capacity (ring buffer size)
+             *   hdr[3] = pending (bytes available = put - get)
+             * Ring buffer data starts at file offset 16. */
+            {
+                struct stat bst;
+                if (fstat(sfd, &bst) == 0 && bst.st_size >= 16) {
+                    void *bmap = mmap(NULL, bst.st_size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+                    if (bmap != MAP_FAILED) {
+                        unsigned int *bhdr = (unsigned int *)bmap;
+                        if (bhdr[0] == 0 && bhdr[1] == 0 && bhdr[2] == 8192) {
+                            /* Write CMsgBrowserReady to ring buffer at offset 0.
+                             * Message format: [4B type][4B size][payload]
+                             * Type=0 (BrowserReady), size=2, payload=08 01 */
+                            unsigned char *ring = (unsigned char *)bmap + 16;
+                            unsigned int msg_type = 0;
+                            unsigned int msg_size = 2;
+                            memcpy(ring, &msg_type, 4);
+                            memcpy(ring + 4, &msg_size, 4);
+                            ring[8] = 0x08;  /* protobuf field 1, varint */
+                            ring[9] = 0x01;  /* browser_handle = 1 */
+
+                            /* Set cursors: 10 bytes written, ready to read */
+                            bhdr[0] = 0;    /* get = 0 */
+                            bhdr[1] = 10;   /* put = 10 */
+                            bhdr[3] = 10;   /* pending = 10 */
+                            __sync_synchronize();
+                            msync(bmap, 32, MS_SYNC);
+                            debug_msg("FIX: BRIDGE: patched hdr (get=0 put=10 pending=10) + CMsgBrowserReady\n");
+                        }
+                        munmap(bmap, bst.st_size);
                     }
                 }
             }
-        }
-    }
-    if (spid == 0) {
-        /* Fallback: parent PID */
-        __asm__ volatile ("syscall" : "=a"(spid)
-            : "0"((long)SYS_getppid)
-            : "rcx", "r11", "memory");
-    }
-    debug_int("FIX: fake_shmem: steam PID=", spid);
 
-    long my_pid = get_pid();
-    long my_uid;
-    __asm__ volatile ("syscall" : "=a"(my_uid)
-        : "0"((long)SYS_getuid)
-        : "rcx", "r11", "memory");
-    debug_int("FIX: fake_shmem: uid=", my_uid);
+            int ret = send_fd_with_name(cfd, shm_tracked[i].name, name_len, sfd);
+            sent++;
 
-    /* Build stream name: SteamChrome_MasterStream_<spid>_<mypid> */
-    char stream_name[64];
-    {
-        char *p = stream_name;
-        const char *pfx = "SteamChrome_MasterStream_";
-        while (*pfx) *p++ = *pfx++;
-        char tmp[20];
-        int_to_str(tmp, spid);
-        for (int i = 0; tmp[i]; i++) *p++ = tmp[i];
-        *p++ = '_';
-        int_to_str(tmp, my_pid);
-        for (int i = 0; tmp[i]; i++) *p++ = tmp[i];
-        *p = '\0';
-    }
-    debug_msg("FIX: fake_shmem: stream=");
-    debug_msg(stream_name);
-    debug_msg("\n");
-
-    /* Step 1: Create Shm_ file with SHMemStream header.
-     * Use our own shm_open() wrapper — it's proven to work for other Shm_ files
-     * (build_shm_path + SYS_openat with the right overlay flags). */
-    debug_msg("FIX: fake_shmem: creating via shm_open: ");
-    debug_msg(shm_name);
-    debug_msg("\n");
-
-    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
-    debug_int("FIX: fake_shmem: shm_open fd=", (long)shm_fd);
-    if (shm_fd < 0) {
-        debug_int("FIX: fake_shmem: create Shm_ failed, errno=", (long)errno);
-        return NULL;
-    }
-
-    /* SHMemStream header (76 bytes):
-     *  0: header_size  (uint32 LE) = 0x4c = 76
-     *  4: data_offset  (uint32 LE) = 0x4c = 76
-     *  8: buffer_size  (uint32 LE) = 0x2000 = 8192
-     * 12: (padding)    = 0
-     * 16: version      (uint32 LE) = 1
-     * 20: count        (uint32 LE) = 1
-     * 24: steam_pid    (uint32 LE)
-     * 28: stream_name  (48 bytes, null-terminated) */
-    unsigned char hdr[76];
-    memset(hdr, 0, sizeof(hdr));
-    hdr[0] = 0x4c;                                    /* header_size */
-    hdr[4] = 0x4c;                                    /* data_offset */
-    hdr[8] = 0x00; hdr[9] = 0x20;                     /* buffer_size = 8192 */
-    hdr[16] = 0x01;                                    /* version */
-    hdr[20] = 0x01;                                    /* count */
-    hdr[24] = (unsigned char)(spid & 0xff);            /* steam PID LE */
-    hdr[25] = (unsigned char)((spid >> 8) & 0xff);
-    hdr[26] = (unsigned char)((spid >> 16) & 0xff);
-    hdr[27] = (unsigned char)((spid >> 24) & 0xff);
-    { /* stream name at offset 28, max 47 chars + NUL */
-        const char *s = stream_name;
-        for (int i = 0; *s && i < 47; i++) hdr[28 + i] = (unsigned char)*s++;
-    }
-
-    long wr;
-    __asm__ volatile ("syscall" : "=a"(wr)
-        : "0"((long)SYS_write), "D"((long)shm_fd), "S"(hdr), "d"(76L)
-        : "rcx", "r11", "memory");
-    debug_int("FIX: fake_shmem: header write ret=", wr);
-
-    /* ftruncate to header + ring buffer (76 + 8192 = 8268) */
-    {
-        long total = 76 + 8192;
-        __asm__ volatile ("syscall" : "=a"(wr)
-            : "0"((long)SYS_ftruncate), "D"((long)shm_fd), "S"(total)
-            : "rcx", "r11", "memory");
-    }
-    debug_int("FIX: fake_shmem: ftruncate ret=", wr);
-
-    close(shm_fd);
-
-    /* Verify: try to open it back with O_RDONLY (same as steam client's poll) */
-    int verify_fd = shm_open(shm_name, O_RDONLY, 0);
-    debug_int("FIX: fake_shmem: VERIFY shm_open O_RDONLY fd=", (long)verify_fd);
-    if (verify_fd >= 0) {
-        unsigned char vbuf[8];
-        if (!real_read_ptr)
-            real_read_ptr = (real_read_fn)dlsym(RTLD_NEXT, "read");
-        ssize_t vr = real_read_ptr(verify_fd, vbuf, 8);
-        debug_int("FIX: fake_shmem: VERIFY read ret=", (long)vr);
-        if (vr > 0)
-            debug_hexdump("  verify hdr: ", vbuf, (int)vr);
-        close(verify_fd);
-    } else {
-        debug_int("FIX: fake_shmem: VERIFY FAILED errno=", (long)errno);
-    }
-
-    /* Step 2: Create shmem socket at /tmp/steam_chrome_shmem_uid<uid>_spid<spid> */
-    char sock_path[128];
-    {
-        char *p = sock_path;
-        const char *s = "/tmp/steam_chrome_shmem_uid";
-        while (*s) *p++ = *s++;
-        char tmp[20];
-        int_to_str(tmp, my_uid);
-        for (int i = 0; tmp[i]; i++) *p++ = tmp[i];
-        s = "_spid";
-        while (*s) *p++ = *s++;
-        int_to_str(tmp, spid);
-        for (int i = 0; tmp[i]; i++) *p++ = tmp[i];
-        *p = '\0';
-    }
-    debug_msg("FIX: fake_shmem: socket path: ");
-    debug_msg(sock_path);
-    debug_msg("\n");
-
-    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        debug_msg("FIX: fake_shmem: socket() failed\n");
-        return NULL;
-    }
-    debug_int("FIX: fake_shmem: socket fd=", sockfd);
-
-    /* bind() goes through our wrapper → converts to abstract socket */
-    struct sockaddr_un saddr;
-    memset(&saddr, 0, sizeof(saddr));
-    saddr.sun_family = AF_UNIX;
-    {
-        const char *s = sock_path;
-        int i = 0;
-        while (*s && i < (int)sizeof(saddr.sun_path) - 1) saddr.sun_path[i++] = *s++;
-        saddr.sun_path[i] = '\0';
-    }
-
-    int bret = bind(sockfd, (struct sockaddr *)&saddr,
-                    offsetof(struct sockaddr_un, sun_path) + strlen(sock_path) + 1);
-    debug_int("FIX: fake_shmem: bind ret=", bret);
-    if (bret < 0) {
-        debug_int("FIX: fake_shmem: bind errno=", errno);
-        close(sockfd);
-        return NULL;
-    }
-
-    int lret = listen(sockfd, 5);
-    debug_int("FIX: fake_shmem: listen ret=", lret);
-
-    debug_msg("FIX: fake_shmem: READY — waiting for steam client connection\n");
-
-    /* Accept loop — handle connections from steam client */
-    for (int ai = 0; ai < 10; ai++) {
-        int cfd = accept(sockfd, NULL, NULL);
-        if (cfd >= 0) {
-            debug_int("FIX: fake_shmem: CONNECTED! client_fd=", cfd);
-            /* Read whatever the client sends, log it for protocol analysis */
-            for (int ri = 0; ri < 100; ri++) {
-                unsigned char rbuf[1024];
-                if (!real_read_ptr)
-                    real_read_ptr = (real_read_fn)dlsym(RTLD_NEXT, "read");
-                ssize_t r = real_read_ptr(cfd, rbuf, sizeof(rbuf));
-                if (r <= 0) {
-                    debug_int("FIX: fake_shmem: client disconnected, r=", (long)r);
-                    break;
-                }
-                debug_int("FIX: fake_shmem: recv len=", (long)r);
-                debug_hexdump("  data: ", rbuf, r > 60 ? 60 : (int)r);
+            if (sent <= 10) {
+                debug_msg("FIX: BRIDGE: sent SCM_RIGHTS for ");
+                debug_msg(shm_tracked[i].name);
+                debug_int("  fd=", sfd);
+                debug_int("  sendmsg ret=", ret);
             }
-            close(cfd);
-        } else {
-            debug_int("FIX: fake_shmem: accept failed, errno=", errno);
-            /* EAGAIN/EINTR: retry; other: break */
-            if (errno != 4 && errno != 11) break;
+        }
+
+        /* Terminator: name_len=0, no cmsg */
+        {
+            unsigned char zero[2] = {0, 0};
+            if (!real_write_ptr)
+                real_write_ptr = (real_write_fn)dlsym(RTLD_NEXT, "write");
+            real_write_ptr(cfd, zero, 2);
+        }
+
+        close(cfd);
+        served++;
+        if (served <= 20) {
+            debug_int("FIX: BRIDGE: served #", served);
+            debug_int("  sent=", sent);
         }
     }
 
-    close(sockfd);
-    debug_msg("FIX: fake_shmem: thread exiting\n");
+    close(listenfd);
+    debug_int("FIX: BRIDGE: exiting, total=", served);
     return NULL;
 }
 
@@ -1357,14 +1312,14 @@ static void install_fixes(void) {
         }
     }
 
-    /* Start fake SHMemStream thread — creates shared memory + socket
-     * that the steam client polls for, since Chromium never inits fully */
+    /* Start SHM bridge thread — forwards Shm_ file data from 64-bit
+     * overlay to 32-bit side via abstract socket */
     {
-        pthread_t shmem_thread;
-        pthread_create(&shmem_thread, NULL, fake_shmem_func, NULL);
-        pthread_detach(shmem_thread);
-        debug_msg("FIX: started fake_shmem thread\n");
+        pthread_t bridge_thread;
+        pthread_create(&bridge_thread, NULL, shm_bridge_func, NULL);
+        pthread_detach(bridge_thread);
+        debug_msg("FIX: started shm_bridge thread\n");
     }
 
-    debug_msg("FIX-v93: + fake SHMemStream\n");
+    debug_msg("FIX-v100: + mmap header patch in bridge server\n");
 }

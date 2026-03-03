@@ -1,14 +1,15 @@
-/* Trace shim: LD_PRELOAD into steam/steamwebhelper to capture IPC protocol.
- * Logs: FD 11 read/write, socketpair, bind/connect/accept on shmem sockets,
- * shm_open, and CMsgBrowserReady detection.
+/* Trace shim v3: LD_PRELOAD into steam/steamwebhelper to capture IPC protocol.
+ * Safe version: only intercepts shm_open, write, read, socket ops.
+ * Monitors /dev/shm headers via a background thread (no mmap/close interception).
  *
- * Compile 64-bit: gcc -shared -fPIC -O2 -o trace_steam_ipc64.so trace_steam_ipc.c -ldl
- * Compile 32-bit: gcc -m32 -shared -fPIC -O2 -o trace_steam_ipc32.so trace_steam_ipc.c -ldl
+ * Compile 64-bit: gcc -shared -fPIC -O2 -w -o trace_steam_ipc64.so trace_steam_ipc.c -ldl -lrt -lpthread
+ * Compile 32-bit: gcc -m32 -shared -fPIC -O2 -w -o trace_steam_ipc32.so trace_steam_ipc.c -ldl -lrt -lpthread
  */
 #define _GNU_SOURCE
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <string.h>
 #include <stddef.h>
 #include <dlfcn.h>
@@ -18,10 +19,26 @@
 #include <errno.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <dirent.h>
 
 static FILE *logf = NULL;
 static pid_t my_pid = 0;
 static int is_32bit = 0;
+
+/* --- Track shm names opened by this process --- */
+#define MAX_SHM_NAMES 64
+static char shm_names[MAX_SHM_NAMES][128];
+static int shm_name_count = 0;
+
+static void track_shm_name(const char *name) {
+    if (shm_name_count < MAX_SHM_NAMES) {
+        strncpy(shm_names[shm_name_count], name, 127);
+        shm_names[shm_name_count][127] = '\0';
+        shm_name_count++;
+    }
+}
 
 static void ensure_log(void) {
     if (logf) return;
@@ -32,7 +49,7 @@ static void ensure_log(void) {
              is_32bit ? "32" : "64", my_pid);
     logf = fopen(path, "w");
     if (!logf) logf = stderr;
-    setvbuf(logf, NULL, _IOLBF, 0); /* line-buffered */
+    setvbuf(logf, NULL, _IOLBF, 0);
 }
 
 static double elapsed(void) {
@@ -62,6 +79,44 @@ static void log_msg(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* --- /dev/shm monitor thread --- */
+/* Reads Shm_ files from /dev/shm directly, no mmap interception needed */
+static void dump_shm_file(const char *path, const char *name) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    unsigned char buf[80];
+    ssize_t n = pread(fd, buf, sizeof(buf), 0);
+    close(fd);
+    if (n >= 16) {
+        unsigned int *h = (unsigned int *)buf;
+        log_msg("SHM_HDR[%s]: hdr[0]=%u hdr[1]=%u hdr[2]=%u hdr[3]=%u\n",
+                name, h[0], h[1], h[2], h[3]);
+        if (h[0] != 0 || h[1] != 0 || h[2] != 0 || h[3] != 0) {
+            log_hex("  raw: ", buf, n > 64 ? 64 : (int)n);
+        }
+    }
+}
+
+static void *shm_monitor_thread(void *arg) {
+    (void)arg;
+    while (1) {
+        sleep(2);
+        /* Scan /dev/shm for Shm_ files */
+        DIR *d = opendir("/dev/shm");
+        if (!d) continue;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strstr(ent->d_name, "Shm_") || strstr(ent->d_name, "ValveIPC")) {
+                char path[512];
+                snprintf(path, sizeof(path), "/dev/shm/%s", ent->d_name);
+                dump_shm_file(path, ent->d_name);
+            }
+        }
+        closedir(d);
+    }
+    return NULL;
+}
+
 /* ---- write() ---- */
 typedef ssize_t (*real_write_fn)(int, const void *, size_t);
 static real_write_fn real_write_ptr = NULL;
@@ -72,12 +127,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
     ssize_t ret = real_write_ptr(fd, buf, count);
     if (fd >= 3 && ret > 0 && buf) {
         const unsigned char *b = (const unsigned char *)buf;
-        /* Log sdPC messages on any fd */
         if (count >= 4 && b[0]=='s' && b[1]=='d' && b[2]=='P' && b[3]=='C') {
             log_msg("WRITE sdPC fd=%d count=%zd ret=%zd\n", fd, count, ret);
             log_hex("  data: ", buf, (int)(ret > 64 ? 64 : ret));
         }
-        /* Log single-byte writes on socket FDs (status bytes) */
         else if (count == 1 && fd < 256) {
             struct stat st;
             if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
@@ -99,12 +152,10 @@ ssize_t read(int fd, void *buf, size_t count) {
     ssize_t ret = real_read_ptr(fd, buf, count);
     if (fd >= 3 && ret > 0 && buf) {
         const unsigned char *b = (const unsigned char *)buf;
-        /* Log sdPC messages */
         if (ret >= 4 && b[0]=='s' && b[1]=='d' && b[2]=='P' && b[3]=='C') {
             log_msg("READ sdPC fd=%d count=%zd ret=%zd\n", fd, count, ret);
             log_hex("  data: ", buf, (int)(ret > 64 ? 64 : ret));
         }
-        /* Log single-byte reads on socket FDs */
         else if (ret == 1 && count <= 4 && fd < 256) {
             struct stat st;
             if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
@@ -220,19 +271,64 @@ int shm_open(const char *name, int oflag, mode_t mode) {
     if (!real_shm_open_ptr)
         real_shm_open_ptr = (real_shm_open_fn)dlsym(RTLD_NEXT, "shm_open");
     int fd = real_shm_open_ptr(name, oflag, mode);
-    if (strstr(name, "steam") || strstr(name, "shmem") || strstr(name, "chrome") ||
-        strstr(name, "Valve") || strstr(name, "Shm_")) {
-        log_msg("shm_open(%s, 0x%x, 0%o) => fd=%d\n", name, oflag, mode, fd);
+    log_msg("shm_open(%s, 0x%x, 0%o) => fd=%d\n", name, oflag, mode, fd);
+    if (fd >= 0) {
+        track_shm_name(name);
+        struct stat st;
+        if (fstat(fd, &st) == 0)
+            log_msg("  shm size=%ld\n", (long)st.st_size);
+        /* Dump header right after open */
+        unsigned char buf[64];
+        ssize_t n = pread(fd, buf, sizeof(buf), 0);
+        if (n >= 16) {
+            unsigned int *h = (unsigned int *)buf;
+            log_msg("  hdr: [0]=%u [1]=%u [2]=%u [3]=%u\n", h[0], h[1], h[2], h[3]);
+            if (h[0] != 0 || h[1] != 0 || h[3] != 0)
+                log_hex("  raw: ", buf, n > 64 ? 64 : (int)n);
+        }
     }
     return fd;
+}
+
+/* ---- shm_unlink() ---- */
+typedef int (*real_shm_unlink_fn)(const char *);
+static real_shm_unlink_fn real_shm_unlink_ptr = NULL;
+
+int shm_unlink(const char *name) {
+    if (!real_shm_unlink_ptr)
+        real_shm_unlink_ptr = (real_shm_unlink_fn)dlsym(RTLD_NEXT, "shm_unlink");
+    log_msg("shm_unlink(%s)\n", name);
+    return real_shm_unlink_ptr(name);
+}
+
+/* ---- ftruncate() ---- */
+typedef int (*real_ftruncate_fn)(int, off_t);
+static real_ftruncate_fn real_ftruncate_ptr = NULL;
+
+int ftruncate(int fd, off_t length) {
+    if (!real_ftruncate_ptr)
+        real_ftruncate_ptr = (real_ftruncate_fn)dlsym(RTLD_NEXT, "ftruncate");
+    int ret = real_ftruncate_ptr(fd, length);
+    /* Only log if it looks like a shm fd (small fd number or known) */
+    if (length > 0 && length < 100000000) {
+        char fdlink[64], fdpath[256];
+        snprintf(fdlink, sizeof(fdlink), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(fdlink, fdpath, sizeof(fdpath)-1);
+        if (n > 0) {
+            fdpath[n] = '\0';
+            if (strstr(fdpath, "shm") || strstr(fdpath, "Shm_") || strstr(fdpath, "Valve")) {
+                log_msg("FTRUNCATE fd=%d path=%s length=%ld ret=%d\n", fd, fdpath, (long)length, ret);
+            }
+        }
+    }
+    return ret;
 }
 
 __attribute__((constructor))
 static void init(void) {
     ensure_log();
-    log_msg("=== TRACE INIT pid=%d ppid=%d bits=%d ===\n", getpid(), getppid(), is_32bit ? 32 : 64);
+    log_msg("=== TRACE v3 pid=%d ppid=%d bits=%d ===\n", getpid(), getppid(), is_32bit ? 32 : 64);
 
-    /* Log FD 11 status */
     struct stat st;
     if (fstat(11, &st) == 0) {
         log_msg("FD 11: mode=0x%x %s\n", st.st_mode,
@@ -242,10 +338,13 @@ static void init(void) {
         log_msg("FD 11: not open\n");
     }
 
-    /* Log all open socket FDs */
     for (int fd = 3; fd < 64; fd++) {
-        if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode))
             log_msg("  socket fd=%d\n", fd);
-        }
     }
+
+    /* Start /dev/shm monitor thread */
+    pthread_t tid;
+    pthread_create(&tid, NULL, shm_monitor_thread, NULL);
+    pthread_detach(tid);
 }
