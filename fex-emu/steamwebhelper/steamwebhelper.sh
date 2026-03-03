@@ -1,5 +1,5 @@
 #!/bin/bash
-# PATCHED v50: exec (preserve PID for IPC) + minimal flags
+# PATCHED v91b: single-process + proxy-server=direct://
 
 set -u
 
@@ -31,9 +31,20 @@ mkdir -p "${REAL_DATADIR}" 2>/dev/null
 mkdir -p "${REAL_TMPDIR}" 2>/dev/null
 rm -f "${REAL_TMPDIR}/SingletonLock" "${REAL_TMPDIR}/SingletonSocket" "${REAL_TMPDIR}/SingletonCookie" 2>/dev/null
 rm -rf "${REAL_TMPDIR}/.com.valvesoftware.Steam."* 2>/dev/null
+rm -f "${REAL_DATADIR}/SingletonLock" "${REAL_DATADIR}/SingletonSocket" "${REAL_DATADIR}/SingletonCookie" 2>/dev/null
+rm -rf "${REAL_DATADIR}/.com.valvesoftware.Steam."* 2>/dev/null
 rm -rf /tmp/.com.valvesoftware.Steam.* 2>/dev/null
 mkdir -p /tmp 2>/dev/null
 chmod 1777 /tmp 2>/dev/null
+
+# Create /dev/shm if missing (Chromium needs it or --disable-dev-shm-usage)
+mkdir -p /dev/shm 2>/dev/null
+chmod 1777 /dev/shm 2>/dev/null
+
+# Create shm redirect directory for our shm_open wrapper
+# (FEX's /dev/shm doesn't work — redirect to real Android path)
+mkdir -p /data/data/com.mediatek.steamlauncher/cache/s/shm 2>/dev/null
+chmod 777 /data/data/com.mediatek.steamlauncher/cache/s/shm 2>/dev/null
 
 # Copy ICU data + resource paks to real Android path so Chromium can mmap them
 # FEX overlay has a bug where mmap on files accessed through symlinks fails
@@ -54,27 +65,37 @@ ARGS=()
 for arg in "$@"; do
     case "$arg" in
         -cachedir=*) ARGS+=("-cachedir=${REAL_DATADIR}") ;;
-        --disable-features=*) ARGS+=("${arg},NotReachedIsFatal"); FOUND_DISABLE_FEATURES=1 ;;
+        --disable-features=*) ARGS+=("${arg},NotReachedIsFatal,Vulkan"); FOUND_DISABLE_FEATURES=1 ;;
         *) ARGS+=("$arg") ;;
     esac
 done
 # Add NotReachedIsFatal even if Steam didn't pass --disable-features
 if [ "$FOUND_DISABLE_FEATURES" -eq 0 ]; then
-    ARGS+=("--disable-features=NotReachedIsFatal")
+    ARGS+=("--disable-features=NotReachedIsFatal,Vulkan")
 fi
 
-log "PATCHED v50: exec for IPC, minimal flags"
+export SDL_VIDEODRIVER=dummy
 
-# Use exec to REPLACE this script process with steamwebhelper.
-# This preserves the PID so Steam's IPC pipes/sockets reach the binary directly.
-# Original Steam script also uses exec chain: .sh → exec entry_point → exec steamwebhelper
-exec "${DIR}/steamwebhelper" \
-    --user-data-dir="${REAL_DATADIR}" \
-    --browser-subprocess-path="${DIR}/steamwebhelper" \
+log "PATCHED v91b: single-process + stat S_IFSOCK fake + proxy-server=direct://"
+
+# Capture ALL output to a debug file (logcat buffer too small).
+# Also keep output on stderr for the Android app's reader.
+DEBUG_LOG="${REAL_DATADIR}/webhelper_debug.log"
+> "${DEBUG_LOG}"
+log "Debug log: ${DEBUG_LOG}"
+
+# Run steamwebhelper and tee output (can't use exec with pipe)
+"${DIR}/steamwebhelper" \
+    --headless \
+    --ozone-platform=headless \
     --no-sandbox \
     --disable-gpu \
     --disable-gpu-sandbox \
     --disable-gpu-compositing \
+    --single-process \
+    --in-process-gpu \
+    --use-gl=disabled \
+    --disable-accelerated-video-decode \
     --disable-setuid-sandbox \
     --disable-seccomp-filter-sandbox \
     --disable-dev-shm-usage \
@@ -82,6 +103,14 @@ exec "${DIR}/steamwebhelper" \
     --disable-crash-reporter \
     --disable-crashpad-for-testing \
     --no-first-run \
+    --no-proxy-server \
+    --proxy-server=direct:// \
+    --disable-background-networking \
     --disable-field-trial-config \
+    --enable-logging \
+    --v=1 \
     --icu-data-dir="${REAL_DATADIR}" \
-    "${ARGS[@]}"
+    --user-data-dir="${REAL_DATADIR}" \
+    --browser-subprocess-path="${DIR}/steamwebhelper" \
+    "${ARGS[@]}" \
+    2>&1 | tee -a "${DEBUG_LOG}"
