@@ -1,5 +1,5 @@
 #!/bin/bash
-# PATCHED v91b: single-process + proxy-server=direct://
+# PATCHED v109: multi-process + CMsgBrowserReady Ring A patching
 
 set -u
 
@@ -76,7 +76,7 @@ fi
 
 export SDL_VIDEODRIVER=dummy
 
-log "PATCHED v91b: single-process + stat S_IFSOCK fake + proxy-server=direct://"
+log "PATCHED v109c: single-process + jitless + client-side CMsgBrowserReady"
 
 # Capture ALL output to a debug file (logcat buffer too small).
 # Also keep output on stderr for the Android app's reader.
@@ -85,15 +85,20 @@ DEBUG_LOG="${REAL_DATADIR}/webhelper_debug.log"
 log "Debug log: ${DEBUG_LOG}"
 
 # Run steamwebhelper and tee output (can't use exec with pipe)
+# v109c: Back to --single-process (most stable — no child crashes).
+# Multi-process caused GPU FATAL crash (exit_code=31 x6 → "Goodbye").
+# --in-process-gpu caused network service infinite crash loop.
+# --single-process avoids ALL child process crashes under FEX.
+# V8 proxy resolver warning is harmless with --no-proxy-server.
+# CMsgBrowserReady injected by 32-bit shim (client-side).
 "${DIR}/steamwebhelper" \
     --headless \
     --ozone-platform=headless \
+    --single-process \
     --no-sandbox \
     --disable-gpu \
     --disable-gpu-sandbox \
     --disable-gpu-compositing \
-    --single-process \
-    --in-process-gpu \
     --use-gl=disabled \
     --disable-accelerated-video-decode \
     --disable-setuid-sandbox \
@@ -107,10 +112,11 @@ log "Debug log: ${DEBUG_LOG}"
     --proxy-server=direct:// \
     --disable-background-networking \
     --disable-field-trial-config \
+    --disable-v8-sandbox \
+    --js-flags="--jitless --no-maglev --no-turbofan --no-expose-wasm" \
     --enable-logging \
     --v=1 \
     --icu-data-dir="${REAL_DATADIR}" \
     --user-data-dir="${REAL_DATADIR}" \
-    --browser-subprocess-path="${DIR}/steamwebhelper" \
     "${ARGS[@]}" \
     2>&1 | tee -a "${DEBUG_LOG}"

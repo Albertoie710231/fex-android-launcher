@@ -1,13 +1,12 @@
-/* v93: v91b + fake SHMemStream (creates shared memory + socket for steam IPC).
+/* v109: Re-enable CMsgBrowserReady patching on Ring A (server→client).
+ *       Shm_99462695 IS the webhelper→client channel. v108's assumption that
+ *       Ring A was client→server was WRONG. The "Invalid command" was pre-existing.
+ *       Also: deploy steamwebhelper.sh to correct filename.
  *
- * v85: + shm_open redirect works (ValveIPC + chrome_shmem)
- * v86: + heartbeat (38 threads, process ALIVE)
- * v87-v88: + FD 11 "sdPC" handshake (2R+2W then STOPS)
- * v89: + shm_open O_EXCL strip → ALL shm_open FIXED
- * v90: + accept errno/accept4
- * v91b: + fake FD 11 ready signal (Chromium init never completes in
- *         single-process mode due to V8 proxy resolver → no ready signal
- *         → steam client times out after 60s)
+ *       v108: removed --single-process from steamwebhelper.sh, stopped Ring A patching.
+ *       v107: persistent SHM patcher thread.
+ *       v106: X11 abstract socket rewrite in 32-bit shim.
+ *       v103: Auto-detect IPC fd from -child-update-ui-socket cmdline arg.
  */
 #define _GNU_SOURCE
 #include <signal.h>
@@ -116,6 +115,76 @@ static void debug_hexdump(const char *prefix, const void *data, int len) {
             : "0"((long)SYS_write), "D"(2L), "S"(buf), "d"((long)(p - buf))
             : "rcx", "r11", "memory");
         off = line_end;
+    }
+}
+
+/* v103: Auto-detect IPC fd from Steam's -child-update-ui-socket cmdline arg.
+ * Steam client passes the IPC socket fd number, which may be 11, 13, or other.
+ * -1 means no IPC fd found (process is not the webhelper child). */
+static volatile int ipc_fd = -1;
+
+static void detect_ipc_fd(void) {
+    /* Read /proc/self/cmdline (NUL-separated args) */
+    char cmdline[4096];
+    long fd;
+    __asm__ volatile ("syscall" : "=a"(fd)
+        : "0"((long)SYS_openat), "D"(-100L),
+          "S"("/proc/self/cmdline"), "d"((long)O_RDONLY)
+        : "rcx", "r11", "memory");
+    if (fd < 0) return;
+    long n;
+    __asm__ volatile ("syscall" : "=a"(n)
+        : "0"((long)SYS_read), "D"(fd), "S"(cmdline), "d"(4095L)
+        : "rcx", "r11", "memory");
+    long ret;
+    __asm__ volatile ("syscall" : "=a"(ret)
+        : "0"((long)SYS_close), "D"(fd)
+        : "rcx", "r11", "memory");
+    if (n <= 0) return;
+    cmdline[n] = '\0';
+
+    /* Scan NUL-separated args for "-child-update-ui-socket" */
+    const char *needle = "-child-update-ui-socket";
+    int needle_len = 23;
+    int pos = 0;
+    while (pos < n) {
+        /* Find end of current arg */
+        int arg_start = pos;
+        while (pos < n && cmdline[pos] != '\0') pos++;
+        int arg_len = pos - arg_start;
+        pos++; /* skip NUL */
+
+        /* Check if this arg matches */
+        if (arg_len == needle_len) {
+            int match = 1;
+            for (int i = 0; i < needle_len; i++) {
+                if (cmdline[arg_start + i] != needle[i]) { match = 0; break; }
+            }
+            if (match && pos < n) {
+                /* Next arg is the fd number */
+                long val = 0;
+                int dpos = pos;
+                while (dpos < n && cmdline[dpos] >= '0' && cmdline[dpos] <= '9') {
+                    val = val * 10 + (cmdline[dpos] - '0');
+                    dpos++;
+                }
+                if (val > 0 && val < 65536) {
+                    ipc_fd = (int)val;
+                    debug_int("FIX: detected IPC fd from cmdline: ", val);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* Fallback: scan fds 3-20 for open sockets (skip stdin/out/err) */
+    for (int sfd = 3; sfd <= 20; sfd++) {
+        struct stat st;
+        if (fstat(sfd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            /* First socket found — might be it. Don't use this as
+             * primary detection, just log for debugging. */
+            debug_int("FIX: fallback: socket fd=", sfd);
+        }
     }
 }
 
@@ -528,16 +597,16 @@ int chmod(const char *pathname, mode_t mode) {
 }
 
 /* ============================================================
- * FD 11 IPC MONITORING: Steam client uses FD 11 to communicate
- * with steamwebhelper. We need to see if steamwebhelper ever
- * writes to FD 11 (the "ready" signal) and if it reads from it.
+ * IPC FD MONITORING: Steam client passes an IPC socket to
+ * steamwebhelper via -child-update-ui-socket <N>.
+ * v103: auto-detect fd number (was hardcoded 11, but can be 13+).
  * ============================================================ */
 #include <sys/uio.h>
 
-static volatile int fd11_write_count = 0;
-static volatile int fd11_read_count = 0;
+static volatile int ipc_write_count = 0;
+static volatile int ipc_read_count = 0;
 
-/* write() wrapper — monitor FD 11 writes */
+/* write() wrapper — monitor IPC fd writes */
 typedef ssize_t (*real_write_fn)(int, const void *, size_t);
 static real_write_fn real_write_ptr = NULL;
 
@@ -545,23 +614,23 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if (!real_write_ptr)
         real_write_ptr = (real_write_fn)dlsym(RTLD_NEXT, "write");
 
-    /* Intercept the 1-byte '0' status write on FD 11 → change to '1' (ready) */
-    if (fd == 11 && count == 1 && buf && *(const unsigned char *)buf == '0') {
+    /* Intercept the 1-byte '0' status write on IPC fd → change to '1' (ready) */
+    if (ipc_fd >= 0 && fd == ipc_fd && count == 1 && buf && *(const unsigned char *)buf == '0') {
         char one = '1';
         ssize_t ret = real_write_ptr(fd, &one, 1);
-        int n = __sync_fetch_and_add(&fd11_write_count, 1);
+        int n = __sync_fetch_and_add(&ipc_write_count, 1);
         if (n < 50) {
-            debug_msg("FIX: WRITE fd=11 INTERCEPTED: '0' → '1' (fake ready)\n");
+            debug_int("FIX: WRITE ipc_fd INTERCEPTED '0'→'1' fd=", fd);
             debug_int("  ret=", (long)ret);
         }
         return ret;
     }
 
     ssize_t ret = real_write_ptr(fd, buf, count);
-    if (fd == 11) {
-        int n = __sync_fetch_and_add(&fd11_write_count, 1);
+    if (ipc_fd >= 0 && fd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: WRITE fd=11 pid=", get_pid());
+            debug_int("FIX: WRITE ipc_fd=", fd);
             debug_int("  count=", (long)count);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -570,7 +639,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
     return ret;
 }
 
-/* writev() wrapper — monitor FD 11 vector writes */
+/* writev() wrapper — monitor IPC fd vector writes */
 typedef ssize_t (*real_writev_fn)(int, const struct iovec *, int);
 static real_writev_fn real_writev_ptr = NULL;
 
@@ -578,10 +647,10 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     if (!real_writev_ptr)
         real_writev_ptr = (real_writev_fn)dlsym(RTLD_NEXT, "writev");
     ssize_t ret = real_writev_ptr(fd, iov, iovcnt);
-    if (fd == 11) {
-        int n = __sync_fetch_and_add(&fd11_write_count, 1);
+    if (ipc_fd >= 0 && fd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: WRITEV fd=11 pid=", get_pid());
+            debug_int("FIX: WRITEV ipc_fd=", fd);
             debug_int("  iovcnt=", (long)iovcnt);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && iov && iovcnt > 0 && iov[0].iov_base)
@@ -599,10 +668,10 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     if (!real_send_ptr)
         real_send_ptr = (real_send_fn)dlsym(RTLD_NEXT, "send");
     ssize_t ret = real_send_ptr(sockfd, buf, len, flags);
-    if (sockfd == 11) {
-        int n = __sync_fetch_and_add(&fd11_write_count, 1);
+    if (ipc_fd >= 0 && sockfd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: SEND fd=11 pid=", get_pid());
+            debug_int("FIX: SEND ipc_fd=", sockfd);
             debug_int("  len=", (long)len);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -619,10 +688,10 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     if (!real_sendmsg_ptr)
         real_sendmsg_ptr = (real_sendmsg_fn)dlsym(RTLD_NEXT, "sendmsg");
     ssize_t ret = real_sendmsg_ptr(sockfd, msg, flags);
-    if (sockfd == 11) {
-        int n = __sync_fetch_and_add(&fd11_write_count, 1);
+    if (ipc_fd >= 0 && sockfd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: SENDMSG fd=11 pid=", get_pid());
+            debug_int("FIX: SENDMSG ipc_fd=", sockfd);
             debug_int("  iovlen=", (long)(msg ? msg->msg_iovlen : -1));
             debug_int("  ret=", (long)ret);
         }
@@ -630,7 +699,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     return ret;
 }
 
-/* read() wrapper — monitor FD 11 reads */
+/* read() wrapper — monitor IPC fd reads */
 typedef ssize_t (*real_read_fn)(int, void *, size_t);
 static real_read_fn real_read_ptr = NULL;
 
@@ -638,10 +707,10 @@ ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read_ptr)
         real_read_ptr = (real_read_fn)dlsym(RTLD_NEXT, "read");
     ssize_t ret = real_read_ptr(fd, buf, count);
-    if (fd == 11) {
-        int n = __sync_fetch_and_add(&fd11_read_count, 1);
+    if (ipc_fd >= 0 && fd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: READ fd=11 pid=", get_pid());
+            debug_int("FIX: READ ipc_fd=", fd);
             debug_int("  count=", (long)count);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -658,10 +727,10 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
     if (!real_recv_ptr)
         real_recv_ptr = (real_recv_fn)dlsym(RTLD_NEXT, "recv");
     ssize_t ret = real_recv_ptr(sockfd, buf, len, flags);
-    if (sockfd == 11) {
-        int n = __sync_fetch_and_add(&fd11_read_count, 1);
+    if (ipc_fd >= 0 && sockfd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: RECV fd=11 pid=", get_pid());
+            debug_int("FIX: RECV ipc_fd=", sockfd);
             debug_int("  len=", (long)len);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -678,10 +747,10 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     if (!real_recvmsg_ptr)
         real_recvmsg_ptr = (real_recvmsg_fn)dlsym(RTLD_NEXT, "recvmsg");
     ssize_t ret = real_recvmsg_ptr(sockfd, msg, flags);
-    if (sockfd == 11) {
-        int n = __sync_fetch_and_add(&fd11_read_count, 1);
+    if (ipc_fd >= 0 && sockfd == ipc_fd) {
+        int n = __sync_fetch_and_add(&ipc_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: RECVMSG fd=11 pid=", get_pid());
+            debug_int("FIX: RECVMSG ipc_fd=", sockfd);
             debug_int("  ret=", (long)ret);
         }
     }
@@ -879,9 +948,10 @@ static void *heartbeat_func(void *arg) {
                 debug_int("  threads=", threads);
             }
         }
-        /* Report FD 11 I/O activity and accept count */
-        debug_int("  fd11_wr=", (long)fd11_write_count);
-        debug_int("  fd11_rd=", (long)fd11_read_count);
+        /* Report IPC fd I/O activity and accept count */
+        debug_int("  ipc_fd=", (long)ipc_fd);
+        debug_int("  ipc_wr=", (long)ipc_write_count);
+        debug_int("  ipc_rd=", (long)ipc_read_count);
         debug_int("  accepts=", (long)accept_count);
         debug_int("  accept_ok=", (long)accept_success_count);
         /* Read ValveIPCSharedObj at multiple offsets to find ready flag */
@@ -911,73 +981,71 @@ static void *heartbeat_func(void *arg) {
     return NULL;
 }
 
-/* FD 11 "fake ready" thread: the webhelper never signals "ready" because
+/* IPC "fake ready" thread: the webhelper never signals "ready" because
  * Chromium's init never completes in single-process mode (V8 proxy resolver).
- * The steam client waits ~60s on FD 11 for a ready message then gives up.
+ * The steam client waits ~60s on the IPC fd for a ready message then gives up.
  *
- * We monitor FD 11 writes: after the handshake (2 writes: 56-byte echo + '0'),
- * we wait 5 seconds then try writing additional messages to FD 11 to fake
- * the ready signal. We try multiple formats since we don't know the protocol. */
-static volatile int fd11_ready_sent = 0;
+ * v103: uses auto-detected ipc_fd instead of hardcoded 11. */
+static volatile int ipc_ready_sent = 0;
 
-static void *fd11_ready_func(void *arg) {
+static void *ipc_ready_func(void *arg) {
     (void)arg;
-    /* The handshake happens in a different process image (before exec),
-     * so fd11_write_count is always 0 here. Just wait a fixed 20s for
-     * Chromium to init, then send the ready signal. */
-    debug_msg("FIX: fd11_ready: waiting 20s for Chromium init...\n");
+    int my_ipc_fd = ipc_fd;
+    if (my_ipc_fd < 0) {
+        debug_msg("FIX: ipc_ready: no IPC fd, aborting\n");
+        return NULL;
+    }
+    debug_int("FIX: ipc_ready: waiting 20s, ipc_fd=", my_ipc_fd);
     struct timespec ts = { .tv_sec = 20, .tv_nsec = 0 };
     long ret;
     __asm__ volatile ("syscall" : "=a"(ret)
         : "0"((long)SYS_nanosleep), "D"(&ts), "S"((long)0)
         : "rcx", "r11", "memory");
 
-    /* Check that FD 11 is still open */
+    /* Check that IPC fd is still open */
     struct stat st;
-    if (fstat(11, &st) != 0) {
-        debug_msg("FIX: fd11_ready: FD 11 closed, aborting\n");
+    if (fstat(my_ipc_fd, &st) != 0) {
+        debug_int("FIX: ipc_ready: fd closed, aborting fd=", my_ipc_fd);
         return NULL;
     }
 
-    debug_msg("FIX: fd11_ready: sending fake ready signal to FD 11\n");
+    debug_int("FIX: ipc_ready: sending fake ready signal to fd=", my_ipc_fd);
 
     if (!real_write_ptr)
         real_write_ptr = (real_write_fn)dlsym(RTLD_NEXT, "write");
 
-    /* First: read any pending data on FD 11 (the handshake messages from steam client) */
+    /* First: drain pending data from the IPC fd */
     unsigned char rdbuf[256];
     for (int i = 0; i < 5; i++) {
-        /* Non-blocking read to drain pending data */
-        int flags = fcntl(11, F_GETFL);
-        fcntl(11, F_SETFL, flags | O_NONBLOCK);
-        ssize_t r = read(11, rdbuf, sizeof(rdbuf));
-        fcntl(11, F_SETFL, flags); /* restore */
+        int flags = fcntl(my_ipc_fd, F_GETFL);
+        fcntl(my_ipc_fd, F_SETFL, flags | O_NONBLOCK);
+        ssize_t r = read(my_ipc_fd, rdbuf, sizeof(rdbuf));
+        fcntl(my_ipc_fd, F_SETFL, flags);
         if (r > 0) {
-            debug_int("FIX: fd11_ready: drained pending data, len=", (long)r);
+            debug_int("FIX: ipc_ready: drained pending data, len=", (long)r);
             debug_hexdump("  data: ", rdbuf, r > 60 ? 60 : (int)r);
         } else {
             break;
         }
     }
 
-    /* Write sdPC echo (same as the handshake reply the wrapper already sent) */
+    /* Write sdPC echo */
     unsigned char ready_msg[56];
     memset(ready_msg, 0, sizeof(ready_msg));
     ready_msg[0] = 's'; ready_msg[1] = 'd'; ready_msg[2] = 'P'; ready_msg[3] = 'C';
     ready_msg[4] = 0x02; /* version = 2 */
-    ready_msg[8] = 0x01; /* type = 1 (same as handshake) */
+    ready_msg[8] = 0x01; /* type = 1 */
 
-    ssize_t n = real_write_ptr(11, ready_msg, 56);
-    debug_int("FIX: fd11_ready: wrote sdPC type=1, ret=", (long)n);
+    ssize_t n = real_write_ptr(my_ipc_fd, ready_msg, 56);
+    debug_int("FIX: ipc_ready: wrote sdPC type=1, ret=", (long)n);
 
     if (n == 56) {
-        /* Write '1' as status (handshake sent '0', try '1' for ready) */
         char one = '1';
-        n = real_write_ptr(11, &one, 1);
-        debug_int("FIX: fd11_ready: wrote '1' status, ret=", (long)n);
+        n = real_write_ptr(my_ipc_fd, &one, 1);
+        debug_int("FIX: ipc_ready: wrote '1' status, ret=", (long)n);
     }
 
-    fd11_ready_sent = 1;
+    ipc_ready_sent = 1;
     return NULL;
 }
 
@@ -1099,10 +1167,42 @@ static void *shm_bridge_func(void *arg) {
 
     if (!real_bind_ptr)
         real_bind_ptr = (real_bind_fn)dlsym(RTLD_NEXT, "bind");
-    int bret = real_bind_ptr(listenfd, (struct sockaddr *)&baddr,
+
+    /* v103: Retry bind on EADDRINUSE (old process may still hold socket).
+     * Try connect first — if old server responds, skip (it's still alive). */
+    int bret = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        bret = real_bind_ptr(listenfd, (struct sockaddr *)&baddr,
                              offsetof(struct sockaddr_un, sun_path) + BRIDGE_SOCK_NAME_LEN);
+        if (bret == 0) break;
+        if (errno != EADDRINUSE) break;
+
+        /* EADDRINUSE: check if old server is alive by trying to connect */
+        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (probe >= 0) {
+            if (!real_connect_ptr)
+                real_connect_ptr = (real_connect_fn)dlsym(RTLD_NEXT, "connect");
+            int cret = real_connect_ptr(probe, (struct sockaddr *)&baddr,
+                offsetof(struct sockaddr_un, sun_path) + BRIDGE_SOCK_NAME_LEN);
+            close(probe);
+            if (cret == 0) {
+                /* Old server is alive and accepting — we're a duplicate, exit */
+                debug_int("FIX: BRIDGE: old server alive, skipping (retry=", retry);
+                close(listenfd);
+                return NULL;
+            }
+        }
+        /* Old server not responding but socket stuck — wait and retry */
+        debug_int("FIX: BRIDGE: EADDRINUSE, retry #", retry + 1);
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        /* Re-create socket for retry */
+        close(listenfd);
+        listenfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listenfd < 0) return NULL;
+    }
     if (bret < 0) {
-        debug_int("FIX: BRIDGE: bind failed errno=", errno);
+        debug_int("FIX: BRIDGE: bind failed after retries, errno=", errno);
         close(listenfd);
         return NULL;
     }
@@ -1145,44 +1245,9 @@ static void *shm_bridge_func(void *arg) {
             int name_len = 0;
             while (shm_tracked[i].name[name_len]) name_len++;
 
-            /* v102: Patch Shm_ header via mmap BEFORE sending fd.
-             * CORRECT SHMemStream header (from local Steam trace):
-             *   hdr[0] = get  (read cursor, 0-based into ring buffer)
-             *   hdr[1] = put  (write cursor, 0-based into ring buffer)
-             *   hdr[2] = capacity (ring buffer size)
-             *   hdr[3] = pending (bytes available = put - get)
-             * Ring buffer data starts at file offset 16. */
-            {
-                struct stat bst;
-                if (fstat(sfd, &bst) == 0 && bst.st_size >= 16) {
-                    void *bmap = mmap(NULL, bst.st_size,
-                        PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
-                    if (bmap != MAP_FAILED) {
-                        unsigned int *bhdr = (unsigned int *)bmap;
-                        if (bhdr[0] == 0 && bhdr[1] == 0 && bhdr[2] == 8192) {
-                            /* Write CMsgBrowserReady to ring buffer at offset 0.
-                             * Message format: [4B type][4B size][payload]
-                             * Type=0 (BrowserReady), size=2, payload=08 01 */
-                            unsigned char *ring = (unsigned char *)bmap + 16;
-                            unsigned int msg_type = 0;
-                            unsigned int msg_size = 2;
-                            memcpy(ring, &msg_type, 4);
-                            memcpy(ring + 4, &msg_size, 4);
-                            ring[8] = 0x08;  /* protobuf field 1, varint */
-                            ring[9] = 0x01;  /* browser_handle = 1 */
-
-                            /* Set cursors: 10 bytes written, ready to read */
-                            bhdr[0] = 0;    /* get = 0 */
-                            bhdr[1] = 10;   /* put = 10 */
-                            bhdr[3] = 10;   /* pending = 10 */
-                            __sync_synchronize();
-                            msync(bmap, 32, MS_SYNC);
-                            debug_msg("FIX: BRIDGE: patched hdr (get=0 put=10 pending=10) + CMsgBrowserReady\n");
-                        }
-                        munmap(bmap, bst.st_size);
-                    }
-                }
-            }
+            /* v107: CMsgBrowserReady patching moved to shm_patcher_func thread.
+             * The one-shot patch here was unreliable — webhelper's own init
+             * would overwrite it. The patcher thread re-applies every 200ms. */
 
             int ret = send_fd_with_name(cfd, shm_tracked[i].name, name_len, sfd);
             sent++;
@@ -1213,6 +1278,283 @@ static void *shm_bridge_func(void *arg) {
 
     close(listenfd);
     debug_int("FIX: BRIDGE: exiting, total=", served);
+    return NULL;
+}
+
+/* ============================================================
+ * SHM PATCHER v107b: Persistent thread that keeps CMsgBrowserReady
+ * in Shm_ ring buffers until the 32-bit client consumes them.
+ *
+ * v107: Discovered the Shm_ file has TWO ring buffers:
+ *   Ring A (offset 16): client→server (commands) — webhelper READS
+ *   Ring B (offset 16+cap+16): server→client (responses) — client READS
+ * v107 wrote to Ring A → webhelper read it as "Invalid command"!
+ * v107b writes to Ring B (server→client direction).
+ *
+ * File layout (probed from file size):
+ *   [Header A: 16 bytes][Ring A: cap bytes][Header B: 16 bytes][Ring B: cap bytes]
+ *   Header: [get:4][put:4][cap:4][pending:4]
+ *   Total expected: 16 + cap + 16 + cap = 32 + 2*cap
+ * ============================================================ */
+static void *shm_patcher_func(void *arg) {
+    (void)arg;
+    debug_msg("FIX: SHM_PATCHER v109: starting\n");
+
+    /* Wait for at least one tracked Shm_ file */
+    for (int w = 0; w < 300 && shm_tracked_count == 0; w++) {
+        struct timespec ts = {0, 200000000L}; /* 200ms */
+        nanosleep(&ts, NULL);
+    }
+    int count = shm_tracked_count;
+    if (count <= 0) {
+        debug_msg("FIX: SHM_PATCHER: no Shm_ files tracked, exiting\n");
+        return NULL;
+    }
+    if (count > MAX_SHM_TRACKED) count = MAX_SHM_TRACKED;
+    debug_int("FIX: SHM_PATCHER: tracking count=", count);
+
+    /* mmap each tracked Shm_ file (MAP_SHARED for live updates) */
+    struct {
+        void *map;
+        long size;
+        int done;    /* 1 = consumed or failed, stop patching */
+        int patches; /* number of times we patched this file */
+        long ring_b_hdr_off; /* offset to Ring B header (server→client) */
+        long ring_b_data_off; /* offset to Ring B data */
+    } maps[MAX_SHM_TRACKED];
+    memset(maps, 0, sizeof(maps));
+
+    for (int i = 0; i < count; i++) {
+        if (!shm_tracked[i].active) { maps[i].done = 1; continue; }
+        int sfd = shm_tracked[i].shm_fd;
+        if (sfd < 0) { maps[i].done = 1; continue; }
+
+        struct stat bst;
+        if (fstat(sfd, &bst) != 0 || bst.st_size < 16) {
+            maps[i].map = NULL;
+            continue;
+        }
+        maps[i].size = bst.st_size;
+        debug_int("FIX: SHM_PATCHER: file size idx=", i);
+        debug_int("  size=", bst.st_size);
+        maps[i].map = mmap(NULL, bst.st_size,
+            PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+        if (maps[i].map == MAP_FAILED) {
+            maps[i].map = NULL;
+            maps[i].done = 1;
+            debug_int("FIX: SHM_PATCHER: mmap failed for idx=", i);
+            continue;
+        }
+
+        /* Probe file layout: dump first 48 bytes of header */
+        {
+            unsigned char *raw = (unsigned char *)maps[i].map;
+            int dump_len = bst.st_size < 48 ? (int)bst.st_size : 48;
+            debug_msg("FIX: SHM_PATCHER: header dump: ");
+            debug_hexdump("  ", raw, dump_len);
+        }
+    }
+
+    /* Poll loop: wait for capacity, find Ring B, patch every 200ms */
+    int all_done = 0;
+    for (int cycle = 0; cycle < 600 && !all_done; cycle++) { /* 600*200ms = 120s */
+        struct timespec ts = {0, 200000000L};
+        nanosleep(&ts, NULL);
+
+        all_done = 1;
+        for (int i = 0; i < count; i++) {
+            if (maps[i].done) continue;
+
+            /* Lazy mmap if not done yet (file may have grown) */
+            if (!maps[i].map) {
+                int sfd = shm_tracked[i].shm_fd;
+                struct stat bst;
+                if (sfd < 0 || fstat(sfd, &bst) != 0 || bst.st_size < 16)
+                    { all_done = 0; continue; }
+                /* Re-mmap if file grew */
+                if (bst.st_size > maps[i].size) {
+                    maps[i].size = bst.st_size;
+                    debug_int("FIX: SHM_PATCHER: file grew, new size=", bst.st_size);
+                }
+                maps[i].map = mmap(NULL, maps[i].size,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+                if (maps[i].map == MAP_FAILED) {
+                    maps[i].map = NULL;
+                    maps[i].done = 1;
+                    continue;
+                }
+            }
+
+            /* Also check for file growth (webhelper may ftruncate later) */
+            {
+                int sfd = shm_tracked[i].shm_fd;
+                struct stat bst;
+                if (sfd >= 0 && fstat(sfd, &bst) == 0 && bst.st_size > maps[i].size) {
+                    munmap(maps[i].map, maps[i].size);
+                    maps[i].size = bst.st_size;
+                    maps[i].map = mmap(NULL, bst.st_size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+                    if (maps[i].map == MAP_FAILED) {
+                        maps[i].map = NULL;
+                        maps[i].done = 1;
+                        continue;
+                    }
+                    debug_int("FIX: SHM_PATCHER: remapped, new size=", bst.st_size);
+                }
+            }
+
+            unsigned int *hdr_a = (unsigned int *)maps[i].map;
+            unsigned int cap_a = hdr_a[2];
+
+            /* Find Ring B header offset (if not yet found) */
+            if (maps[i].ring_b_hdr_off == 0 && cap_a > 0) {
+                /* Expected layout: [HdrA:16][RingA:cap][HdrB:16][RingB:cap] */
+                long ring_b_off = 16 + (long)cap_a;
+                long min_size = ring_b_off + 16; /* need at least HdrB */
+                if (maps[i].size >= min_size) {
+                    maps[i].ring_b_hdr_off = ring_b_off;
+                    maps[i].ring_b_data_off = ring_b_off + 16;
+                    debug_int("FIX: SHM_PATCHER: Ring B found at offset=", ring_b_off);
+                    debug_int("  file_size=", maps[i].size);
+                    /* Dump Ring B header */
+                    unsigned int *hdr_b = (unsigned int *)((char *)maps[i].map + ring_b_off);
+                    debug_int("  B.get=", hdr_b[0]);
+                    debug_int("  B.put=", hdr_b[1]);
+                    debug_int("  B.cap=", hdr_b[2]);
+                    debug_int("  B.pend=", hdr_b[3]);
+                } else {
+                    /* File not big enough for two ring buffers — try single */
+                    debug_int("FIX: SHM_PATCHER: single ring? size=", maps[i].size);
+                    debug_int("  need=", min_size);
+                }
+            }
+
+            /* Log header state periodically (every 5s = 25 cycles) */
+            if (cycle % 25 == 0) {
+                debug_int("FIX: SHM_PATCHER: [", i);
+                debug_int("] A.get=", hdr_a[0]);
+                debug_int("  A.put=", hdr_a[1]);
+                debug_int("  A.cap=", cap_a);
+                debug_int("  A.pend=", hdr_a[3]);
+                if (maps[i].ring_b_hdr_off > 0) {
+                    unsigned int *hdr_b = (unsigned int *)((char *)maps[i].map + maps[i].ring_b_hdr_off);
+                    debug_int("  B.get=", hdr_b[0]);
+                    debug_int("  B.put=", hdr_b[1]);
+                    debug_int("  B.cap=", hdr_b[2]);
+                    debug_int("  B.pend=", hdr_b[3]);
+                }
+                debug_int("  patches=", maps[i].patches);
+            }
+
+            /* Try patching Ring B (server→client) if available */
+            if (maps[i].ring_b_hdr_off > 0) {
+                unsigned int *hdr_b = (unsigned int *)((char *)maps[i].map + maps[i].ring_b_hdr_off);
+                unsigned int b_get = hdr_b[0];
+                unsigned int b_put = hdr_b[1];
+                unsigned int b_cap = hdr_b[2];
+                unsigned int b_pend = hdr_b[3];
+
+                /* Client consumed message: get moved past 0 */
+                if (b_get > 0) {
+                    debug_int("FIX: SHM_PATCHER: CONSUMED! idx=", i);
+                    debug_int("  B.get=", b_get);
+                    debug_int("  after patches=", maps[i].patches);
+                    maps[i].done = 1;
+                    continue;
+                }
+
+                /* Ring B ready (cap set) and empty: patch it */
+                if (b_cap > 0 && b_put == 0 && b_pend == 0) {
+                    unsigned char *ring = (unsigned char *)maps[i].map + maps[i].ring_b_data_off;
+                    /* CMsgBrowserReady: type=0, size=2, payload=08 01 */
+                    unsigned int msg_type = 0;
+                    unsigned int msg_size = 2;
+                    memcpy(ring, &msg_type, 4);
+                    memcpy(ring + 4, &msg_size, 4);
+                    ring[8] = 0x08;  /* protobuf field 1, varint */
+                    ring[9] = 0x01;  /* browser_handle = 1 */
+                    __sync_synchronize();
+                    hdr_b[1] = 10;   /* put = 10 */
+                    hdr_b[3] = 10;   /* pending = 10 */
+                    __sync_synchronize();
+                    msync((char *)maps[i].map + maps[i].ring_b_hdr_off, 32, MS_SYNC);
+                    maps[i].patches++;
+                    if (maps[i].patches <= 10 || (maps[i].patches % 50 == 0)) {
+                        debug_int("FIX: SHM_PATCHER: patched Ring B idx=", i);
+                        debug_int("  patch#=", maps[i].patches);
+                        debug_int("  cycle=", cycle);
+                    }
+                }
+            } else if (cap_a == 0) {
+                /* Ring A not initialized yet — keep waiting */
+            } else {
+                /* v109: Ring A IS the server→client channel for Shm_99462695.
+                 * The webhelper creates this file. The 32-bit client reads it.
+                 * Wait 15s for Chromium to write CMsgBrowserReady natively,
+                 * then inject it ourselves if the ring is still empty. */
+                unsigned int a_get = hdr_a[0];
+                unsigned int a_put = hdr_a[1];
+                unsigned int a_pend = hdr_a[3];
+
+                /* Client consumed: get moved past 0 */
+                if (a_get > 0) {
+                    debug_int("FIX: SHM_PATCHER: Ring A CONSUMED! idx=", i);
+                    debug_int("  A.get=", a_get);
+                    debug_int("  patches=", maps[i].patches);
+                    maps[i].done = 1;
+                    continue;
+                }
+
+                /* Wait 75 cycles (15s) for Chromium to write natively */
+                if (cycle < 75) {
+                    if (cycle % 25 == 0) {
+                        debug_int("FIX: SHM_PATCHER: waiting for native write, cycle=", cycle);
+                    }
+                } else if (a_put == 0 && a_pend == 0 && cap_a > 0) {
+                    /* Ring A still empty after 15s — inject CMsgBrowserReady */
+                    unsigned char *ring = (unsigned char *)maps[i].map + 16;
+                    unsigned int msg_type = 0;
+                    unsigned int msg_size = 2;
+                    memcpy(ring, &msg_type, 4);
+                    memcpy(ring + 4, &msg_size, 4);
+                    ring[8] = 0x08;  /* protobuf field 1, varint */
+                    ring[9] = 0x01;  /* browser_handle = 1 */
+                    __sync_synchronize();
+                    hdr_a[1] = 10;   /* put = 10 */
+                    hdr_a[3] = 10;   /* pending = 10 */
+                    __sync_synchronize();
+                    msync(maps[i].map, 32, MS_SYNC);
+                    maps[i].patches++;
+                    if (maps[i].patches <= 5 || (maps[i].patches % 50 == 0)) {
+                        debug_int("FIX: SHM_PATCHER: patched Ring A idx=", i);
+                        debug_int("  patch#=", maps[i].patches);
+                        debug_int("  cycle=", cycle);
+                    }
+                }
+            }
+
+            all_done = 0;
+        }
+    }
+
+    /* Cleanup mmaps */
+    for (int i = 0; i < count; i++) {
+        if (maps[i].map && maps[i].map != MAP_FAILED) {
+            unsigned int *hdr = (unsigned int *)maps[i].map;
+            debug_int("FIX: SHM_PATCHER: final idx=", i);
+            debug_int("  A.get=", hdr[0]);
+            debug_int("  A.put=", hdr[1]);
+            if (maps[i].ring_b_hdr_off > 0) {
+                unsigned int *hdr_b = (unsigned int *)((char *)maps[i].map + maps[i].ring_b_hdr_off);
+                debug_int("  B.get=", hdr_b[0]);
+                debug_int("  B.put=", hdr_b[1]);
+            }
+            debug_int("  total_patches=", maps[i].patches);
+            munmap(maps[i].map, maps[i].size);
+        }
+    }
+
+    debug_msg("FIX: SHM_PATCHER: exiting\n");
     return NULL;
 }
 
@@ -1273,47 +1615,49 @@ static void install_fixes(void) {
     /* Re-register robust_list in forked children */
     pthread_atfork(NULL, NULL, child_fork_handler);
 
-    /* Check if FD 11 (parent IPC socket) is open.
-     * Steam passes -child-update-ui-socket 11 to steamwebhelper.
-     * If FD 11 is closed, the main IPC channel to steam is broken. */
+    /* v103: Auto-detect IPC fd from cmdline */
+    detect_ipc_fd();
+
+    /* Log IPC fd status and all open sockets/pipes */
     {
         struct stat st;
-        if (fstat(11, &st) == 0) {
-            debug_msg("FIX: FD 11 (parent IPC socket) OPEN, type=");
-            if (S_ISSOCK(st.st_mode)) debug_msg("socket\n");
-            else if (S_ISFIFO(st.st_mode)) debug_msg("pipe\n");
-            else debug_int("other mode=", st.st_mode & S_IFMT);
+        if (ipc_fd >= 0 && fstat(ipc_fd, &st) == 0) {
+            debug_int("FIX: IPC fd OPEN: ", ipc_fd);
+            if (S_ISSOCK(st.st_mode)) debug_msg("  type=socket\n");
+            else if (S_ISFIFO(st.st_mode)) debug_msg("  type=pipe\n");
+            else debug_int("  type=", st.st_mode & S_IFMT);
+        } else if (ipc_fd >= 0) {
+            debug_int("FIX: IPC fd CLOSED! fd=", ipc_fd);
         } else {
-            debug_msg("FIX: FD 11 (parent IPC socket) CLOSED!\n");
+            debug_msg("FIX: no IPC fd detected (not webhelper child)\n");
         }
-        /* Also check FDs 3-15 for any open sockets/pipes */
-        for (int fd = 3; fd <= 15; fd++) {
+        /* Also check FDs 3-20 for any open sockets/pipes */
+        for (int fd = 3; fd <= 20; fd++) {
             if (fstat(fd, &st) == 0 && (S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode))) {
                 debug_int("FIX: FD open: fd=", fd);
             }
         }
     }
 
-    /* Start heartbeat thread — logs every 15s to confirm process is alive. */
+    /* Start heartbeat thread */
     {
         pthread_t hb_thread;
         pthread_create(&hb_thread, NULL, heartbeat_func, NULL);
         pthread_detach(hb_thread);
     }
 
-    /* Start FD 11 fake ready thread — only in the process where FD 11 is open */
-    {
+    /* Start IPC fake ready thread — only if IPC fd is valid and open */
+    if (ipc_fd >= 0) {
         struct stat st;
-        if (fstat(11, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        if (fstat(ipc_fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
             pthread_t ready_thread;
-            pthread_create(&ready_thread, NULL, fd11_ready_func, NULL);
+            pthread_create(&ready_thread, NULL, ipc_ready_func, NULL);
             pthread_detach(ready_thread);
-            debug_msg("FIX: started fd11_ready thread\n");
+            debug_int("FIX: started ipc_ready thread, fd=", ipc_fd);
         }
     }
 
-    /* Start SHM bridge thread — forwards Shm_ file data from 64-bit
-     * overlay to 32-bit side via abstract socket */
+    /* Start SHM bridge thread */
     {
         pthread_t bridge_thread;
         pthread_create(&bridge_thread, NULL, shm_bridge_func, NULL);
@@ -1321,5 +1665,13 @@ static void install_fixes(void) {
         debug_msg("FIX: started shm_bridge thread\n");
     }
 
-    debug_msg("FIX-v100: + mmap header patch in bridge server\n");
+    /* v107: Start persistent SHM patcher thread */
+    {
+        pthread_t patcher_thread;
+        pthread_create(&patcher_thread, NULL, shm_patcher_func, NULL);
+        pthread_detach(patcher_thread);
+        debug_msg("FIX: started shm_patcher thread\n");
+    }
+
+    debug_msg("FIX-v109: + Ring A CMsgBrowserReady patcher\n");
 }

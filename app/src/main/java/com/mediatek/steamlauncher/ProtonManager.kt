@@ -438,7 +438,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
                 echo "=== Starting Steam client ==="
                 cd "${'$'}STEAMDIR"
                 bash steam.sh $loginFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
-                    -nobootstrapupdate -skipstreamingdrivers \
+                    -nobootstrapupdate -skipstreamingdrivers -smallmode \
                     2>&1 | tee /tmp/steam_new.log
             else
                 echo "ERROR: Steam client not found at ${'$'}STEAMDIR/ubuntu12_32/steam"

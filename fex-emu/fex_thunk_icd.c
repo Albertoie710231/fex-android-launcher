@@ -530,6 +530,7 @@ typedef void (*PFN_vkGetPhysDeviceProps2)(void*, void*);
 static PFN_vkGetPhysDeviceProps2 real_get_phys_dev_props2 = NULL;
 
 static void wrapped_GetPhysicalDeviceProperties2(void* physDev, void* pProps2) {
+    LOG("GetPhysDeviceProps2 ENTER: pd=%p pProps2=%p\n", physDev, pProps2);
     real_get_phys_dev_props2(physDev, pProps2);
     if (pProps2) {
         /* VkPhysicalDeviceProperties2: sType(4)+pad(4)+pNext(8)+properties(...)
@@ -540,6 +541,110 @@ static void wrapped_GetPhysicalDeviceProperties2(void* physDev, void* pProps2) {
             *apiVer = TARGET_API_VERSION;
             LOG("GetPhysDeviceProps2: apiVersion capped 0x%x -> 0x%x\n",
                 orig, TARGET_API_VERSION);
+        }
+
+        /* Walk pNext chain to patch properties (bionic-vulkan-wrapper compat) */
+        typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } PropBase;
+        PropBase* node = (PropBase*)(*(void**)((uint8_t*)pProps2 + 8));
+        int pnIdx = 0;
+        while (node) {
+            LOG("  Props2 pNext[%d] sType=%u (0x%x)\n", pnIdx++, node->sType, node->sType);
+            switch (node->sType) {
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT = 1000281001
+             * Layout: sType(4)+pad(4)+pNext(8)+storageTexelAlign(8)+storageTexelSingleAlign(4)+
+             *         pad(4)+uniformTexelAlign(8)+uniformTexelSingleAlign(4)
+             * Force alignment=1 so DXVK doesn't assume stricter alignment than Mali provides */
+            case 1000281001: {
+                uint64_t* storageAlign = (uint64_t*)((uint8_t*)node + 16);
+                uint64_t* uniformAlign = (uint64_t*)((uint8_t*)node + 32);
+                if (*storageAlign != 1 || *uniformAlign != 1) {
+                    LOG("Props2: TexelBufferAlignment: storage=%llu->1 uniform=%llu->1\n",
+                        (unsigned long long)*storageAlign, (unsigned long long)*uniformAlign);
+                    *storageAlign = 1;
+                    *uniformAlign = 1;
+                }
+                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES = 51
+             * subgroupSupportedOperations at offset 280, subgroupSupportedStages at offset 276
+             * Relative to struct start: sType(4)+pad(4)+pNext(8) = 16 header
+             * Vulkan11Props: deviceUUID(16)+driverUUID(16)+deviceLUID(8)+deviceNodeMask(4)+
+             *   deviceLUIDValid(4)+subgroupSize(4)+subgroupSupportedStages(4)+
+             *   subgroupSupportedOperations(4)+...
+             * subgroupSupportedStages at offset 16+48=64, subgroupSupportedOperations at 68 */
+            case 51: {
+                uint32_t* subStages = (uint32_t*)((uint8_t*)node + 64);
+                uint32_t* subOps    = (uint32_t*)((uint8_t*)node + 68);
+                if (*subStages != 0 || *subOps != 0) {
+                    LOG("Props2: Vulkan11: subgroupStages=0x%x->0 subgroupOps=0x%x->0\n",
+                        *subStages, *subOps);
+                    *subStages = 0;
+                    *subOps = 0;
+                }
+                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES = 52
+             * Float controls: set denorm/rounding to NONE/false to prevent DXVK
+             * from relying on specific float behavior Mali doesn't guarantee.
+             * denormBehaviorIndependence at offset 16+96=112 (4 bytes, enum)
+             * roundingModeIndependence at offset 116 (4 bytes, enum) */
+            case 52: {
+                uint32_t* denormIndep = (uint32_t*)((uint8_t*)node + 112);
+                uint32_t* roundIndep  = (uint32_t*)((uint8_t*)node + 116);
+                if (*denormIndep != 0 || *roundIndep != 0) {
+                    LOG("Props2: Vulkan12: denormIndep=%u->0 roundIndep=%u->0\n",
+                        *denormIndep, *roundIndep);
+                    *denormIndep = 0; /* VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE */
+                    *roundIndep  = 0;
+                }
+                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES = 53
+             * storageTexelBufferOffsetAlignmentBytes at offset 16+252=268 (uint64)
+             * uniformTexelBufferOffsetAlignmentBytes at offset 284 (uint64) */
+            case 53: {
+                uint64_t* stTexelAlign = (uint64_t*)((uint8_t*)node + 268);
+                uint64_t* unTexelAlign = (uint64_t*)((uint8_t*)node + 284);
+                if (*stTexelAlign != 1 || *unTexelAlign != 1) {
+                    LOG("Props2: Vulkan13: stTexelAlign=%llu->1 unTexelAlign=%llu->1\n",
+                        (unsigned long long)*stTexelAlign, (unsigned long long)*unTexelAlign);
+                    *stTexelAlign = 1;
+                    *unTexelAlign = 1;
+                }
+                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000
+             * Layout: sType(4)+pad(4)+pNext(8)+subgroupSize(4)+supportedStages(4)+
+             *         supportedOperations(4)+quadOperationsInAllStages(4) */
+            case 1000094000: {
+                uint32_t* supStages = (uint32_t*)((uint8_t*)node + 20);
+                uint32_t* supOps    = (uint32_t*)((uint8_t*)node + 24);
+                if (*supStages != 0 || *supOps != 0) {
+                    LOG("Props2: Subgroup: stages=0x%x->0 ops=0x%x->0\n",
+                        *supStages, *supOps);
+                    *supStages = 0;
+                    *supOps = 0;
+                }
+                break;
+            }
+            /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR = 1000197000
+             * Same as Vulkan 1.2 float controls but standalone extension struct.
+             * Layout: sType(4)+pad(4)+pNext(8)+denormBehaviorIndependence(4)+
+             *         roundingModeIndependence(4)+... (bunch of VkBool32s) */
+            case 1000197000: {
+                uint32_t* denormIndep = (uint32_t*)((uint8_t*)node + 16);
+                uint32_t* roundIndep  = (uint32_t*)((uint8_t*)node + 20);
+                LOG("Props2: FloatControls(KHR): denormIndep=%u->0 roundIndep=%u->0\n",
+                    *denormIndep, *roundIndep);
+                *denormIndep = 0;
+                *roundIndep  = 0;
+                /* Zero out all the denorm/rounding bools (offsets 24-76, 14 VkBool32s) */
+                for (int fi = 0; fi < 14; fi++)
+                    *(uint32_t*)((uint8_t*)node + 24 + fi * 4) = 0;
+                break;
+            }
+            }
+            node = (PropBase*)node->pNext;
         }
     }
 }
@@ -1554,7 +1659,20 @@ static VkResult trace_CreateBuffer(void* device, const void* pCreateInfo,
     LOG("[D%d] vkCreateBuffer: dev=%p size=%llu usage=0x%x flags=0x%x sharing=%u pNext=%p\n",
         g_device_count, real, (unsigned long long)size, usage, flags, sharing, pNext);
 
-    VkResult res = real_create_buffer(real, pCreateInfo, pAllocator, pBuffer);
+    /* Force STORAGE_BUFFER_BIT on all buffers (bionic-vulkan-wrapper compat).
+     * Mali may allocate buffers with different alignment/layout when this bit
+     * is set. Ensures vertex/index/uniform buffers are SSBO-compatible. */
+    uint8_t patched_buf_ci[56];
+    const void* bufCI = pCreateInfo;
+    if (pCreateInfo && !(usage & 0x20)) { /* VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 0x20 */
+        memcpy(patched_buf_ci, pCreateInfo, 56);
+        *(uint32_t*)(patched_buf_ci + 32) = usage | 0x20;
+        bufCI = patched_buf_ci;
+        LOG("[D%d] vkCreateBuffer: +STORAGE_BUFFER_BIT (0x%x -> 0x%x)\n",
+            g_device_count, usage, usage | 0x20);
+    }
+
+    VkResult res = real_create_buffer(real, bufCI, pAllocator, pBuffer);
     LOG("[D%d] vkCreateBuffer: result=%d buf=0x%llx\n",
         g_device_count, res, pBuffer ? (unsigned long long)*pBuffer : 0);
     if (res != 0) {
@@ -2090,6 +2208,12 @@ static VkResult trace_CreateSampler(void* device, const void* pCreateInfo,
 typedef VkResult (*PFN_vkCreateShaderModule)(void*, const void*, const void*, uint64_t*);
 static PFN_vkCreateShaderModule real_create_shader_module = NULL;
 
+/* Forward declarations for Mali SPIR-V fix passes (defined below, ~line 3700+) */
+static int strip_clip_distance_spirv(uint32_t* code, uint64_t codeSize);
+static int fix_mali_spirv(uint32_t* code, uint64_t codeSize);
+static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize,
+                                          uint64_t* outSize, int* nBarriersOut);
+
 static VkResult trace_CreateShaderModule(void* device, const void* pCreateInfo,
                                          const void* pAllocator, uint64_t* pModule) {
     void* real = unwrap(device);
@@ -2116,9 +2240,70 @@ static VkResult trace_CreateShaderModule(void* device, const void* pCreateInfo,
         }
     }
 
-    VkResult res = real_create_shader_module(real, pCreateInfo, pAllocator, pModule);
+    /* ==== Apply Mali SPIR-V fixes ==== */
+    uint32_t* mutableCode = NULL;
+    uint64_t effectiveSize = codeSize;
+    uint8_t patched_ci[40];
+    const void* moduleCI = pCreateInfo;
+
+    if (pCode && codeSize > 20) {
+        mutableCode = (uint32_t*)malloc(codeSize);
+        if (mutableCode) {
+            memcpy(mutableCode, pCode, codeSize);
+            int total_fixes = 0;
+
+            /* Fix 1: Strip ClipDistance/CullDistance (Mali unsupported) */
+            {
+                int n_strip = strip_clip_distance_spirv(mutableCode, effectiveSize);
+                if (n_strip > 0) {
+                    total_fixes += n_strip;
+                    LOG("[D%d] MALI-FIX(CSM): stripped %d ClipDistance/CullDistance\n",
+                        g_device_count, n_strip);
+                }
+            }
+            /* Fix 2: OpConstantComposite → OpSpecConstantComposite */
+            {
+                int n_composite = fix_mali_spirv(mutableCode, effectiveSize);
+                if (n_composite > 0) {
+                    total_fixes += n_composite;
+                    LOG("[D%d] MALI-FIX(CSM): fixed %d ConstantComposite→Spec\n",
+                        g_device_count, n_composite);
+                }
+            }
+            /* Fix 3: Shift optimization barriers */
+            {
+                uint64_t barrierSize = 0;
+                int nBarriers = 0;
+                uint32_t* barrierCode = add_mali_shift_barriers(
+                    mutableCode, effectiveSize, &barrierSize, &nBarriers);
+                if (barrierCode) {
+                    free(mutableCode);
+                    mutableCode = barrierCode;
+                    effectiveSize = barrierSize;
+                    total_fixes += nBarriers;
+                    LOG("[D%d] MALI-FIX(CSM): added %d shift barriers (%lu→%lu bytes)\n",
+                        g_device_count, nBarriers,
+                        (unsigned long)codeSize, (unsigned long)barrierSize);
+                }
+            }
+
+            if (total_fixes > 0) {
+                /* Build modified VkShaderModuleCreateInfo with patched SPIR-V */
+                memcpy(patched_ci, pCreateInfo, 40);
+                *(uint64_t*)(patched_ci + 24) = effectiveSize;
+                *(const uint32_t**)(patched_ci + 32) = mutableCode;
+                moduleCI = patched_ci;
+                LOG("[D%d] MALI-FIX(CSM): %d total fixes applied (%u words)\n",
+                    g_device_count, total_fixes, wordCount);
+            }
+        }
+    }
+
+    VkResult res = real_create_shader_module(real, moduleCI, pAllocator, pModule);
     LOG("[D%d] vkCreateShaderModule: dev=%p result=%d module=0x%llx words=%u\n",
         g_device_count, real, res, pModule ? (unsigned long long)*pModule : 0, wordCount);
+
+    if (mutableCode) free(mutableCode);
     return res;
 }
 
@@ -3854,6 +4039,10 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
     uint32_t uint_zero = 0;   /* OpConstant %uint 0 */
     uint32_t int_zero  = 0;   /* OpConstant %int  0 */
 
+    /* Integer vector types: uvec[N] and svec[N] for N=2,3,4 */
+    uint32_t uvec_type[5] = {0};  /* vec<uint32, N> */
+    uint32_t svec_type[5] = {0};  /* vec<sint32, N> */
+
     uint64_t idx = 5;
     while (idx < nwords) {
         uint32_t instr = code[idx];
@@ -3865,6 +4054,16 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
         if (op == 21 && wc == 4 && code[idx + 2] == 32) {
             if (code[idx + 3] == 0) uint_type = code[idx + 1];
             else if (code[idx + 3] == 1) int_type = code[idx + 1];
+        }
+        /* OpTypeVector: [4|23] result comp_type count
+         * SPIR-V guarantees OpTypeInt precedes OpTypeVector that uses it */
+        if (op == 23 && wc == 4) {
+            uint32_t comp = code[idx + 2];
+            uint32_t cnt  = code[idx + 3];
+            if (cnt >= 2 && cnt <= 4) {
+                if (comp == uint_type && uint_type) uvec_type[cnt] = code[idx + 1];
+                if (comp == int_type  && int_type)  svec_type[cnt] = code[idx + 1];
+            }
         }
         /* OpConstant: [wc|43] type result value... */
         if (op == 43 && wc >= 4) {
@@ -3888,9 +4087,11 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
             if (const_ids[_i]==(id)) { _f=1; break; } \
         } _f; })
 
-    /* ---- Pass 2: Count qualifying OpShiftLeftLogical ---- */
+    /* ---- Pass 2: Count qualifying OpShiftLeftLogical (scalar + vector) ---- */
     int n_barriers = 0;
-    int any_int_shift = 0;
+    int need_int_shift = 0;        /* need scalar int zero */
+    int need_uvec[5] = {0};        /* need uvecN zero for N=2,3,4 */
+    int need_svec[5] = {0};        /* need svecN zero for N=2,3,4 */
     idx = 5;
     while (idx < nwords) {
         uint32_t instr = code[idx];
@@ -3902,10 +4103,17 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
         if (op == 196 && wc == 5) {
             uint32_t rtype = code[idx + 1];
             uint32_t shift_id = code[idx + 4];
-            if (BARRIER_IS_CONST(shift_id) &&
-                (rtype == uint_type || rtype == int_type)) {
-                n_barriers++;
-                if (rtype == int_type) any_int_shift = 1;
+            if (BARRIER_IS_CONST(shift_id)) {
+                int match = 0;
+                if (rtype == uint_type && uint_type) { match = 1; }
+                else if (rtype == int_type && int_type) { match = 1; need_int_shift = 1; }
+                else {
+                    for (int n = 2; n <= 4; n++) {
+                        if (rtype == uvec_type[n] && uvec_type[n]) { match = 1; need_uvec[n] = 1; break; }
+                        if (rtype == svec_type[n] && svec_type[n]) { match = 1; need_svec[n] = 1; break; }
+                    }
+                }
+                if (match) n_barriers++;
             }
         }
         idx += wc;
@@ -3918,11 +4126,20 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
     /* ---- Determine extra definitions needed ---- */
     int need_uint_type = (!uint_type);
     int need_uint_zero = (!uint_zero);
-    int need_int_zero  = (any_int_shift && !int_zero);
+    /* Need int_zero for scalar signed shifts AND as component for svecN zeros */
+    int any_signed = need_int_shift;
+    for (int n = 2; n <= 4; n++) { if (need_svec[n]) any_signed = 1; }
+    int need_int_zero = (any_signed && !int_zero);
+
     int extra_words = 0;
     if (need_uint_type) extra_words += 4;
     if (need_uint_zero) extra_words += 4;
     if (need_int_zero)  extra_words += 4;
+    /* Each vector zero: OpConstantComposite = (3+N) words */
+    for (int n = 2; n <= 4; n++) {
+        if (need_uvec[n]) extra_words += (3 + n);
+        if (need_svec[n]) extra_words += (3 + n);
+    }
 
     /* ---- Allocate output buffer ---- */
     uint64_t out_nwords = nwords + (uint64_t)n_barriers * 7 + extra_words;
@@ -3936,6 +4153,13 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
     if (need_uint_type) uint_type = next_id++;
     if (need_uint_zero) uint_zero = next_id++;
     if (need_int_zero)  int_zero  = next_id++;
+    /* IDs for vector zero constants */
+    uint32_t uvec_zero[5] = {0};
+    uint32_t svec_zero[5] = {0};
+    for (int n = 2; n <= 4; n++) {
+        if (need_uvec[n]) uvec_zero[n] = next_id++;
+        if (need_svec[n]) svec_zero[n] = next_id++;
+    }
     uint32_t temp_base = next_id;
     next_id += n_barriers;
 
@@ -3976,36 +4200,66 @@ static uint32_t* add_mali_shift_barriers(const uint32_t* code, uint64_t codeSize
                 out[oidx++] = int_zero;
                 out[oidx++] = 0;
             }
+            /* Emit vector zero constants: OpConstantComposite %vecType zeros... */
+            for (int n = 2; n <= 4; n++) {
+                if (need_uvec[n] && uvec_zero[n]) {
+                    out[oidx++] = ((3 + n) << 16) | 44; /* OpConstantComposite */
+                    out[oidx++] = uvec_type[n];
+                    out[oidx++] = uvec_zero[n];
+                    for (int c = 0; c < n; c++)
+                        out[oidx++] = uint_zero;
+                }
+                if (need_svec[n] && svec_zero[n]) {
+                    out[oidx++] = ((3 + n) << 16) | 44; /* OpConstantComposite */
+                    out[oidx++] = svec_type[n];
+                    out[oidx++] = svec_zero[n];
+                    for (int c = 0; c < n; c++)
+                        out[oidx++] = int_zero;
+                }
+            }
         }
 
-        /* Qualifying OpShiftLeftLogical? */
+        /* Qualifying OpShiftLeftLogical? (scalar or vector integer) */
         if (op == 196 && wc == 5) {
             uint32_t rtype     = code[idx + 1];
             uint32_t result_id = code[idx + 2];
             uint32_t shift_id  = code[idx + 4];
 
-            if (BARRIER_IS_CONST(shift_id) &&
-                (rtype == uint_type || rtype == int_type)) {
-                uint32_t temp_id = temp_base + bidx;
+            if (BARRIER_IS_CONST(shift_id)) {
+                /* Determine zero constant for the insert parameter */
+                uint32_t insert_z = 0;
+                if (rtype == uint_type && uint_type)      insert_z = uint_zero;
+                else if (rtype == int_type && int_type)   insert_z = int_zero;
+                else {
+                    for (int n = 2; n <= 4; n++) {
+                        if (rtype == uvec_type[n] && uvec_type[n]) { insert_z = uvec_zero[n]; break; }
+                        if (rtype == svec_type[n] && svec_type[n]) { insert_z = svec_zero[n]; break; }
+                    }
+                }
 
-                /* Copy shift with renamed result → temp_id */
-                memcpy(out + oidx, code + idx, wc * 4);
-                out[oidx + 2] = temp_id;
-                oidx += wc;
+                if (insert_z) {
+                    uint32_t temp_id = temp_base + bidx;
 
-                /* Insert OpBitFieldInsert(temp, zero, 0, 0) → original ID */
-                uint32_t insert_z = (rtype == int_type) ? int_zero : uint_zero;
-                out[oidx++] = (7 << 16) | 201; /* OpBitFieldInsert */
-                out[oidx++] = rtype;             /* result type     */
-                out[oidx++] = result_id;          /* original ID     */
-                out[oidx++] = temp_id;            /* base            */
-                out[oidx++] = insert_z;           /* insert = 0      */
-                out[oidx++] = uint_zero;          /* offset = 0      */
-                out[oidx++] = uint_zero;          /* count  = 0      */
+                    /* Copy shift with renamed result → temp_id */
+                    memcpy(out + oidx, code + idx, wc * 4);
+                    out[oidx + 2] = temp_id;
+                    oidx += wc;
 
-                bidx++;
-                idx += wc;
-                continue;
+                    /* Insert OpBitFieldInsert(temp, zero, 0, 0) → original ID
+                     * insert = type-matched zero (scalar or vector)
+                     * offset, count = scalar uint 0 (always) */
+                    out[oidx++] = (7 << 16) | 201; /* OpBitFieldInsert */
+                    out[oidx++] = rtype;             /* result type     */
+                    out[oidx++] = result_id;          /* original ID     */
+                    out[oidx++] = temp_id;            /* base            */
+                    out[oidx++] = insert_z;           /* insert = 0      */
+                    out[oidx++] = uint_zero;          /* offset = 0      */
+                    out[oidx++] = uint_zero;          /* count  = 0      */
+
+                    bidx++;
+                    idx += wc;
+                    continue;
+                }
             }
         }
 
