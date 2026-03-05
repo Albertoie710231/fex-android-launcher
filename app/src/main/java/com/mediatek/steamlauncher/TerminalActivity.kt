@@ -384,6 +384,23 @@ class TerminalActivity : AppCompatActivity() {
                 useVirtualDesktop = false
             ))
         }
+
+        // Launch Sekiro
+        findViewById<Button>(R.id.btnLaunchSekiro).setOnClickListener {
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for Sekiro]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            if (!isDisplayMode) toggleDisplayMode()
+            executeCommand(protonManager.getLaunchCommand(
+                exePath = "/home/user/Steam/steamapps/common/Sekiro Shadows Die Twice/sekiro.exe",
+                steamAppId = "814380",
+                dllOverrides = "d3d11=n;dxgi=n;d3d9=n;d3dcompiler_43=n;d3dcompiler_47=n;steam_api64=n;amd_ags_x64=d;d3dx11_43=n"
+            ))
+        }
     }
 
     private fun showX11Display() {

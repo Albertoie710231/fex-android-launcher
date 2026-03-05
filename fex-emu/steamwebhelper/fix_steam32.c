@@ -1,13 +1,24 @@
-/* v109: 32-bit shim for the steam client binary.
- * - v109: Inject CMsgBrowserReady from client-side mmap (fixes cross-FEX
- *         mmap visibility issue — webhelper patcher writes weren't visible).
- *         Fill Ring A after 50 polls (~5s) if still empty.
- * - v106: bind/connect AF_UNIX → abstract socket conversion
- * - v105: MAP_SHARED on bridge fd (bidirectional IPC)
- * - v104: Detect IPC fd from -child-update-ui-socket cmdline arg.
- *         After CMsgBrowserReady consumed, send ready signal to
- *         Steam main process via IPC fd. Also: enhanced I/O
- *         monitoring on IPC fd (all data, not just sdPC).
+/* v104: 32-bit shim for the steam client binary.
+ * - bind/connect AF_UNIX → abstract socket conversion (steam-only)
+ * - shm_open/shm_unlink redirect to real Android path
+ * - open/open64: redirect /dev/shm/ to real Android path
+ * - shm_open: force O_CREAT, strip O_EXCL (match 64-bit shim)
+ * - v91: enhanced connect logging
+ * - v91b: stat/lstat fake S_IFSOCK for steam_chrome_shmem paths
+ * - v98: SCM_RIGHTS fd passing across FEX overlay boundary
+ * - v100: Bridge fd dup (no local file creation)
+ * - v101: Intercept mmap for bridge fds → anonymous mapping
+ * - v102: CORRECT SHMemStream header format (from local trace):
+ *         hdr[0]=get (read cursor), hdr[1]=put (write cursor),
+ *         hdr[2]=capacity, hdr[3]=pending bytes.
+ *         NOT cubHeader/eState as previously assumed.
+ * - v103: FD 11 bridge — fake webhelper handshake from 32-bit side.
+ *         The webhelper (64-bit) never inherits fd 11 because
+ *         cross-FEX-arch exec loses inherited fds. We dup the child
+ *         end of the socketpair and fake the sdPC ready response so
+ *         the Steam client thinks the webhelper is ready.
+ *         Also: stat/access fake for missing steam_chrome_shmem files,
+ *         and create dummy shmem file in 32-bit overlay.
  */
 #define _GNU_SOURCE
 #include <sys/socket.h>
@@ -21,14 +32,11 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <pthread.h>
-#include <time.h>
-
-/* v104: IPC fd for communication with Steam main process.
- * Detected from -child-update-ui-socket cmdline arg. */
-static volatile int s32_ipc_fd = -1;
+#include <stdlib.h>
 
 /* All debug output uses a single write() per message to avoid
  * FexOutput splitting lines across logcat entries */
@@ -89,12 +97,9 @@ static void debug_hexline(const char *prefix, const void *data, int datalen) {
     debug_write(buf, p - buf);
 }
 
-/* Real Android TMPDIR for abstract socket path rewriting.
- * libXlorie binds X11 socket with the full Android path in the abstract
- * socket name, but FEX guests see /tmp/ through the rootfs overlay.
- * We must rewrite X11 abstract connects to match. */
-#define REAL_TMPDIR "/data/user/0/com.mediatek.steamlauncher/cache/tmp"
-#define REAL_TMPDIR_LEN 49  /* strlen(REAL_TMPDIR) */
+/* v104: Real Android tmpdir extracted from FEX_OUTPUTLOG at init time.
+ * Used to rewrite X11 socket paths (FEX /tmp != Android cache/tmp). */
+static char real_tmpdir[256] = "";
 
 static socklen_t make_abstract(const struct sockaddr *addr, socklen_t addrlen,
                                struct sockaddr_un *out) {
@@ -155,56 +160,43 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         int pathlen = (int)(addrlen - offsetof(struct sockaddr_un, sun_path));
 
         if (un->sun_path[0] == '\0') {
-            /* Already abstract — check if X11 path needs rewriting */
-            int namelen = pathlen > 1 ? pathlen - 1 : 0;
+            /* Already abstract — check if it's a /tmp/ path that needs rewriting */
             const char *abs_name = &un->sun_path[1];
+            if (real_tmpdir[0] && strncmp(abs_name, "/tmp/", 5) == 0) {
+                /* Rewrite @/tmp/foo → @$real_tmpdir/foo */
+                struct sockaddr_un rewritten;
+                memset(&rewritten, 0, sizeof(rewritten));
+                rewritten.sun_family = AF_UNIX;
+                rewritten.sun_path[0] = '\0';
+                const char *suffix = abs_name + 4; /* "/foo..." */
+                int rlen = 0;
+                const char *s = real_tmpdir;
+                while (*s && rlen < 105) rewritten.sun_path[1 + rlen++] = *s++;
+                s = suffix;
+                while (*s && rlen < 105) rewritten.sun_path[1 + rlen++] = *s++;
+                socklen_t rw_len = offsetof(struct sockaddr_un, sun_path) + 1 + rlen;
 
-            /* libXlorie binds X11 with full Android path, FEX uses /tmp/ */
-            if (namelen >= 15 && memcmp(abs_name, "/tmp/.X11-unix/", 15) == 0) {
-                struct sockaddr_un rw;
-                memset(&rw, 0, sizeof(rw));
-                rw.sun_family = AF_UNIX;
-                rw.sun_path[0] = '\0';
-                /* REAL_TMPDIR + suffix after "/tmp" */
-                memcpy(&rw.sun_path[1], REAL_TMPDIR, REAL_TMPDIR_LEN);
-                int suffix_len = namelen - 4; /* skip "/tmp" */
-                if (REAL_TMPDIR_LEN + suffix_len < 106) {
-                    memcpy(&rw.sun_path[1 + REAL_TMPDIR_LEN], abs_name + 4, suffix_len);
-                    socklen_t rw_len = offsetof(struct sockaddr_un, sun_path) + 1
-                                       + REAL_TMPDIR_LEN + suffix_len;
-                    int ret = real_connect_ptr(sockfd, (struct sockaddr *)&rw, rw_len);
-                    int saved_errno = errno;
-                    int n = __sync_fetch_and_add(&connect_abstract_count, 1);
-                    if (n < 10) {
-                        debug_str("S32: X11 abstract rewrite: ", abs_name, "\n");
-                        debug_str("  → ", &rw.sun_path[1], "\n");
-                        debug_int("  ret=", ret);
-                        if (ret < 0) debug_int("  errno=", saved_errno);
-                    }
-                    errno = saved_errno;
-                    return ret;
+                int ret = real_connect_ptr(sockfd, (struct sockaddr *)&rewritten, rw_len);
+                int saved_errno = errno;
+                int n = __sync_fetch_and_add(&connect_abstract_count, 1);
+                if (n < 30) {
+                    debug_str("S32: connect ABSTRACT→rewrite: ", abs_name, "\n");
+                    debug_str("  → @", &rewritten.sun_path[1], "\n");
+                    debug_int("  fd=", sockfd);
+                    debug_int("  ret=", ret);
+                    if (ret < 0) debug_int("  errno=", saved_errno);
                 }
+                errno = saved_errno;
+                return ret;
             }
-
-            /* Other abstract connects: pass through */
+            /* Non-/tmp abstract — pass through */
             int ret = real_connect_ptr(sockfd, addr, addrlen);
             int saved_errno = errno;
             int n = __sync_fetch_and_add(&connect_abstract_count, 1);
-            /* Always log steam_chrome_shmem connects */
-            int is_shmem = 0;
-            if (namelen > 20) {
-                for (int i = 0; i < namelen - 18; i++) {
-                    if (memcmp(abs_name + i, "steam_chrome_shmem", 18) == 0) {
-                        is_shmem = 1; break;
-                    }
-                }
-            }
-            if (n < 30 || is_shmem) {
-                if (is_shmem) debug_msg("S32: *** steam_chrome_shmem CONNECT ***\n");
-                debug_hexline("S32: connect ABSTRACT hex: ", abs_name,
-                             namelen > 60 ? 60 : namelen);
+            if (n < 30) {
+                int namelen = pathlen > 1 ? pathlen - 1 : 0;
                 if (namelen > 0 && abs_name[0] >= 0x20) {
-                    debug_str("S32:   name=", abs_name, "\n");
+                    debug_str("S32: connect ABSTRACT: ", abs_name, "\n");
                 }
                 debug_int("  fd=", sockfd);
                 debug_int("  ret=", ret);
@@ -214,64 +206,54 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             return ret;
         }
 
-        /* Filesystem path → convert to abstract (with X11 path rewrite) */
-        {
-            const char *path = un->sun_path;
-            int plen = 0;
-            while (path[plen] && plen < 107) plen++;
+        /* v104: Rewrite /tmp/ paths to real Android tmpdir as abstract sockets.
+         * FEX guest sees /tmp but the actual sockets (X11, etc.) live at
+         * $CACHE/tmp on the Android side. We rewrite to the correct abstract
+         * socket name so they connect to the ARM64 X11 server. */
+        if (real_tmpdir[0] && strncmp(un->sun_path, "/tmp/", 5) == 0) {
+            /* /tmp/foo → @$real_tmpdir/foo (abstract socket) */
+            struct sockaddr_un rewritten;
+            memset(&rewritten, 0, sizeof(rewritten));
+            rewritten.sun_family = AF_UNIX;
+            rewritten.sun_path[0] = '\0'; /* abstract */
+            const char *suffix = un->sun_path + 4; /* "/foo..." after /tmp */
+            int rlen = 0;
+            const char *s = real_tmpdir;
+            while (*s && rlen < 105) rewritten.sun_path[1 + rlen++] = *s++;
+            s = suffix;
+            while (*s && rlen < 105) rewritten.sun_path[1 + rlen++] = *s++;
+            socklen_t abs_len = offsetof(struct sockaddr_un, sun_path) + 1 + rlen;
 
-            /* X11 paths: rewrite /tmp/.X11-unix/ → REAL_TMPDIR/.X11-unix/ */
-            if (plen >= 15 && memcmp(path, "/tmp/.X11-unix/", 15) == 0) {
-                struct sockaddr_un rw;
-                memset(&rw, 0, sizeof(rw));
-                rw.sun_family = AF_UNIX;
-                rw.sun_path[0] = '\0';
-                memcpy(&rw.sun_path[1], REAL_TMPDIR, REAL_TMPDIR_LEN);
-                int suffix_len = plen - 4; /* skip "/tmp" */
-                if (REAL_TMPDIR_LEN + suffix_len < 106) {
-                    memcpy(&rw.sun_path[1 + REAL_TMPDIR_LEN], path + 4, suffix_len);
-                    socklen_t rw_len = offsetof(struct sockaddr_un, sun_path) + 1
-                                       + REAL_TMPDIR_LEN + suffix_len;
-                    int ret = real_connect_ptr(sockfd, (struct sockaddr *)&rw, rw_len);
-                    int saved_errno = errno;
-                    int n = __sync_fetch_and_add(&connect_count, 1);
-                    if (n < 10) {
-                        debug_str("S32: X11 path rewrite: ", path, "\n");
-                        debug_str("  → ", &rw.sun_path[1], "\n");
-                        debug_int("  ret=", ret);
-                        if (ret < 0) debug_int("  errno=", saved_errno);
-                    }
-                    errno = saved_errno;
-                    return ret;
-                }
+            int ret = real_connect_ptr(sockfd, (struct sockaddr *)&rewritten, abs_len);
+            int saved_errno = errno;
+            int n = __sync_fetch_and_add(&connect_count, 1);
+            if (n < 50) {
+                debug_str("S32: connect→rewrite: ", un->sun_path, "\n");
+                debug_str("  → @", &rewritten.sun_path[1], "\n");
+                debug_int("  fd=", sockfd);
+                debug_int("  ret=", ret);
+                if (ret < 0) debug_int("  errno=", saved_errno);
             }
+            errno = saved_errno;
+            return ret;
+        }
 
-            /* Other paths: normal abstract conversion */
-            struct sockaddr_un abstract_addr;
-            socklen_t abs_len = make_abstract(addr, addrlen, &abstract_addr);
-            if (abs_len > 0) {
-                int ret = real_connect_ptr(sockfd, (struct sockaddr *)&abstract_addr, abs_len);
-                int saved_errno = errno;
-                int n = __sync_fetch_and_add(&connect_count, 1);
-                /* Always log steam_chrome_shmem connects */
-                int is_shmem_f = 0;
-                if (plen > 20) {
-                    for (int i = 0; i < plen - 18; i++) {
-                        if (memcmp(path + i, "steam_chrome_shmem", 18) == 0) {
-                            is_shmem_f = 1; break;
-                        }
-                    }
-                }
-                if (n < 50 || is_shmem_f) {
-                    if (is_shmem_f) debug_msg("S32: *** steam_chrome_shmem FILE CONNECT ***\n");
-                    debug_str("S32: connect→abstract: ", un->sun_path, "\n");
-                    debug_int("  fd=", sockfd);
-                    debug_int("  ret=", ret);
-                    if (ret < 0) debug_int("  errno=", saved_errno);
-                }
-                errno = saved_errno;
-                return ret;
+        /* Steam-related paths → abstract with original name.
+         * Other paths → pass through to FEX. */
+        struct sockaddr_un abstract_addr;
+        socklen_t abs_len = make_abstract(addr, addrlen, &abstract_addr);
+        if (abs_len > 0) {
+            int ret = real_connect_ptr(sockfd, (struct sockaddr *)&abstract_addr, abs_len);
+            int saved_errno = errno;
+            int n = __sync_fetch_and_add(&connect_count, 1);
+            if (n < 50) {
+                debug_str("S32: connect→abstract: ", un->sun_path, "\n");
+                debug_int("  fd=", sockfd);
+                debug_int("  ret=", ret);
+                if (ret < 0) debug_int("  errno=", saved_errno);
             }
+            errno = saved_errno;
+            return ret;
         }
     }
 
@@ -401,11 +383,11 @@ int shm_open(const char *name, int oflag, mode_t mode) {
     if (fd < 0 && !(oflag & O_CREAT) && strstr(name, "Shm_") != NULL) {
         int pn = __sync_fetch_and_add(&shm_poll_fail_count, 1);
 
-        /* v104: Try bridge on every poll failure (was: every 10th).
+        /* Try bridge every 10 polls (~1s).
          * v98: SCM_RIGHTS — bridge sends the webhelper's fd via sendmsg.
          * Even with separate FEX fd tables, SCM_RIGHTS passes real fds.
          * The received fd shares the same open file → live MAP_SHARED. */
-        if (pn >= 2) {
+        if (pn >= 5 && (pn % 10) == 0) {
             int bsock = socket(AF_UNIX, SOCK_STREAM, 0);
             if (bsock >= 0) {
                 struct sockaddr_un baddr;
@@ -582,23 +564,23 @@ int __xstat(int ver, const char *path, struct stat *buf) {
     if (!real_xstat_ptr)
         real_xstat_ptr = (real_xstat_fn)dlsym(RTLD_NEXT, "__xstat");
     int ret = real_xstat_ptr(ver, path, buf);
+
     if (is_shmem_path(path)) {
         if (ret == 0 && S_ISREG(buf->st_mode)) {
-            /* File exists but is regular → fake as socket */
+            /* File exists as regular → fake S_IFSOCK */
             buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFSOCK;
         } else if (ret != 0) {
-            /* v109: File doesn't exist in 32-bit overlay (dummy was created
-             * in webhelper's overlay). Fake a successful stat as S_IFSOCK. */
+            /* v103: File doesn't exist in 32-bit overlay (it's in 64-bit overlay).
+             * Fake a successful stat with S_IFSOCK so the client tries to connect.
+             * Our connect wrapper converts the filesystem path to abstract socket. */
             memset(buf, 0, sizeof(*buf));
             buf->st_mode = S_IFSOCK | 0777;
             buf->st_nlink = 1;
-            buf->st_size = 0;
             ret = 0;
         }
         int n = __sync_fetch_and_add(&stat_fake_count, 1);
         if (n < 20) {
             debug_str("S32: stat→S_IFSOCK: ", path, "\n");
-            debug_int("  original_ret=", ret);
         }
     }
     return ret;
@@ -608,15 +590,15 @@ int __lxstat(int ver, const char *path, struct stat *buf) {
     if (!real_lxstat_ptr)
         real_lxstat_ptr = (real_lxstat_fn)dlsym(RTLD_NEXT, "__lxstat");
     int ret = real_lxstat_ptr(ver, path, buf);
+
     if (is_shmem_path(path)) {
         if (ret == 0 && S_ISREG(buf->st_mode)) {
             buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFSOCK;
         } else if (ret != 0) {
-            /* v109: Fake success for ENOENT */
+            /* v103: fake for non-existent file too */
             memset(buf, 0, sizeof(*buf));
             buf->st_mode = S_IFSOCK | 0777;
             buf->st_nlink = 1;
-            buf->st_size = 0;
             ret = 0;
         }
         int n = __sync_fetch_and_add(&stat_fake_count, 1);
@@ -636,7 +618,7 @@ int lstat(const char *path, struct stat *buf) {
     return __lxstat(3, path, buf);
 }
 
-/* access() wrapper: always succeed for shmem paths */
+/* access() wrapper: if the file exists, succeed for shmem paths */
 typedef int (*real_access_fn)(const char *, int);
 static real_access_fn real_access_ptr = NULL;
 
@@ -644,11 +626,9 @@ int access(const char *path, int mode) {
     if (!real_access_ptr)
         real_access_ptr = (real_access_fn)dlsym(RTLD_NEXT, "access");
     int ret = real_access_ptr(path, mode);
+    /* v103: fake success for steam_chrome_shmem even if file doesn't exist */
     if (is_shmem_path(path)) {
-        if (ret != 0) {
-            /* v109: Fake success for ENOENT */
-            ret = 0;
-        }
+        if (ret != 0) ret = 0; /* force success */
         int n = __sync_fetch_and_add(&stat_fake_count, 1);
         if (n < 20) {
             debug_str("S32: access OK (faked): ", path, "\n");
@@ -657,10 +637,103 @@ int access(const char *path, int mode) {
     return ret;
 }
 
+/* Forward declarations for write/read wrappers (used by fd11 thread) */
+typedef ssize_t (*real_write32_fn)(int, const void *, size_t);
+static real_write32_fn real_write32_ptr = NULL;
+typedef ssize_t (*real_read32_fn)(int, void *, size_t);
+static real_read32_fn real_read32_ptr = NULL;
+
 /* socketpair wrapper: log when steam client creates IPC sockets */
 typedef int (*real_socketpair_fn)(int, int, int, int[2]);
 static real_socketpair_fn real_socketpair_ptr = NULL;
 static volatile int socketpair_count = 0;
+
+/* v103: FD 11 bridge — saved dup of the child's end (sv[0]) of the IPC
+ * socketpair. We write to this fd to simulate the webhelper's responses.
+ * Data written here appears when the parent reads from sv[1] (fd 12). */
+static int ipc_child_fd = -1;
+static volatile int fd11_ready_done = 0;
+
+/* v103: Thread that fakes the webhelper's sdPC handshake on the IPC socket.
+ *
+ * Protocol (from webhelper's perspective, which we simulate):
+ *   1. Read parent's handshake messages (drain pending data)
+ *   2. Write 56-byte sdPC response: "sdPC" + version=2 + type=1
+ *   3. Write 1-byte status: '1' (ready)
+ *
+ * We write to ipc_child_fd (= dup of sv[0]). The parent reads from
+ * sv[1] (fd 12) and thinks the webhelper responded. */
+static void *fd11_fake_ready_func(void *arg) {
+    (void)arg;
+    int fd = ipc_child_fd;
+    debug_int("S32: fd11_fake: starting on child fd=", fd);
+
+    if (!real_write32_ptr)
+        real_write32_ptr = (real_write32_fn)dlsym(RTLD_NEXT, "write");
+    if (!real_read32_ptr)
+        real_read32_ptr = (real_read32_fn)dlsym(RTLD_NEXT, "read");
+
+    /* v103c: The socketpair (fd 11/12) is shared between the child-update-ui
+     * process and (later) the webhelper. Our fd 200 is a dup of the same socket
+     * endpoint as fd 11.
+     *
+     * CRITICAL: We must NOT read from fd 200 during the child-update-ui phase,
+     * or we'll steal its messages and corrupt the protocol. Instead:
+     * 1. Sleep 3 seconds (child-update-ui finishes well within this time)
+     * 2. Drain any leftover data (non-blocking, don't echo back)
+     * 3. Write sdPC ready signal (what the webhelper would send)
+     *
+     * The parent reads from fd 12 and sees our sdPC as the webhelper's response.
+     * The 60-second timeout for "Failed connecting" gives us plenty of room. */
+
+    debug_msg("S32: fd11_fake: sleeping 3s for child-update-ui to finish...\n");
+    struct timespec ts = { .tv_sec = 3, .tv_nsec = 0 };
+    nanosleep(&ts, NULL);
+
+    /* Drain any pending data the parent wrote for the webhelper phase.
+     * Do NOT echo — just consume so the stream is clean for our sdPC. */
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    unsigned char rbuf[512];
+    int total_drained = 0;
+    for (int i = 0; i < 10; i++) {
+        ssize_t r = real_read32_ptr(fd, rbuf, sizeof(rbuf));
+        if (r > 0) {
+            debug_int("S32: fd11_fake: drained len=", (long)r);
+            debug_hexline("  data: ", rbuf, r > 40 ? 40 : (int)r);
+            total_drained += (int)r;
+        } else {
+            break;
+        }
+    }
+    fcntl(fd, F_SETFL, flags); /* restore blocking */
+    debug_int("S32: fd11_fake: total drained=", total_drained);
+
+    /* Write sdPC ready response (56 bytes).
+     * This is what the real webhelper writes to fd 11 after Chromium init. */
+    unsigned char ready_msg[56];
+    memset(ready_msg, 0, sizeof(ready_msg));
+    ready_msg[0] = 's'; ready_msg[1] = 'd';
+    ready_msg[2] = 'P'; ready_msg[3] = 'C';
+    ready_msg[4] = 0x02; /* version = 2 */
+    ready_msg[8] = 0x01; /* type = 1 (echo/ready) */
+
+    ssize_t n = real_write32_ptr(fd, ready_msg, 56);
+    debug_int("S32: fd11_fake: wrote sdPC ret=", (long)n);
+    if (n < 0) debug_int("  errno=", errno);
+
+    /* Write status byte '1' (ready) */
+    if (n == 56) {
+        char one = '1';
+        n = real_write32_ptr(fd, &one, 1);
+        debug_int("S32: fd11_fake: wrote '1' ret=", (long)n);
+        if (n < 0) debug_int("  errno=", errno);
+    }
+
+    fd11_ready_done = 1;
+    debug_msg("S32: fd11_fake: DONE — ready signal sent\n");
+    return NULL;
+}
 
 int socketpair(int domain, int type, int protocol, int sv[2]) {
     if (!real_socketpair_ptr)
@@ -671,39 +744,49 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
         debug_int("S32: socketpair fd0=", sv[0]);
         debug_int("  fd1=", sv[1]);
     }
+
+    /* v103: Save a dup of sv[0] (the child's end) before the parent closes it.
+     * We dup to a high fd number (200+) so it won't collide with normal fds.
+     * The dup survives even after close(sv[0]) because it's an independent fd
+     * referencing the same socket endpoint. */
+    if (ret == 0 && ipc_child_fd < 0 && domain == AF_UNIX) {
+        int saved = fcntl(sv[0], F_DUPFD, 200);
+        if (saved >= 0) {
+            /* Clear CLOEXEC so it survives (fcntl F_DUPFD doesn't set it) */
+            ipc_child_fd = saved;
+            debug_int("S32: fd11: saved child end dup fd=", saved);
+            debug_int("S32: fd11: original sv[0]=", sv[0]);
+            debug_int("S32: fd11: parent sv[1]=", sv[1]);
+
+            /* Start the fake webhelper handshake thread */
+            pthread_t thr;
+            pthread_create(&thr, NULL, fd11_fake_ready_func, NULL);
+            pthread_detach(thr);
+            debug_msg("S32: fd11: started fake ready thread\n");
+        } else {
+            debug_int("S32: fd11: dup failed errno=", errno);
+        }
+    }
+
     return ret;
 }
 
 /* write wrapper: monitor writes that look like IPC to webhelper */
-typedef ssize_t (*real_write32_fn)(int, const void *, size_t);
-static real_write32_fn real_write32_ptr = NULL;
 static volatile int write_ipc_count = 0;
 
 ssize_t write(int fd, const void *buf, size_t count) {
     if (!real_write32_ptr)
         real_write32_ptr = (real_write32_fn)dlsym(RTLD_NEXT, "write");
     ssize_t ret = real_write32_ptr(fd, buf, count);
-    if (ret > 0 && buf) {
-        /* v104: Log ANY write on IPC fd */
-        if (s32_ipc_fd >= 0 && fd == s32_ipc_fd) {
+    /* Log writes that look like sdPC IPC messages */
+    if (ret > 0 && count >= 4 && buf) {
+        const unsigned char *b = (const unsigned char *)buf;
+        if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
             int n = __sync_fetch_and_add(&write_ipc_count, 1);
-            if (n < 50) {
-                debug_int("S32: write IPC fd=", fd);
+            if (n < 30) {
+                debug_int("S32: write sdPC fd=", fd);
                 debug_int("  count=", (long)count);
                 debug_int("  ret=", (long)ret);
-                debug_hexline("  data: ", buf, ret > 40 ? 40 : (int)ret);
-            }
-        }
-        /* Also log sdPC writes on any fd */
-        else if (count >= 4) {
-            const unsigned char *b = (const unsigned char *)buf;
-            if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
-                int n = __sync_fetch_and_add(&write_ipc_count, 1);
-                if (n < 50) {
-                    debug_int("S32: write sdPC fd=", fd);
-                    debug_int("  count=", (long)count);
-                    debug_int("  ret=", (long)ret);
-                }
             }
         }
     }
@@ -711,36 +794,22 @@ ssize_t write(int fd, const void *buf, size_t count) {
 }
 
 /* read wrapper: monitor reads of sdPC messages */
-typedef ssize_t (*real_read32_fn)(int, void *, size_t);
-static real_read32_fn real_read32_ptr = NULL;
 static volatile int read_ipc_count = 0;
 
 ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read32_ptr)
         real_read32_ptr = (real_read32_fn)dlsym(RTLD_NEXT, "read");
     ssize_t ret = real_read32_ptr(fd, buf, count);
-    if (ret > 0 && buf) {
-        /* v104: Log ANY read on IPC fd */
-        if (s32_ipc_fd >= 0 && fd == s32_ipc_fd) {
+    /* Log reads that returned sdPC IPC messages */
+    if (ret >= 4 && buf) {
+        const unsigned char *b = (const unsigned char *)buf;
+        if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
             int n = __sync_fetch_and_add(&read_ipc_count, 1);
-            if (n < 50) {
-                debug_int("S32: read IPC fd=", fd);
+            if (n < 30) {
+                debug_int("S32: read sdPC fd=", fd);
                 debug_int("  count=", (long)count);
                 debug_int("  ret=", (long)ret);
                 debug_hexline("  data: ", buf, ret > 40 ? 40 : (int)ret);
-            }
-        }
-        /* Also log sdPC reads on any fd */
-        else if (ret >= 4) {
-            const unsigned char *b = (const unsigned char *)buf;
-            if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
-                int n = __sync_fetch_and_add(&read_ipc_count, 1);
-                if (n < 50) {
-                    debug_int("S32: read sdPC fd=", fd);
-                    debug_int("  count=", (long)count);
-                    debug_int("  ret=", (long)ret);
-                    debug_hexline("  data: ", buf, ret > 40 ? 40 : (int)ret);
-                }
             }
         }
     }
@@ -898,12 +967,8 @@ static real_munmap_fn real_munmap_ptr = NULL;
 
 static volatile int mmap_intercept_count = 0;
 
-/* Forward declarations */
-static void try_send_ipc_ready(void);
-static volatile int ipc_saw_data;
-
 /* Singleton anonymous mapping for the bridge Shm_ */
-static void * volatile bridge_anon_map = NULL;
+static void *bridge_anon_map = NULL;
 static size_t bridge_anon_size = 0;
 
 /* v102: CORRECT SHMemStream header format (confirmed via local Steam trace):
@@ -939,47 +1004,22 @@ static void fill_shm_header(void *mapping, size_t length) {
     }
 }
 
-/* v105: Use REAL file-backed MAP_SHARED on the bridge fd.
- * Previously used MAP_ANONYMOUS which broke bidirectional IPC —
- * client writes to ANON were invisible to webhelper and vice versa.
- * The bridge (64-bit side) already patches CMsgBrowserReady into
- * the real Shm_ file before sending the fd via SCM_RIGHTS.
- * With MAP_SHARED, both sides share the same physical pages. */
-static void *get_bridge_mapping(int fd, size_t length) {
+/* Return the singleton bridge mapping (create + fill ONCE on first call) */
+static void *get_bridge_mapping(size_t length) {
     if (!bridge_anon_map) {
         if (!real_mmap_ptr)
             real_mmap_ptr = (real_mmap_fn)dlsym(RTLD_NEXT, "mmap");
 
-        /* Try MAP_SHARED on the real fd first (bidirectional IPC) */
-        void *m = real_mmap_ptr(NULL, length, PROT_READ | PROT_WRITE,
-                                MAP_SHARED, fd, 0);
-        if (m != MAP_FAILED) {
-            bridge_anon_map = m;
-            bridge_anon_size = length;
-            debug_int("S32: mmap SHARED on bridge fd=", fd);
-            debug_int("  size=", (long)length);
-            debug_hexline("  hdr: ", m, 32);
-
-            /* v108: Do NOT fill CMsgBrowserReady into Ring A.
-             * This ring is client→server (commands). Writing CMsgBrowserReady
-             * there causes "Invalid command" in webhelper's chrome_ipc_server.
-             * Let Chromium init natively and write CMsgBrowserReady itself. */
-            volatile unsigned int *hdr = (volatile unsigned int *)m;
-            debug_int("S32: ring hdr: get=", hdr[0]);
-            debug_int("  put=", hdr[1]);
-            debug_int("  cap=", hdr[2]);
-            debug_int("  pend=", hdr[3]);
-            return m;
-        }
-
-        /* Fallback: MAP_ANONYMOUS (one-way, but won't crash) */
-        debug_int("S32: MAP_SHARED failed, fallback ANON fd=", fd);
         void *anon = real_mmap_ptr(NULL, length, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (anon == MAP_FAILED) return anon;
         memset(anon, 0, length);
         bridge_anon_map = anon;
         bridge_anon_size = length;
+
+        /* v102: fill header + CMsgBrowserReady once.
+         * After client reads and Clear()s, the ring stays empty (get=put=0, pending=0).
+         * That's correct — client got our BrowserReady, now waits for more. */
         fill_shm_header(bridge_anon_map, bridge_anon_size);
         debug_int("S32: created ANON mapping + CMsgBrowserReady, size=", (long)length);
         debug_hexline("  hdr: ", bridge_anon_map, 32);
@@ -995,29 +1035,12 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     if (fd >= 0 && offset == 0 && length >= 16 && is_bridge_dup_fd(fd)) {
         int n = __sync_fetch_and_add(&mmap_intercept_count, 1);
         if (n < 20 || (n % 50) == 0) {
-            debug_int("S32: mmap bridge fd=", fd);
+            debug_int("S32: mmap→ANON fd=", fd);
             debug_int("  count=", n + 1);
             if (bridge_anon_map)
                 debug_hexline("  current hdr: ", bridge_anon_map, 16);
         }
-        void *m = get_bridge_mapping(fd, length);
-
-        /* v109: Inject CMsgBrowserReady from client side after 50 polls (~5s).
-         * Cross-FEX mmap visibility doesn't work — the webhelper-side patcher
-         * writes are never visible here. So we fill the ring buffer directly
-         * in our own address space. The ring is server→client: webhelper creates
-         * the Shm_ file, 32-bit client reads it. */
-        if (n == 50 && m && m != MAP_FAILED) {
-            volatile unsigned int *hdr = (volatile unsigned int *)m;
-            if (hdr[1] == 0 && hdr[3] == 0 && hdr[2] > 0) {
-                fill_shm_header(m, bridge_anon_size > 0 ? bridge_anon_size : length);
-                ipc_saw_data = 1;
-                debug_msg("S32: v109: injected CMsgBrowserReady after 50 polls\n");
-                debug_hexline("  hdr now: ", m, 32);
-            }
-        }
-
-        try_send_ipc_ready();
+        void *m = get_bridge_mapping(length);
         return m;
     }
 
@@ -1031,23 +1054,11 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, __off64_t o
     if (fd >= 0 && offset == 0 && length >= 16 && is_bridge_dup_fd(fd)) {
         int n = __sync_fetch_and_add(&mmap_intercept_count, 1);
         if (n < 20 || (n % 50) == 0) {
-            debug_int("S32: mmap64 bridge fd=", fd);
+            debug_int("S32: mmap64→ANON fd=", fd);
             if (bridge_anon_map)
                 debug_hexline("  current hdr: ", bridge_anon_map, 16);
         }
-        void *m = get_bridge_mapping(fd, length);
-
-        /* v109: Same client-side CMsgBrowserReady injection as mmap() */
-        if (n == 50 && m && m != MAP_FAILED) {
-            volatile unsigned int *hdr = (volatile unsigned int *)m;
-            if (hdr[1] == 0 && hdr[3] == 0 && hdr[2] > 0) {
-                fill_shm_header(m, bridge_anon_size > 0 ? bridge_anon_size : length);
-                ipc_saw_data = 1;
-                debug_msg("S32: v109: injected CMsgBrowserReady after 50 polls (mmap64)\n");
-            }
-        }
-
-        try_send_ipc_ready();
+        void *m = get_bridge_mapping(length);
         return m;
     }
 
@@ -1074,161 +1085,65 @@ int munmap(void *addr, size_t length) {
     return real_munmap_ptr(addr, length);
 }
 
-/* v104: Auto-detect IPC fd from -child-update-ui-socket cmdline arg.
- * The child-update-ui process gets this arg with the fd number for
- * communicating readiness back to the Steam main process. */
-static void detect_s32_ipc_fd(void) {
-    char cmdline[4096];
-    int fd = syscall(SYS_openat, -100, "/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return;
-    ssize_t n = syscall(SYS_read, fd, cmdline, 4095);
-    syscall(SYS_close, fd);
-    if (n <= 0) return;
-    cmdline[n] = '\0';
+/* v103: Create the steam_chrome_shmem dummy file in the 32-bit overlay.
+ * The webhelper creates this file in the 64-bit overlay (invisible to us).
+ * We create it here so stat/access in the 32-bit client finds it.
+ * The actual IPC goes through the abstract socket (same kernel namespace). */
+static void create_shmem_dummy_file(void) {
+    char path[256];
+    char pidbuf[20];
+    long pid = (long)getpid();
 
-    /* Scan NUL-separated args for "-child-update-ui-socket" */
-    const char *needle = "-child-update-ui-socket";
-    int needle_len = 23;
-    int pos = 0;
-    while (pos < n) {
-        int arg_start = pos;
-        while (pos < n && cmdline[pos] != '\0') pos++;
-        int arg_len = pos - arg_start;
-        pos++; /* skip NUL */
+    /* Build: /tmp/steam_chrome_shmem_uid1000_spid<PID> */
+    int n = 0;
+    const char *prefix = "/tmp/steam_chrome_shmem_uid1000_spid";
+    while (*prefix && n < 200) path[n++] = *prefix++;
 
-        if (arg_len == needle_len) {
-            int match = 1;
-            for (int i = 0; i < needle_len; i++) {
-                if (cmdline[arg_start + i] != needle[i]) { match = 0; break; }
-            }
-            if (match && pos < n) {
-                /* Next arg is the fd number */
-                long val = 0;
-                int dpos = pos;
-                while (dpos < n && cmdline[dpos] >= '0' && cmdline[dpos] <= '9') {
-                    val = val * 10 + (cmdline[dpos] - '0');
-                    dpos++;
-                }
-                if (val > 0 && val < 65536) {
-                    s32_ipc_fd = (int)val;
-                    debug_int("S32: detected IPC fd from cmdline: ", val);
-                    /* Write fd to shared file so OTHER guest processes can read it.
-                     * Under FEX, fork() creates separate address spaces, so static
-                     * variables are NOT shared between guest processes. */
-                    {
-                        char fd_str[16];
-                        int sl = 0;
-                        long tmp = val;
-                        char digs[10]; int nd = 0;
-                        if (tmp == 0) digs[nd++] = '0';
-                        else while (tmp > 0) { digs[nd++] = '0' + (tmp % 10); tmp /= 10; }
-                        for (int i = nd - 1; i >= 0; i--) fd_str[sl++] = digs[i];
-                        fd_str[sl++] = '\n';
-                        int wfd = syscall(SYS_openat, -100, "/tmp/s32_ipc_fd",
-                                          O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                        if (wfd >= 0) {
-                            syscall(SYS_write, wfd, fd_str, sl);
-                            syscall(SYS_close, wfd);
-                            debug_msg("S32: wrote IPC fd to /tmp/s32_ipc_fd\n");
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-    }
-    debug_msg("S32: no -child-update-ui-socket in cmdline (not child-update-ui process)\n");
-}
+    /* Append PID */
+    int pn = 0;
+    if (pid == 0) { pidbuf[pn++] = '0'; }
+    else { long v = pid; while (v > 0) { pidbuf[pn++] = '0' + (v % 10); v /= 10; } }
+    for (int i = pn - 1; i >= 0; i--) path[n++] = pidbuf[i];
+    path[n] = '\0';
 
-/* v104b: IPC ready signal — triggered INLINE from mmap interceptor.
- * Previous approach (polling thread) failed because FEX kills pthreads
- * created from DT_NEEDED constructors. Instead, we detect CMsgBrowserReady
- * consumption directly in the mmap() wrapper and send the ready signal
- * on the IPC fd synchronously.
- *
- * Flow: client mmaps → gets singleton with put=10 → consumes → munmaps →
- *       re-mmaps → we see put=0 → send ready signal on ipc_fd.
- */
-static volatile int ipc_ready_sent = 0;
-static volatile int ipc_saw_data = 0;
+    if (!real_open_ptr)
+        real_open_ptr = (real_open_fn)dlsym(RTLD_NEXT, "open");
 
-static void try_send_ipc_ready(void) {
-    if (ipc_ready_sent) return;
-    int my_fd = s32_ipc_fd;
-    if (my_fd < 0) {
-        /* FEX fork() creates separate address spaces — read from shared file
-         * written by the child-update-ui guest process */
-        char fd_buf[16];
-        int rfd = syscall(SYS_openat, -100, "/tmp/s32_ipc_fd", O_RDONLY);
-        if (rfd >= 0) {
-            ssize_t rn = syscall(SYS_read, rfd, fd_buf, 15);
-            syscall(SYS_close, rfd);
-            if (rn > 0) {
-                long val = 0;
-                for (int i = 0; i < rn && fd_buf[i] >= '0' && fd_buf[i] <= '9'; i++)
-                    val = val * 10 + (fd_buf[i] - '0');
-                if (val > 0 && val < 65536) {
-                    s32_ipc_fd = (int)val;
-                    my_fd = (int)val;
-                    debug_int("S32: try_ready: loaded IPC fd from file: ", val);
-                }
-            }
-        }
-        if (my_fd < 0) {
-            debug_int("S32: try_ready: skip, ipc_fd=", (long)my_fd);
-            return;
-        }
-    }
-    if (!bridge_anon_map) {
-        debug_msg("S32: try_ready: skip, no bridge_anon_map\n");
-        return;
-    }
-
-    /* v105b: With MAP_SHARED, client mmaps ONCE and polls in-place —
-     * no mmap→munmap→remmap cycle. So we can't wait for consumption
-     * detection via repeated mmap calls. Instead, send immediately
-     * when ipc_saw_data is set (meaning we filled CMsgBrowserReady). */
-    if (ipc_saw_data) {
-        if (__sync_bool_compare_and_swap(&ipc_ready_sent, 0, 1)) {
-            debug_msg("S32: ipc_ready: CMsgBrowserReady consumed! Sending ready signal.\n");
-
-            if (!real_write32_ptr)
-                real_write32_ptr = (real_write32_fn)dlsym(RTLD_NEXT, "write");
-
-            /* Send sdPC ready message (56 bytes) */
-            unsigned char ready_msg[56];
-            memset(ready_msg, 0, sizeof(ready_msg));
-            ready_msg[0] = 's'; ready_msg[1] = 'd';
-            ready_msg[2] = 'P'; ready_msg[3] = 'C';
-            ready_msg[4] = 0x02; /* version = 2 */
-            ready_msg[8] = 0x01; /* type = 1 */
-
-            ssize_t w = real_write32_ptr(my_fd, ready_msg, 56);
-            debug_int("S32: ipc_ready: wrote sdPC type=1, ret=", (long)w);
-
-            if (w == 56) {
-                char one = '1';
-                w = real_write32_ptr(my_fd, &one, 1);
-                debug_int("S32: ipc_ready: wrote '1' status, ret=", (long)w);
-            }
-            debug_msg("S32: ipc_ready: DONE\n");
-        }
+    /* Create as regular file — our stat wrapper will fake S_IFSOCK */
+    int fd = real_open_ptr(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (fd >= 0) {
+        close(fd);
+        debug_str("S32: created shmem dummy: ", path, "\n");
+    } else {
+        debug_str("S32: shmem dummy FAILED: ", path, "\n");
+        debug_int("  errno=", errno);
     }
 }
 
 __attribute__((constructor))
 static void init(void) {
     mkdir(SHM_REDIR_DIR, 0777);
+    mkdir("/tmp", 0777);
+    debug_int("S32-v104: pid=", (long)getpid());
+    debug_msg("S32-v104: fd11 bridge + shmem stat fake\n");
 
-    /* Detect IPC fd from cmdline */
-    detect_s32_ipc_fd();
-
-    debug_int("S32-v109: pid=", (long)getpid());
-    debug_int("  ipc_fd=", (long)s32_ipc_fd);
-
-    /* v104b: IPC ready signal is sent inline from mmap interceptor,
-     * not from a separate thread (FEX kills pthreads from constructors). */
-    if (s32_ipc_fd >= 0) {
-        debug_int("S32: IPC ready will trigger from mmap interceptor, fd=", s32_ipc_fd);
+    /* v104: Extract real Android tmpdir from FEX_OUTPUTLOG.
+     * FEX_OUTPUTLOG = "/data/user/0/.../cache/tmp/fex-debug.log"
+     * We want:       "/data/user/0/.../cache/tmp" */
+    const char *fex_log = getenv("FEX_OUTPUTLOG");
+    if (fex_log) {
+        const char *last_slash = NULL;
+        for (const char *p = fex_log; *p; p++)
+            if (*p == '/') last_slash = p;
+        if (last_slash && (last_slash - fex_log) > 0 &&
+            (last_slash - fex_log) < (int)sizeof(real_tmpdir) - 1) {
+            int len = (int)(last_slash - fex_log);
+            memcpy(real_tmpdir, fex_log, len);
+            real_tmpdir[len] = '\0';
+            debug_str("S32: real_tmpdir=", real_tmpdir, "\n");
+        }
     }
+
+    /* Create the shmem dummy file early so client can find it */
+    create_shmem_dummy_file();
 }
