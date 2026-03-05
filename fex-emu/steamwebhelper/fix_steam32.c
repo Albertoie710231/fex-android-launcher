@@ -1,24 +1,15 @@
-/* v104: 32-bit shim for the steam client binary.
- * - bind/connect AF_UNIX → abstract socket conversion (steam-only)
- * - shm_open/shm_unlink redirect to real Android path
- * - open/open64: redirect /dev/shm/ to real Android path
- * - shm_open: force O_CREAT, strip O_EXCL (match 64-bit shim)
- * - v91: enhanced connect logging
- * - v91b: stat/lstat fake S_IFSOCK for steam_chrome_shmem paths
- * - v98: SCM_RIGHTS fd passing across FEX overlay boundary
- * - v100: Bridge fd dup (no local file creation)
- * - v101: Intercept mmap for bridge fds → anonymous mapping
- * - v102: CORRECT SHMemStream header format (from local trace):
- *         hdr[0]=get (read cursor), hdr[1]=put (write cursor),
- *         hdr[2]=capacity, hdr[3]=pending bytes.
- *         NOT cubHeader/eState as previously assumed.
- * - v103: FD 11 bridge — fake webhelper handshake from 32-bit side.
- *         The webhelper (64-bit) never inherits fd 11 because
- *         cross-FEX-arch exec loses inherited fds. We dup the child
- *         end of the socketpair and fake the sdPC ready response so
- *         the Steam client thinks the webhelper is ready.
- *         Also: stat/access fake for missing steam_chrome_shmem files,
- *         and create dummy shmem file in 32-bit overlay.
+/* v107: 32-bit shim for the steam client binary.
+ * - v107: Fix Shm_ IPC channels — let client create its own files (O_EXCL preserved).
+ *         Previously ALL Shm_ opens returned the single bridge fd → only one
+ *         channel visible → IPC init stalled (60s timeout). Now each Shm_ gets
+ *         its own fd. Add listen() wrapper for socket discovery.
+ * - v106: Pre-create MasterStream at /dev/shm/ via RAW SYSCALL in constructor.
+ * - v105: openat/open/shm_open MasterStream intercepts (bypassed by glibc)
+ * - v104: X11 abstract socket path rewriting (FEX /tmp != Android cache/tmp)
+ * - v103: FD 11 bridge, stat/access fake for steam_chrome_shmem
+ * - v102: Correct SHMemStream header (cursor-based layout)
+ * - v101: mmap intercept → singleton ANON mapping
+ * - v100: Bridge fd dup via SCM_RIGHTS
  */
 #define _GNU_SOURCE
 #include <sys/socket.h>
@@ -144,6 +135,40 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return real_bind_ptr(sockfd, addr, addrlen);
 }
 
+/* v107: listen() wrapper — log fd, backlog, and bound address for socket discovery.
+ * Tells us what sockets the client creates so the webhelper can connect to them. */
+typedef int (*real_listen_fn)(int, int);
+static real_listen_fn real_listen_ptr = NULL;
+static volatile int listen_count = 0;
+
+int listen(int sockfd, int backlog) {
+    if (!real_listen_ptr)
+        real_listen_ptr = (real_listen_fn)dlsym(RTLD_NEXT, "listen");
+    int ret = real_listen_ptr(sockfd, backlog);
+    int n = __sync_fetch_and_add(&listen_count, 1);
+    if (n < 30) {
+        debug_int("S32: listen fd=", sockfd);
+        debug_int("  backlog=", backlog);
+        debug_int("  ret=", ret);
+        if (ret < 0) debug_int("  errno=", errno);
+        /* Log the bound address via getsockname */
+        struct sockaddr_un sa;
+        socklen_t salen = sizeof(sa);
+        if (getsockname(sockfd, (struct sockaddr *)&sa, &salen) == 0) {
+            if (sa.sun_family == AF_UNIX) {
+                if (sa.sun_path[0] == '\0' && salen > sizeof(sa_family_t) + 1) {
+                    debug_str("  addr=@", &sa.sun_path[1], "\n");
+                } else if (sa.sun_path[0] != '\0') {
+                    debug_str("  addr=", sa.sun_path, "\n");
+                }
+            } else {
+                debug_int("  family=", sa.sun_family);
+            }
+        }
+    }
+    return ret;
+}
+
 typedef int (*real_connect_fn)(int, const struct sockaddr *, socklen_t);
 static real_connect_fn real_connect_ptr = NULL;
 
@@ -162,8 +187,9 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         if (un->sun_path[0] == '\0') {
             /* Already abstract — check if it's a /tmp/ path that needs rewriting */
             const char *abs_name = &un->sun_path[1];
-            if (real_tmpdir[0] && strncmp(abs_name, "/tmp/", 5) == 0) {
-                /* Rewrite @/tmp/foo → @$real_tmpdir/foo */
+            if (real_tmpdir[0] && strncmp(abs_name, "/tmp/", 5) == 0 &&
+                !strstr(abs_name, "steam_chrome_shmem")) {
+                /* Rewrite @/tmp/foo → @$real_tmpdir/foo (NOT for shmem) */
                 struct sockaddr_un rewritten;
                 memset(&rewritten, 0, sizeof(rewritten));
                 rewritten.sun_family = AF_UNIX;
@@ -209,8 +235,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         /* v104: Rewrite /tmp/ paths to real Android tmpdir as abstract sockets.
          * FEX guest sees /tmp but the actual sockets (X11, etc.) live at
          * $CACHE/tmp on the Android side. We rewrite to the correct abstract
-         * socket name so they connect to the ARM64 X11 server. */
-        if (real_tmpdir[0] && strncmp(un->sun_path, "/tmp/", 5) == 0) {
+         * socket name so they connect to the ARM64 X11 server.
+         *
+         * v105: Do NOT rewrite steam_chrome_shmem paths — the 64-bit webhelper
+         * binds to @/tmp/steam_chrome_shmem_... (via its own make_abstract).
+         * Rewriting to @$real_tmpdir/... would create a name mismatch. Let
+         * these fall through to make_abstract() which preserves /tmp/. */
+        if (real_tmpdir[0] && strncmp(un->sun_path, "/tmp/", 5) == 0 &&
+            !strstr(un->sun_path, "steam_chrome_shmem")) {
             /* /tmp/foo → @$real_tmpdir/foo (abstract socket) */
             struct sockaddr_un rewritten;
             memset(&rewritten, 0, sizeof(rewritten));
@@ -334,60 +366,146 @@ int shm_open(const char *name, int oflag, mode_t mode) {
     char path[256];
     build_shm_path(path, sizeof(path), name);
 
-    /* v100: If we already have a bridge fd for this Shm_ name, return dup.
-     * v101: Track the dup fd so our mmap interceptor can catch it later. */
-    if (!(oflag & O_CREAT) && bridge_shm_fd >= 0 &&
-        strstr(name, "Shm_") != NULL && strcmp(name, bridge_shm_name) == 0) {
-        int dfd = dup(bridge_shm_fd);
-        if (dfd >= 0) add_bridge_dup_fd(dfd);
-        int count = __sync_fetch_and_add(&shm_open_count_32, 1);
-        if (count < 10 || (count % 100) == 0) {
-            debug_int("S32: shm_open→bridge dup fd=", dfd);
-        }
-        return dfd;
-    }
-
     if (!real_open_ptr)
         real_open_ptr = (real_open_fn)dlsym(RTLD_NEXT, "open");
 
-    int real_flags;
-    if (oflag & O_CREAT) {
-        /* Caller wants to create: strip O_EXCL, force O_RDWR */
-        real_flags = (oflag & ~O_EXCL) | O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
-        if (!mode) mode = 0666;
-    } else {
-        /* Caller is just opening/polling (O_RDONLY): preserve original flags!
-         * This is how the steam client polls for webhelper readiness. */
-        real_flags = oflag | O_CLOEXEC | O_NOFOLLOW;
-        if (!mode) mode = 0666;
+    /* v105: MasterStream special handling.
+     * The client expects the webhelper to pre-create this SHM.
+     * When O_EXCL is set, the client EXPECTS EEXIST (meaning webhelper made it).
+     * If O_EXCL succeeds, the client logs an error and retries forever.
+     * We pre-create the file (with CMsgBrowserReady) then return EEXIST.
+     * On the subsequent O_RDONLY, the client maps the file directly. */
+    if (strstr(name, "SteamChrome_MasterStream") != NULL) {
+        if (oflag & O_EXCL) {
+            /* Pre-create the file with CMsgBrowserReady data */
+            int msfd = real_open_ptr(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+            if (msfd >= 0) {
+                unsigned char buf[8208];
+                memset(buf, 0, sizeof(buf));
+                unsigned int *hdr = (unsigned int *)buf;
+                hdr[0] = 0;     /* get */
+                hdr[1] = 10;    /* put */
+                hdr[2] = 8192;  /* capacity */
+                hdr[3] = 10;    /* pending */
+                /* CMsgBrowserReady at ring offset 0 (buf offset 16) */
+                unsigned char *ring = buf + 16;
+                unsigned int msg_type = 0, msg_size = 2;
+                memcpy(ring, &msg_type, 4);
+                memcpy(ring + 4, &msg_size, 4);
+                ring[8] = 0x08; ring[9] = 0x01; /* browser_handle = 1 */
+                write(msfd, buf, sizeof(buf));
+                close(msfd);
+                debug_str("S32: v105 MasterStream pre-created: ", name, "\n");
+            }
+            /* Return EEXIST — client thinks webhelper created it */
+            errno = EEXIST;
+            return -1;
+        }
+        /* O_RDONLY: open the pre-created file, let client MAP_SHARED it */
+        int msfd = real_open_ptr(path, O_RDWR | O_CLOEXEC, 0666);
+        if (msfd < 0) {
+            /* File not yet created — create on demand with CMsgBrowserReady */
+            msfd = real_open_ptr(path, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+            if (msfd >= 0) {
+                unsigned char buf[8208];
+                memset(buf, 0, sizeof(buf));
+                unsigned int *hdr = (unsigned int *)buf;
+                hdr[0] = 0; hdr[1] = 10; hdr[2] = 8192; hdr[3] = 10;
+                unsigned char *ring = buf + 16;
+                unsigned int msg_type = 0, msg_size = 2;
+                memcpy(ring, &msg_type, 4);
+                memcpy(ring + 4, &msg_size, 4);
+                ring[8] = 0x08; ring[9] = 0x01;
+                write(msfd, buf, sizeof(buf));
+                lseek(msfd, 0, SEEK_SET);
+                debug_str("S32: v105 MasterStream on-demand: ", name, "\n");
+            }
+        }
+        if (msfd >= 0) {
+            int cnt = __sync_fetch_and_add(&shm_open_count_32, 1);
+            if (cnt < 10) {
+                debug_str("S32: v105 MasterStream open: ", name, "\n");
+                debug_int("  fd=", msfd);
+            }
+        }
+        return msfd;
     }
 
-    int fd = real_open_ptr(path, real_flags, mode);
-    int count = __sync_fetch_and_add(&shm_open_count_32, 1);
-    /* Always log polling (O_RDONLY) calls, and first 30 of others */
-    if (count < 30 || !(oflag & O_CREAT)) {
-        debug_str("S32: shm_open(", name, ")\n");
-        debug_int("  flags=", oflag);
-        debug_int("  fd=", fd);
-    }
+    /* v107: Shm_ IPC channels — let client create its own files.
+     * On a real PC, the client creates 3 Shm_ files (O_CREAT|O_EXCL succeeds)
+     * and opens 5 more from webhelper (O_EXCL→EEXIST then O_RDWR).
+     * Previously we returned the bridge fd for ALL Shm_ → single channel
+     * → IPC init stalled (60s timeout). Now each Shm_ gets its own fd. */
+    if (strstr(name, "Shm_") != NULL) {
+        int count = __sync_fetch_and_add(&shm_open_count_32, 1);
 
-    /* v100: No fd tracking needed — we use bridge_shm_fd directly. */
+        if ((oflag & O_CREAT) && (oflag & O_EXCL)) {
+            /* Client wants exclusive create of its own Shm_ channel.
+             * Preserve O_EXCL so kernel returns EEXIST if file exists. */
+            int fd = real_open_ptr(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+                                   mode ? mode : 0666);
+            if (fd >= 0) {
+                if (count < 30) {
+                    debug_str("S32: shm Shm_ CREATE OK: ", name, "\n");
+                    debug_int("  fd=", fd);
+                }
+                return fd;
+            }
+            if (errno == EEXIST) {
+                /* Already exists (webhelper or previous run) → open O_RDWR */
+                fd = real_open_ptr(path, O_RDWR | O_CLOEXEC, 0666);
+                if (count < 30) {
+                    debug_str("S32: shm Shm_ EEXIST→RDWR: ", name, "\n");
+                    debug_int("  fd=", fd);
+                }
+                return fd;
+            }
+            if (count < 30) {
+                debug_str("S32: shm Shm_ CREATE FAIL: ", name, "\n");
+                debug_int("  errno=", errno);
+            }
+            return -1;
+        }
 
-    /* Track Shm_ polling failures. On every failed poll, try to get real
-     * data from the 64-bit bridge socket. The bridge sends the webhelper's
-     * actual Shm_ file content (with real SHMemStream header + ring buffer).
-     * We write it to our local (32-bit) overlay so the steam client can see it.
-     *
-     * Must be done INLINE here (not in a separate thread) because FEX overlay
-     * isolation is per-process — files created by a different PID are invisible. */
-    if (fd < 0 && !(oflag & O_CREAT) && strstr(name, "Shm_") != NULL) {
-        int pn = __sync_fetch_and_add(&shm_poll_fail_count, 1);
+        if (oflag & O_CREAT) {
+            /* O_CREAT without O_EXCL — just create or open */
+            int fd = real_open_ptr(path, O_CREAT | O_RDWR | O_CLOEXEC,
+                                   mode ? mode : 0666);
+            if (count < 30) {
+                debug_str("S32: shm Shm_ O_CREAT: ", name, "\n");
+                debug_int("  fd=", fd);
+            }
+            return fd;
+        }
 
-        /* Try bridge every 10 polls (~1s).
-         * v98: SCM_RIGHTS — bridge sends the webhelper's fd via sendmsg.
-         * Even with separate FEX fd tables, SCM_RIGHTS passes real fds.
-         * The received fd shares the same open file → live MAP_SHARED. */
-        if (pn >= 5 && (pn % 10) == 0) {
+        /* Non-O_CREAT: client polling for webhelper-created files.
+         * Try redir dir first, then bridge fd, then bridge socket. */
+        {
+            int fd = real_open_ptr(path, O_RDWR | O_CLOEXEC, 0666);
+            if (fd >= 0) {
+                if (count < 30) {
+                    debug_str("S32: shm Shm_ POLL found: ", name, "\n");
+                    debug_int("  fd=", fd);
+                }
+                return fd;
+            }
+        }
+
+        /* Try bridge fd if we have one for this exact name */
+        if (bridge_shm_fd >= 0 && strcmp(name, bridge_shm_name) == 0) {
+            int dfd = dup(bridge_shm_fd);
+            if (dfd >= 0) add_bridge_dup_fd(dfd);
+            if (count < 30) {
+                debug_str("S32: shm Shm_ POLL→bridge: ", name, "\n");
+                debug_int("  fd=", dfd);
+            }
+            return dfd;
+        }
+
+        /* File not found — poll the 64-bit bridge socket periodically */
+        {
+            int pn = __sync_fetch_and_add(&shm_poll_fail_count, 1);
+            if (pn >= 5 && (pn % 10) == 0) {
             int bsock = socket(AF_UNIX, SOCK_STREAM, 0);
             if (bsock >= 0) {
                 struct sockaddr_un baddr;
@@ -451,10 +569,8 @@ int shm_open(const char *name, int oflag, mode_t mode) {
                             debug_int("  received_fd=", received_fd);
                         }
 
-                        /* If name matches our poll, save as bridge fd */
+                        /* If name matches, save bridge fd and return directly */
                         if (strcmp(bname, name) == 0 && received_fd >= 0) {
-                            /* v100: Save bridge fd globally for future dup()s.
-                             * v101: mmap interception handles the header. */
                             bridge_shm_fd = received_fd;
                             {
                                 int i = 0;
@@ -464,12 +580,12 @@ int shm_open(const char *name, int oflag, mode_t mode) {
                                 bridge_shm_name[i] = '\0';
                             }
                             debug_int("  MATCH! bridge_shm_fd=", received_fd);
-
-                            fd = dup(received_fd);
-                            if (fd >= 0) add_bridge_dup_fd(fd);
-                            debug_int("  returning dup fd=", fd);
+                            int dfd = dup(received_fd);
+                            if (dfd >= 0) add_bridge_dup_fd(dfd);
+                            debug_int("  returning dup fd=", dfd);
+                            close(bsock);
+                            return dfd;
                         } else if (received_fd >= 0) {
-                            /* Not the one we need — close it to avoid leak */
                             close(received_fd);
                         }
                     }
@@ -482,10 +598,36 @@ int shm_open(const char *name, int oflag, mode_t mode) {
                 }
                 close(bsock);
             }
+            }
+            /* All paths exhausted — Shm_ file not found */
+            if (count < 30 || (count % 100) == 0) {
+                debug_str("S32: shm Shm_ POLL FAIL: ", name, "\n");
+                debug_int("  pn=", pn);
+            }
+            errno = ENOENT;
+            return -1;
         }
     }
 
-    return fd;
+    /* Generic SHM path (non-Shm_, non-MasterStream) */
+    {
+        int real_flags;
+        if (oflag & O_CREAT) {
+            real_flags = (oflag & ~O_EXCL) | O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
+            if (!mode) mode = 0666;
+        } else {
+            real_flags = oflag | O_CLOEXEC | O_NOFOLLOW;
+            if (!mode) mode = 0666;
+        }
+        int fd = real_open_ptr(path, real_flags, mode);
+        int count = __sync_fetch_and_add(&shm_open_count_32, 1);
+        if (count < 30 || !(oflag & O_CREAT)) {
+            debug_str("S32: shm_open(", name, ")\n");
+            debug_int("  flags=", oflag);
+            debug_int("  fd=", fd);
+        }
+        return fd;
+    }
 }
 
 int shm_unlink(const char *name) {
@@ -516,6 +658,42 @@ int open(const char *pathname, int flags, ...) {
 
     char redir[256];
     if (build_devshm_redir(pathname, redir, sizeof(redir))) {
+        /* v105: MasterStream — client expects O_EXCL to FAIL (EEXIST).
+         * Pre-create the file with CMsgBrowserReady on first O_EXCL,
+         * then return EEXIST. On subsequent non-EXCL open, return the file. */
+        if (strstr(pathname, "SteamChrome_MasterStream") != NULL) {
+            if (flags & O_EXCL) {
+                /* Pre-create with CMsgBrowserReady data */
+                int msfd = real_open_ptr(redir, O_CREAT | O_RDWR | O_TRUNC, 0666);
+                if (msfd >= 0) {
+                    unsigned char buf[8208];
+                    memset(buf, 0, sizeof(buf));
+                    unsigned int *hdr = (unsigned int *)buf;
+                    hdr[0] = 0; hdr[1] = 10; hdr[2] = 8192; hdr[3] = 10;
+                    unsigned char *ring = buf + 16;
+                    unsigned int msg_type = 0, msg_size = 2;
+                    memcpy(ring, &msg_type, 4);
+                    memcpy(ring + 4, &msg_size, 4);
+                    ring[8] = 0x08; ring[9] = 0x01;
+                    syscall(SYS_write, msfd, buf, sizeof(buf));
+                    close(msfd);
+                    debug_str("S32: v105 MasterStream pre-created: ", redir, "\n");
+                }
+                errno = EEXIST;
+                return -1;
+            }
+            /* Non-EXCL open: return the pre-created file */
+            int msfd = real_open_ptr(redir, O_RDWR | O_CLOEXEC, 0666);
+            if (msfd >= 0) {
+                int cnt = __sync_fetch_and_add(&devshm_open_count, 1);
+                if (cnt < 10) {
+                    debug_str("S32: v105 MasterStream open: ", redir, "\n");
+                    debug_int("  fd=", msfd);
+                }
+            }
+            return msfd;
+        }
+
         int real_flags = (flags & ~O_EXCL) | O_CREAT | O_RDWR;
         if (!mode) mode = 0666;
         int fd = real_open_ptr(redir, real_flags, mode);
@@ -537,6 +715,91 @@ int open64(const char *pathname, int flags, ...) {
         mode = va_arg(ap, mode_t);
     va_end(ap);
     return open(pathname, flags, mode);
+}
+
+/* v105: openat/openat64 wrapper — glibc shm_open may use openat internally.
+ * The MasterStream goes through openat(fd_to_devshm, name, O_EXCL) which
+ * bypasses our open() wrapper. Catch it here. */
+typedef int (*real_openat_fn)(int, const char *, int, ...);
+static real_openat_fn real_openat_ptr = NULL;
+static volatile int openat_shm_count = 0;
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    if (!real_openat_ptr)
+        real_openat_ptr = (real_openat_fn)dlsym(RTLD_NEXT, "openat");
+    va_list ap;
+    va_start(ap, flags);
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE))
+        mode = va_arg(ap, mode_t);
+    va_end(ap);
+
+    /* Detect MasterStream via openat on /dev/shm dir fd */
+    if (pathname && strstr(pathname, "SteamChrome_MasterStream") != NULL) {
+        if (!real_open_ptr)
+            real_open_ptr = (real_open_fn)dlsym(RTLD_NEXT, "open");
+
+        /* Build full /dev/shm/ redirect path */
+        char redir[256];
+        int n = 0;
+        const char *d = SHM_REDIR_DIR;
+        while (*d && n < 250) redir[n++] = *d++;
+        redir[n++] = '/';
+        const char *s = pathname;
+        while (*s && n < 255) redir[n++] = *s++;
+        redir[n] = '\0';
+
+        if (flags & O_EXCL) {
+            /* Pre-create with CMsgBrowserReady, return EEXIST */
+            int msfd = real_open_ptr(redir, O_CREAT | O_RDWR | O_TRUNC, 0666);
+            if (msfd >= 0) {
+                unsigned char buf[8208];
+                memset(buf, 0, sizeof(buf));
+                unsigned int *hdr = (unsigned int *)buf;
+                hdr[0] = 0; hdr[1] = 10; hdr[2] = 8192; hdr[3] = 10;
+                unsigned char *ring = buf + 16;
+                unsigned int msg_type = 0, msg_size = 2;
+                memcpy(ring, &msg_type, 4);
+                memcpy(ring + 4, &msg_size, 4);
+                ring[8] = 0x08; ring[9] = 0x01;
+                syscall(SYS_write, msfd, buf, sizeof(buf));
+                close(msfd);
+                debug_str("S32: v105 MasterStream openat pre-created: ", pathname, "\n");
+            }
+            errno = EEXIST;
+            return -1;
+        }
+        /* Non-EXCL: open pre-created file */
+        int msfd = real_open_ptr(redir, O_RDWR | O_CLOEXEC, 0666);
+        if (msfd >= 0) {
+            int cnt = __sync_fetch_and_add(&openat_shm_count, 1);
+            if (cnt < 10)
+                debug_str("S32: v105 MasterStream openat open: ", pathname, "\n");
+        }
+        return msfd;
+    }
+
+    /* Log other /dev/shm openat calls */
+    if (pathname && strstr(pathname, "Shm_") != NULL) {
+        int cnt = __sync_fetch_and_add(&openat_shm_count, 1);
+        if (cnt < 10) {
+            debug_str("S32: openat Shm_: ", pathname, "\n");
+            debug_int("  dirfd=", dirfd);
+            debug_int("  flags=", flags);
+        }
+    }
+
+    return real_openat_ptr(dirfd, pathname, flags, mode);
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    va_list ap;
+    va_start(ap, flags);
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE))
+        mode = va_arg(ap, mode_t);
+    va_end(ap);
+    return openat(dirfd, pathname, flags, mode);
 }
 
 /* stat/lstat wrappers: fake S_IFSOCK for steam_chrome_shmem paths.
@@ -686,8 +949,11 @@ static void *fd11_fake_ready_func(void *arg) {
      * The parent reads from fd 12 and sees our sdPC as the webhelper's response.
      * The 60-second timeout for "Failed connecting" gives us plenty of room. */
 
-    debug_msg("S32: fd11_fake: sleeping 3s for child-update-ui to finish...\n");
-    struct timespec ts = { .tv_sec = 3, .tv_nsec = 0 };
+    /* v105: Reduced from 3s to 500ms. The first socketpair (child-update-ui)
+     * gets closed quickly. We need to write before EPIPE. If this is the
+     * wrong socketpair, the thread just EPIPE's and exits harmlessly. */
+    debug_msg("S32: fd11_fake: sleeping 500ms...\n");
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 500000000 };
     nanosleep(&ts, NULL);
 
     /* Drain any pending data the parent wrote for the webhelper phase.
@@ -730,8 +996,12 @@ static void *fd11_fake_ready_func(void *arg) {
         if (n < 0) debug_int("  errno=", errno);
     }
 
-    fd11_ready_done = 1;
-    debug_msg("S32: fd11_fake: DONE — ready signal sent\n");
+    if (n == 56 || n == 1) {
+        fd11_ready_done = 1;
+        debug_msg("S32: fd11_fake: DONE — ready signal sent\n");
+    } else {
+        debug_msg("S32: fd11_fake: EPIPE — wrong socketpair, will retry on next\n");
+    }
     return NULL;
 }
 
@@ -745,27 +1015,13 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
         debug_int("  fd1=", sv[1]);
     }
 
-    /* v103: Save a dup of sv[0] (the child's end) before the parent closes it.
-     * We dup to a high fd number (200+) so it won't collide with normal fds.
-     * The dup survives even after close(sv[0]) because it's an independent fd
-     * referencing the same socket endpoint. */
-    if (ret == 0 && ipc_child_fd < 0 && domain == AF_UNIX) {
-        int saved = fcntl(sv[0], F_DUPFD, 200);
-        if (saved >= 0) {
-            /* Clear CLOEXEC so it survives (fcntl F_DUPFD doesn't set it) */
-            ipc_child_fd = saved;
-            debug_int("S32: fd11: saved child end dup fd=", saved);
-            debug_int("S32: fd11: original sv[0]=", sv[0]);
-            debug_int("S32: fd11: parent sv[1]=", sv[1]);
-
-            /* Start the fake webhelper handshake thread */
-            pthread_t thr;
-            pthread_create(&thr, NULL, fd11_fake_ready_func, NULL);
-            pthread_detach(thr);
-            debug_msg("S32: fd11: started fake ready thread\n");
-        } else {
-            debug_int("S32: fd11: dup failed errno=", errno);
-        }
+    /* v105: Log all socketpairs but do NOT write fake sdPC.
+     * socketpair #0 is for child-update-ui (writing corrupts it → crash).
+     * The webhelper uses steam_chrome_shmem socket, NOT a socketpair. */
+    if (ret == 0 && domain == AF_UNIX) {
+        debug_int("S32: socketpair #", (long)n);
+        debug_int("  sv[0]=", sv[0]);
+        debug_int("  sv[1]=", sv[1]);
     }
 
     return ret;
@@ -1124,8 +1380,59 @@ __attribute__((constructor))
 static void init(void) {
     mkdir(SHM_REDIR_DIR, 0777);
     mkdir("/tmp", 0777);
-    debug_int("S32-v104: pid=", (long)getpid());
-    debug_msg("S32-v104: fd11 bridge + shmem stat fake\n");
+    debug_int("S32-v107: pid=", (long)getpid());
+    debug_msg("S32-v107: Shm_ per-file IPC + listen logging\n");
+
+    /* v106: Pre-create MasterStream at REAL /dev/shm/ using RAW SYSCALL.
+     * All library wrappers (open/openat/shm_open) are bypassed by glibc
+     * internals. Only a raw SYS_openat reaches the kernel before Steam does.
+     * When Steam's shm_open tries O_CREAT|O_EXCL, the kernel returns EEXIST
+     * natively because the file already exists. */
+    {
+        char ms_path[256];
+        const char *prefix = "/dev/shm/SteamChrome_MasterStream_uid1000_spid";
+        const char *suffix = "_mem";
+        int n = 0;
+        const char *s;
+        for (s = prefix; *s; s++) ms_path[n++] = *s;
+        /* Append PID */
+        long pid = (long)getpid();
+        char pidbuf[16];
+        int pn = 0;
+        if (pid == 0) { pidbuf[pn++] = '0'; }
+        else { long v = pid; while (v > 0) { pidbuf[pn++] = '0' + (v % 10); v /= 10; } }
+        for (int i = pn - 1; i >= 0; i--) ms_path[n++] = pidbuf[i];
+        for (s = suffix; *s; s++) ms_path[n++] = *s;
+        ms_path[n] = '\0';
+
+        /* Ensure /dev/shm exists */
+        syscall(SYS_mkdir, "/dev/shm", 0777);
+
+        /* Create file via raw syscall — bypasses our own wrappers AND glibc */
+        int msfd = (int)syscall(SYS_openat, AT_FDCWD, ms_path,
+                                O_CREAT | O_RDWR | O_TRUNC, 0666);
+        if (msfd >= 0) {
+            unsigned char buf[8208];
+            memset(buf, 0, sizeof(buf));
+            unsigned int *hdr = (unsigned int *)buf;
+            hdr[0] = 0;      /* get = 0 */
+            hdr[1] = 10;     /* put = 10 */
+            hdr[2] = 8192;   /* capacity */
+            hdr[3] = 10;     /* pending = 10 bytes */
+            unsigned char *ring = buf + 16;
+            unsigned int msg_type = 0, msg_size = 2;
+            memcpy(ring, &msg_type, 4);
+            memcpy(ring + 4, &msg_size, 4);
+            ring[8] = 0x08;  /* protobuf field 1 varint */
+            ring[9] = 0x01;  /* browser_handle = 1 */
+            syscall(SYS_write, msfd, buf, sizeof(buf));
+            close(msfd);
+            debug_str("S32: v106 MasterStream pre-created: ", ms_path, "\n");
+        } else {
+            debug_str("S32: v106 MasterStream FAILED: ", ms_path, "\n");
+            debug_int("  errno=", errno);
+        }
+    }
 
     /* v104: Extract real Android tmpdir from FEX_OUTPUTLOG.
      * FEX_OUTPUTLOG = "/data/user/0/.../cache/tmp/fex-debug.log"
