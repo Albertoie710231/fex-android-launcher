@@ -69,7 +69,6 @@ for arg in "$@"; do
         *) ARGS+=("$arg") ;;
     esac
 done
-# Add NotReachedIsFatal even if Steam didn't pass --disable-features
 if [ "$FOUND_DISABLE_FEATURES" -eq 0 ]; then
     ARGS+=("--disable-features=NotReachedIsFatal,Vulkan")
 fi
@@ -88,16 +87,14 @@ log "Wrote PID=$$ PPID=$PPID UID=$(id -u) to /tmp/steam_webhelper_pid"
 # Use exec so steamwebhelper REPLACES the shell process (keeps same PID).
 # The PID in /tmp/steam_webhelper_pid matches the actual process PID.
 exec "${DIR}/steamwebhelper" \
-    --headless \
-    --ozone-platform=headless \
     --no-sandbox \
+    --no-zygote \
     --disable-gpu \
     --disable-gpu-sandbox \
-    --disable-gpu-compositing \
     --single-process \
-    --in-process-gpu \
     --use-gl=disabled \
-    --disable-accelerated-video-decode \
+    --ozone-platform=x11 \
+    --enable-features=UseOzonePlatform,NetworkServiceInProcess2 \
     --disable-setuid-sandbox \
     --disable-seccomp-filter-sandbox \
     --disable-dev-shm-usage \
@@ -107,7 +104,6 @@ exec "${DIR}/steamwebhelper" \
     --no-first-run \
     --no-proxy-server \
     --proxy-server=direct:// \
-    --disable-background-networking \
     --disable-field-trial-config \
     --enable-logging \
     --v=1 \

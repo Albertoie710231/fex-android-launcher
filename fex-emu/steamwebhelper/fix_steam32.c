@@ -1,4 +1,14 @@
-/* v134: 32-bit shim for the steam client binary.
+/* v136: 32-bit shim for the steam client binary.
+ * - v136: FIX stale PID cache — get_webhelper_pid() now ALWAYS re-reads
+ *         /tmp/steam_webhelper_pid instead of caching forever. When webhelper
+ *         respawns, PID changes but stale cache caused "Checked: OLD/NEW"
+ *         mismatch → WebUITransport rejected all WebSocket connections.
+ * - v135: FIX MasterStream ring reset — Steam's Create() reinitializes the
+ *         SHM header (put=0) via raw syscall, wiping our pre-injected
+ *         BrowserReady. Our POLL only checked for all-zeros or wrong size,
+ *         missing the case where cubBuf=8192 but put=0 (ring empty).
+ *         FIX: POLL now detects put==0 with cubBuf>0 and refills immediately.
+ *         Also log all 4 header fields (get, put, cubBuf, pending) for debugging.
  * - v133: FIX WebUITransport PID check ("Checked: 0/PID").
  *         S32 uses SO_PEERCRED or /proc/net/tcp to find the PID of the
  *         connecting WebSocket client. On Android, /proc/net/tcp is
@@ -695,6 +705,22 @@ static int is_bridge_dup_fd(int fd) {
  * Returns webhelper PID, or 0 if file not found/unreadable. Non-blocking. */
 static volatile unsigned int cached_wh_pid = 0;
 
+/* v135: Bridge socket name is PID-based: \0shm_bridge_64to32_<WH_PID> */
+static char s32_bridge_sock_name[64];
+static int s32_bridge_sock_name_len = 0;
+
+static void build_bridge_sock_name(unsigned int wh_pid) {
+    s32_bridge_sock_name[0] = '\0'; /* abstract socket prefix */
+    const char *prefix = "shm_bridge_64to32_";
+    int n = 1;
+    while (*prefix) s32_bridge_sock_name[n++] = *prefix++;
+    char digits[16]; int dn = 0;
+    if (wh_pid == 0) digits[dn++] = '0';
+    else { unsigned int p = wh_pid; while (p > 0) { digits[dn++] = '0' + (p % 10); p /= 10; } }
+    for (int i = dn - 1; i >= 0; i--) s32_bridge_sock_name[n++] = digits[i];
+    s32_bridge_sock_name_len = n;
+}
+
 static unsigned int read_webhelper_pid_file(void) {
     /* v133: Must use raw syscall — open() wrapper calls get_webhelper_pid()
      * which calls us → infinite recursion → stack overflow → segfault */
@@ -710,16 +736,21 @@ static unsigned int read_webhelper_pid_file(void) {
 }
 
 static unsigned int get_webhelper_pid(void) {
-    /* Check cache first */
-    unsigned int p = cached_wh_pid;
-    if (p > 0) return p;
-    /* Try reading file (non-blocking — file may not exist yet) */
-    p = read_webhelper_pid_file();
+    /* v136: ALWAYS re-read the PID file. When webhelper respawns, the PID
+     * changes and stale cache causes WebUITransport PID mismatch → rejected.
+     * The file read is cheap (raw syscall, small file). */
+    unsigned int p = read_webhelper_pid_file();
     if (p > 0) {
-        cached_wh_pid = p;
-        debug_int("S32: read webhelper PID from file: ", (long)p);
+        if (p != cached_wh_pid) {
+            debug_int("S32: webhelper PID changed to: ", (long)p);
+            cached_wh_pid = p;
+            /* Rebuild bridge socket name for new PID */
+            build_bridge_sock_name(p);
+        }
+        return p;
     }
-    return p;
+    /* File not readable yet — return cached value if any */
+    return cached_wh_pid;
 }
 
 /* v131: Write REAL CMsgBrowserReady into ring buffer (76 bytes, PC format).
@@ -784,6 +815,8 @@ static void write_browserready_ring(unsigned char *buf, size_t bufsize) {
 /* v116: MS poller globals — saved from constructor for background thread */
 static char ms_poller_shm_name[130]; /* "/SteamChrome_MasterStream_..." for shm_open */
 static char ms_poller_devshm_path[256]; /* "/dev/shm/SteamChrome_MasterStream_..." for raw syscall */
+static char ms_hashed_devshm_path[256]; /* v135: "/dev/shm/u1000-Shm_XXXX" — the HASHED path Steam actually uses */
+static char ms_hashed_redir_path[256]; /* v135: SHM_REDIR_DIR path for hashed name */
 static unsigned char ms_poller_buf[8192]; /* pre-built CMsgBrowserReady content */
 static volatile int ms_poller_active = 0;
 static int ms_precreate_fd = -1; /* kept-open fd from constructor's shm_open */
@@ -1185,24 +1218,88 @@ static void *ms_poller_thread(void *arg) {
                     debug_msg("  *** SIZE CHANGED ***\n");
                 }
 
-                /* Log hdr[0] specifically (might be m_cubBuffer) */
+                /* Log header fields: get(0), put(4), cubBuf(8), pending(12) */
                 unsigned int hdr0 = *(unsigned int *)(cur_hdr);
+                unsigned int hdr4 = *(unsigned int *)(cur_hdr + 4);
                 unsigned int hdr8 = *(unsigned int *)(cur_hdr + 8);
-                debug_int("  hdr[0]=", (long)hdr0);
-                debug_int("  hdr[8]=", (long)hdr8);
+                unsigned int hdr12 = *(unsigned int *)(cur_hdr + 12);
+                debug_int("  get=", (long)hdr0);
+                debug_int("  put=", (long)hdr4);
+                debug_int("  cubBuf=", (long)hdr8);
+                debug_int("  pending=", (long)hdr12);
             }
 
             memcpy(last_hdr, cur_hdr, 32);
 
-            /* If content is all zeros or size wrong, refill */
-            if ((is_zeros || (fsr == 0 && rst.st_size < 8192)) && refill_count < 200) {
+            /* v135: Detect ring reset — Steam's Create() reinitializes the header
+             * (put=0, pending=0) via raw syscall, wiping our BrowserReady.
+             * Refill whenever put==0 but cubBuf>0 (ring exists but is empty). */
+            unsigned int poll_put = *(unsigned int *)(cur_hdr + 4);
+            unsigned int poll_cubBuf = *(unsigned int *)(cur_hdr + 8);
+            int ring_empty = (poll_cubBuf > 0 && poll_put == 0);
+            if ((is_zeros || ring_empty || (fsr == 0 && rst.st_size < 8192)) && refill_count < 200) {
                 raw32_ftruncate64((int)rfd, 8192, 0);
                 raw32_lseek((int)rfd, 0, 0/*SEEK_SET*/);
                 long wr = raw32_write((int)rfd, ms_poller_buf, 8192);
                 refill_count++;
-                debug_int("S32-v129: REFILLED #", refill_count);
-                debug_int("  raw_write=", wr);
+                if (refill_count <= 10 || (refill_count % 50 == 0)) {
+                    debug_int("S32-v135: REFILLED #", refill_count);
+                    debug_int("  raw_write=", wr);
+                }
                 memcpy(last_hdr, ms_poller_buf, 32); /* update tracked header */
+            }
+
+            /* v135: Monitor the HASHED path via mmap — this is what Steam actually
+             * uses via Connect(). Writing to the file doesn't help because Steam
+             * mmaps with MAP_SHARED and FEX's overlay may not sync file writes
+             * to mmap'd pages. Instead, we mmap the SAME file with MAP_SHARED
+             * and write directly to the mapped memory (same page cache). */
+            if (ms_hashed_devshm_path[0]) {
+                static volatile unsigned int *hashed_mmap = NULL;
+                static int hashed_mmap_fd = -1;
+                if (!hashed_mmap) {
+                    long hfd = raw32_openat(-100, ms_hashed_devshm_path, O_RDWR, 0666);
+                    if (hfd >= 0) {
+                        /* Ensure file is 8192 bytes */
+                        struct stat64 hst;
+                        if (raw32_fstat64((int)hfd, &hst) == 0 && hst.st_size < 8192)
+                            raw32_ftruncate64((int)hfd, 8192, 0);
+                        /* mmap with MAP_SHARED — same pages as Steam's mapping */
+                        typedef void *(*mmap_fn)(void *, size_t, int, int, int, off_t);
+                        mmap_fn do_mmap = (mmap_fn)dlsym(RTLD_NEXT, "mmap");
+                        void *hm = do_mmap(NULL, 8192, PROT_READ|PROT_WRITE,
+                                           MAP_SHARED, (int)hfd, 0);
+                        if (hm != MAP_FAILED) {
+                            hashed_mmap = (volatile unsigned int *)hm;
+                            hashed_mmap_fd = (int)hfd; /* keep fd open */
+                            debug_msg("S32-v135: mmap'd hashed MS path OK\n");
+                            /* Inject immediately */
+                            write_browserready_ring((unsigned char *)hm, 8192);
+                            __sync_synchronize();
+                            debug_msg("S32-v135: injected BrowserReady into hashed mmap\n");
+                        } else {
+                            raw32_close((int)hfd);
+                            debug_msg("S32-v135: mmap hashed FAILED\n");
+                        }
+                    }
+                }
+                /* Re-inject if Steam cleared the ring */
+                if (hashed_mmap) {
+                    unsigned int hm_put = hashed_mmap[1]; /* offset 4 = put */
+                    unsigned int hm_cub = hashed_mmap[2]; /* offset 8 = cubBuf */
+                    if (hm_cub > 0 && hm_put == 0) {
+                        write_browserready_ring((unsigned char *)hashed_mmap, 8192);
+                        __sync_synchronize();
+                        if (iter < 100 || (iter % 500 == 0))
+                            debug_msg("S32-v135: RE-INJECTED into hashed mmap (put was 0)\n");
+                    }
+                    /* Log periodically */
+                    if (iter < 10 || (iter % 500 == 0)) {
+                        debug_int("S32-v135: hashed get=", (long)hashed_mmap[0]);
+                        debug_int("  hashed put=", (long)hashed_mmap[1]);
+                        debug_int("  hashed cubBuf=", (long)hashed_mmap[2]);
+                    }
+                }
             }
 
             last_size = cur_size;
@@ -1277,13 +1374,18 @@ static int do_bridge_sync(void) {
     int bsock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (bsock < 0) return -1;
 
+    /* v135: Use PID-based bridge socket name */
+    unsigned int bwh = cached_wh_pid;
+    if (bwh == 0) { close(bsock); return -1; } /* no PID yet */
+    if (s32_bridge_sock_name_len == 0) build_bridge_sock_name(bwh);
+
     struct sockaddr_un baddr;
     memset(&baddr, 0, sizeof(baddr));
     baddr.sun_family = AF_UNIX;
-    memcpy(baddr.sun_path, "\0shm_bridge_64to32", 19);
+    memcpy(baddr.sun_path, s32_bridge_sock_name, s32_bridge_sock_name_len);
 
     int cret = real_connect_ptr(bsock, (struct sockaddr *)&baddr,
-        offsetof(struct sockaddr_un, sun_path) + 19);
+        offsetof(struct sockaddr_un, sun_path) + s32_bridge_sock_name_len);
     if (cret != 0) {
         close(bsock);
         return -1;
@@ -1676,6 +1778,23 @@ int shm_open(const char *name, int oflag, mode_t mode) {
                         syscall(SYS_write, ofd, ms_data, (long)8208);
                         close(ofd);
                     }
+
+                    /* v135: Save hashed path for poller — THIS is the file Steam
+                     * actually uses via Connect(). The poller must monitor and
+                     * refill this path, not just the unhashed name. */
+                    {
+                        int n = 0;
+                        const char *s = devshm_ms;
+                        while (*s && n < 254) ms_hashed_devshm_path[n++] = *s++;
+                        ms_hashed_devshm_path[n] = '\0';
+                    }
+                    {
+                        int n = 0;
+                        const char *s = path;
+                        while (*s && n < 254) ms_hashed_redir_path[n++] = *s++;
+                        ms_hashed_redir_path[n] = '\0';
+                    }
+                    debug_str("S32-v135: saved hashed MS path: ", devshm_ms, "\n");
                 }
                 return msfd;
             }
@@ -3015,9 +3134,6 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
  *   [4 bytes] data_len (LE)
  *   [data_len bytes] file content
  * ============================================================ */
-#define BRIDGE_SOCK_NAME "\0shm_bridge_64to32"
-#define BRIDGE_SOCK_NAME_LEN 19  /* includes leading \0 */
-
 static volatile int bridge_recv_count = 0;
 
 /* Helper: read exactly n bytes from fd */
@@ -3042,16 +3158,30 @@ static void *shm_bridge_listener(void *arg) {
         return NULL;
     }
 
+    /* v135: Wait for webhelper PID to be known before binding */
+    unsigned int wh = cached_wh_pid;
+    if (wh == 0) {
+        debug_msg("S32: BRIDGE: waiting for webhelper PID...\n");
+        for (int w = 0; w < 60 && cached_wh_pid == 0; w++) usleep(500000);
+        wh = cached_wh_pid;
+    }
+    if (wh == 0) {
+        debug_msg("S32: BRIDGE: no webhelper PID after 30s, using fallback\n");
+        wh = 99999;
+    }
+    build_bridge_sock_name(wh);
+    debug_int("S32: BRIDGE: using PID-based socket, PID=", (long)wh);
+
     struct sockaddr_un baddr;
     memset(&baddr, 0, sizeof(baddr));
     baddr.sun_family = AF_UNIX;
-    memcpy(baddr.sun_path, BRIDGE_SOCK_NAME, BRIDGE_SOCK_NAME_LEN);
+    memcpy(baddr.sun_path, s32_bridge_sock_name, s32_bridge_sock_name_len);
 
     /* Use real bind (not our wrapper — abstract socket already) */
     if (!real_bind_ptr)
         real_bind_ptr = (real_bind_fn)dlsym(RTLD_NEXT, "bind");
     int bret = real_bind_ptr(listenfd, (struct sockaddr *)&baddr,
-                             offsetof(struct sockaddr_un, sun_path) + BRIDGE_SOCK_NAME_LEN);
+                             offsetof(struct sockaddr_un, sun_path) + s32_bridge_sock_name_len);
     if (bret < 0) {
         debug_int("S32: BRIDGE: bind failed errno=", errno);
         close(listenfd);

@@ -602,8 +602,9 @@ int chmod(const char *pathname, mode_t mode) {
 
 static volatile int fd11_write_count = 0;
 static volatile int fd11_read_count = 0;
+static int ipc_socket_fd = -1; /* v135: detected from -child-update-ui-socket cmdline arg */
 
-/* write() wrapper — monitor FD 11 writes */
+/* write() wrapper — monitor IPC FD writes */
 typedef ssize_t (*real_write_fn)(int, const void *, size_t);
 static real_write_fn real_write_ptr = NULL;
 
@@ -611,23 +612,23 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if (!real_write_ptr)
         real_write_ptr = (real_write_fn)dlsym(RTLD_NEXT, "write");
 
-    /* Intercept the 1-byte '0' status write on FD 11 → change to '1' (ready) */
-    if (fd == 11 && count == 1 && buf && *(const unsigned char *)buf == '0') {
+    /* v135: Intercept the 1-byte '0' status write on IPC FD → change to '1' (ready) */
+    if (ipc_socket_fd > 0 && fd == ipc_socket_fd && count == 1 && buf && *(const unsigned char *)buf == '0') {
         char one = '1';
         ssize_t ret = real_write_ptr(fd, &one, 1);
         int n = __sync_fetch_and_add(&fd11_write_count, 1);
         if (n < 50) {
-            debug_msg("FIX: WRITE fd=11 INTERCEPTED: '0' → '1' (fake ready)\n");
+            debug_int("FIX: WRITE IPC INTERCEPTED '0'→'1' fd=", fd);
             debug_int("  ret=", (long)ret);
         }
         return ret;
     }
 
     ssize_t ret = real_write_ptr(fd, buf, count);
-    if (fd == 11) {
+    if (ipc_socket_fd > 0 && fd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: WRITE fd=11 pid=", get_pid());
+            debug_int("FIX: WRITE ipc fd=", fd);
             debug_int("  count=", (long)count);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -636,7 +637,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
     return ret;
 }
 
-/* writev() wrapper — monitor FD 11 vector writes */
+/* writev() wrapper — monitor IPC FD vector writes */
 typedef ssize_t (*real_writev_fn)(int, const struct iovec *, int);
 static real_writev_fn real_writev_ptr = NULL;
 
@@ -644,14 +645,12 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     if (!real_writev_ptr)
         real_writev_ptr = (real_writev_fn)dlsym(RTLD_NEXT, "writev");
     ssize_t ret = real_writev_ptr(fd, iov, iovcnt);
-    if (fd == 11) {
+    if (ipc_socket_fd > 0 && fd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: WRITEV fd=11 pid=", get_pid());
+            debug_int("FIX: WRITEV ipc fd=", fd);
             debug_int("  iovcnt=", (long)iovcnt);
             debug_int("  ret=", (long)ret);
-            if (ret > 0 && iov && iovcnt > 0 && iov[0].iov_base)
-                debug_hexdump("  iov0: ", iov[0].iov_base, (int)(iov[0].iov_len > 16 ? 16 : iov[0].iov_len));
         }
     }
     return ret;
@@ -665,13 +664,12 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     if (!real_send_ptr)
         real_send_ptr = (real_send_fn)dlsym(RTLD_NEXT, "send");
     ssize_t ret = real_send_ptr(sockfd, buf, len, flags);
-    if (sockfd == 11) {
+    if (ipc_socket_fd > 0 && sockfd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: SEND fd=11 pid=", get_pid());
+            debug_int("FIX: SEND ipc fd=", sockfd);
             debug_int("  len=", (long)len);
             debug_int("  ret=", (long)ret);
-            if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
         }
     }
     return ret;
@@ -685,10 +683,10 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     if (!real_sendmsg_ptr)
         real_sendmsg_ptr = (real_sendmsg_fn)dlsym(RTLD_NEXT, "sendmsg");
     ssize_t ret = real_sendmsg_ptr(sockfd, msg, flags);
-    if (sockfd == 11) {
+    if (ipc_socket_fd > 0 && sockfd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_write_count, 1);
         if (n < 50) {
-            debug_int("FIX: SENDMSG fd=11 pid=", get_pid());
+            debug_int("FIX: SENDMSG ipc fd=", sockfd);
             debug_int("  iovlen=", (long)(msg ? msg->msg_iovlen : -1));
             debug_int("  ret=", (long)ret);
         }
@@ -696,7 +694,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
     return ret;
 }
 
-/* read() wrapper — monitor FD 11 reads */
+/* read() wrapper — monitor IPC FD reads */
 typedef ssize_t (*real_read_fn)(int, void *, size_t);
 static real_read_fn real_read_ptr = NULL;
 
@@ -704,10 +702,10 @@ ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read_ptr)
         real_read_ptr = (real_read_fn)dlsym(RTLD_NEXT, "read");
     ssize_t ret = real_read_ptr(fd, buf, count);
-    if (fd == 11) {
+    if (ipc_socket_fd > 0 && fd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: READ fd=11 pid=", get_pid());
+            debug_int("FIX: READ ipc fd=", fd);
             debug_int("  count=", (long)count);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -724,10 +722,10 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
     if (!real_recv_ptr)
         real_recv_ptr = (real_recv_fn)dlsym(RTLD_NEXT, "recv");
     ssize_t ret = real_recv_ptr(sockfd, buf, len, flags);
-    if (sockfd == 11) {
+    if (ipc_socket_fd > 0 && sockfd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: RECV fd=11 pid=", get_pid());
+            debug_int("FIX: RECV ipc fd=", sockfd);
             debug_int("  len=", (long)len);
             debug_int("  ret=", (long)ret);
             if (ret > 0 && buf) debug_hexdump("  data: ", buf, (int)ret);
@@ -744,14 +742,99 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     if (!real_recvmsg_ptr)
         real_recvmsg_ptr = (real_recvmsg_fn)dlsym(RTLD_NEXT, "recvmsg");
     ssize_t ret = real_recvmsg_ptr(sockfd, msg, flags);
-    if (sockfd == 11) {
+    if (ipc_socket_fd > 0 && sockfd == ipc_socket_fd) {
         int n = __sync_fetch_and_add(&fd11_read_count, 1);
         if (n < 50) {
-            debug_int("FIX: RECVMSG fd=11 pid=", get_pid());
+            debug_int("FIX: RECVMSG ipc fd=", sockfd);
             debug_int("  ret=", (long)ret);
         }
     }
     return ret;
+}
+
+/* v136: CEF CreateBrowser interceptor — async→sync fallback for single-process mode.
+ * In single-process mode, cef_browser_host_create_browser (async) fails for the
+ * second browser window. Try cef_browser_host_create_browser_sync as fallback. */
+typedef struct _cef_window_info_t cef_window_info_t;
+typedef struct _cef_client_t cef_client_t;
+typedef struct _cef_string_t cef_string_t;
+typedef struct _cef_browser_settings_t cef_browser_settings_t;
+typedef struct _cef_dictionary_value_t cef_dictionary_value_t;
+typedef struct _cef_request_context_t cef_request_context_t;
+typedef struct _cef_browser_t cef_browser_t;
+
+typedef int (*real_cef_create_browser_fn)(const cef_window_info_t*,
+    cef_client_t*, const cef_string_t*, const cef_browser_settings_t*,
+    cef_dictionary_value_t*, cef_request_context_t*);
+typedef cef_browser_t* (*real_cef_create_browser_sync_fn)(const cef_window_info_t*,
+    cef_client_t*, const cef_string_t*, const cef_browser_settings_t*,
+    cef_dictionary_value_t*, cef_request_context_t*);
+
+static real_cef_create_browser_fn real_cef_create_browser_ptr = NULL;
+static real_cef_create_browser_sync_fn real_cef_create_browser_sync_ptr = NULL;
+static volatile int cef_create_count = 0;
+
+int cef_browser_host_create_browser(const cef_window_info_t *windowInfo,
+    cef_client_t *client, const cef_string_t *url,
+    const cef_browser_settings_t *settings,
+    cef_dictionary_value_t *extra_info,
+    cef_request_context_t *request_context) {
+
+    if (!real_cef_create_browser_ptr)
+        real_cef_create_browser_ptr = (real_cef_create_browser_fn)dlsym(RTLD_NEXT,
+            "cef_browser_host_create_browser");
+    if (!real_cef_create_browser_sync_ptr)
+        real_cef_create_browser_sync_ptr = (real_cef_create_browser_sync_fn)dlsym(RTLD_NEXT,
+            "cef_browser_host_create_browser_sync");
+
+    int n = __sync_fetch_and_add(&cef_create_count, 1);
+    debug_int("FIX-v136: cef_browser_host_create_browser called #", (long)(n+1));
+
+    /* Try async first */
+    int ret = 0;
+    if (real_cef_create_browser_ptr) {
+        ret = real_cef_create_browser_ptr(windowInfo, client, url, settings,
+            extra_info, request_context);
+        debug_int("FIX-v136: async CreateBrowser returned: ", (long)ret);
+    }
+
+    /* If async fails and sync is available, try sync as fallback */
+    if (ret == 0 && real_cef_create_browser_sync_ptr) {
+        debug_msg("FIX-v136: async failed, trying sync CreateBrowserSync...\n");
+        cef_browser_t *browser = real_cef_create_browser_sync_ptr(windowInfo,
+            client, url, settings, extra_info, request_context);
+        if (browser) {
+            debug_msg("FIX-v136: sync CreateBrowserSync SUCCEEDED!\n");
+            ret = 1;
+        } else {
+            debug_msg("FIX-v136: sync CreateBrowserSync also FAILED\n");
+        }
+    }
+
+    return ret;
+}
+
+/* v135: XCreateWindow wrapper — force minimum 1x1 size to prevent CEF rejection */
+typedef unsigned long Window;
+typedef unsigned long (*real_XCreateWindow_fn)(void *, Window, int, int,
+    unsigned int, unsigned int, unsigned int, int, unsigned int,
+    void *, unsigned long, void *);
+static real_XCreateWindow_fn real_XCreateWindow_ptr = NULL;
+
+unsigned long XCreateWindow(void *display, Window parent, int x, int y,
+    unsigned int width, unsigned int height, unsigned int border_width,
+    int depth, unsigned int cls, void *visual, unsigned long valuemask, void *attributes) {
+    if (!real_XCreateWindow_ptr)
+        real_XCreateWindow_ptr = (real_XCreateWindow_fn)dlsym(RTLD_NEXT, "XCreateWindow");
+    /* Force minimum size — CEF rejects 0x0 windows */
+    if (width == 0) width = 1920;
+    if (height == 0) height = 1080;
+    unsigned long win = real_XCreateWindow_ptr(display, parent, x, y, width, height,
+        border_width, depth, cls, visual, valuemask, attributes);
+    debug_int("FIX: XCreateWindow w=", (long)width);
+    debug_int("  h=", (long)height);
+    debug_int("  win=", (long)win);
+    return win;
 }
 
 /* accept/accept4 wrapper — detect if anyone connects to the shmem socket */
@@ -1029,6 +1112,42 @@ static void *heartbeat_func(void *arg) {
  * the ready signal. We try multiple formats since we don't know the protocol. */
 static volatile int fd11_ready_sent = 0;
 
+static void detect_ipc_fd(void) {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) { ipc_socket_fd = 11; return; }
+    char buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) { ipc_socket_fd = 11; return; }
+    buf[n] = '\0';
+    for (ssize_t i = 0; i < n; ) {
+        const char *arg2 = buf + i;
+        ssize_t arglen = strlen(arg2);
+        if (strcmp(arg2, "-child-update-ui-socket") == 0) {
+            i += arglen + 1;
+            if (i < n) {
+                /* manual atoi */
+                { int val = 0; const char *p = buf + i;
+                  while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
+                  ipc_socket_fd = val; }
+                debug_int("FIX-v135: detected IPC socket FD=", ipc_socket_fd);
+            }
+            return;
+        }
+        i += arglen + 1;
+    }
+    debug_msg("FIX-v135: -child-update-ui-socket not in cmdline, scanning FDs\n");
+    struct stat st;
+    for (int testfd = 3; testfd <= 20; testfd++) {
+        if (fstat(testfd, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            ipc_socket_fd = testfd;
+            debug_int("FIX-v135: found socket at FD=", testfd);
+            return;
+        }
+    }
+    ipc_socket_fd = 11;
+}
+
 static void *fd11_ready_func(void *arg) {
     (void)arg;
     /* The handshake happens in a different process image (before exec),
@@ -1041,28 +1160,27 @@ static void *fd11_ready_func(void *arg) {
         : "0"((long)SYS_nanosleep), "D"(&ts), "S"((long)0)
         : "rcx", "r11", "memory");
 
-    /* Check that FD 11 is still open */
+    /* v135: Check that IPC FD is still open */
     struct stat st;
-    if (fstat(11, &st) != 0) {
-        debug_msg("FIX: fd11_ready: FD 11 closed, aborting\n");
+    if (fstat(ipc_socket_fd, &st) != 0) {
+        debug_int("FIX: fd_ready: IPC FD closed, fd=", ipc_socket_fd);
         return NULL;
     }
 
-    debug_msg("FIX: fd11_ready: sending fake ready signal to FD 11\n");
+    debug_int("FIX: fd_ready: sending fake ready signal to FD=", ipc_socket_fd);
 
     if (!real_write_ptr)
         real_write_ptr = (real_write_fn)dlsym(RTLD_NEXT, "write");
 
-    /* First: read any pending data on FD 11 (the handshake messages from steam client) */
+    /* First: read any pending data on IPC FD */
     unsigned char rdbuf[256];
     for (int i = 0; i < 5; i++) {
-        /* Non-blocking read to drain pending data */
-        int flags = fcntl(11, F_GETFL);
-        fcntl(11, F_SETFL, flags | O_NONBLOCK);
-        ssize_t r = read(11, rdbuf, sizeof(rdbuf));
-        fcntl(11, F_SETFL, flags); /* restore */
+        int flags = fcntl(ipc_socket_fd, F_GETFL);
+        fcntl(ipc_socket_fd, F_SETFL, flags | O_NONBLOCK);
+        ssize_t r = read(ipc_socket_fd, rdbuf, sizeof(rdbuf));
+        fcntl(ipc_socket_fd, F_SETFL, flags);
         if (r > 0) {
-            debug_int("FIX: fd11_ready: drained pending data, len=", (long)r);
+            debug_int("FIX: fd_ready: drained pending data, len=", (long)r);
             debug_hexdump("  data: ", rdbuf, r > 60 ? 60 : (int)r);
         } else {
             break;
@@ -1076,14 +1194,13 @@ static void *fd11_ready_func(void *arg) {
     ready_msg[4] = 0x02; /* version = 2 */
     ready_msg[8] = 0x01; /* type = 1 (same as handshake) */
 
-    ssize_t n = real_write_ptr(11, ready_msg, 56);
-    debug_int("FIX: fd11_ready: wrote sdPC type=1, ret=", (long)n);
+    ssize_t n = real_write_ptr(ipc_socket_fd, ready_msg, 56);
+    debug_int("FIX: fd_ready: wrote sdPC type=1, ret=", (long)n);
 
     if (n == 56) {
-        /* Write '1' as status (handshake sent '0', try '1' for ready) */
         char one = '1';
-        n = real_write_ptr(11, &one, 1);
-        debug_int("FIX: fd11_ready: wrote '1' status, ret=", (long)n);
+        n = real_write_ptr(ipc_socket_fd, &one, 1);
+        debug_int("FIX: fd_ready: wrote '1' status, ret=", (long)n);
     }
 
     fd11_ready_sent = 1;
@@ -1155,8 +1272,28 @@ static void track_shm_file(const char *name, const char *path, int fd) {
  *   data: name_len(2) + name (as iov)
  *   cmsg: SCM_RIGHTS with the fd
  * Terminator: name_len=0 (no cmsg) */
-#define BRIDGE_SOCK_NAME "\0shm_bridge_64to32"
-#define BRIDGE_SOCK_NAME_LEN 19
+/* v95: Include PID in bridge socket name to avoid EADDRINUSE from
+ * previous webhelper processes that are still alive (parked in crash
+ * handler's infinite sleep). Abstract sockets auto-cleanup on process
+ * exit but parked processes never exit. */
+static char bridge_sock_name[64];
+static int bridge_sock_name_len = 0;
+
+static void init_bridge_sock_name(void) {
+    if (bridge_sock_name_len > 0) return;
+    /* Format: \0shm_bridge_64to32_<PID> */
+    bridge_sock_name[0] = '\0'; /* abstract socket prefix */
+    const char *prefix = "shm_bridge_64to32_";
+    int n = 1;
+    while (*prefix) bridge_sock_name[n++] = *prefix++;
+    /* Append PID */
+    long pid = syscall(SYS_getpid);
+    char digits[16]; int dn = 0;
+    if (pid == 0) digits[dn++] = '0';
+    else { while (pid > 0) { digits[dn++] = '0' + (pid % 10); pid /= 10; } }
+    for (int i = dn - 1; i >= 0; i--) bridge_sock_name[n++] = digits[i];
+    bridge_sock_name_len = n;
+}
 
 /* Helper: send one fd with SCM_RIGHTS along with name data */
 static int send_fd_with_name(int sock, const char *name, int name_len, int fd_to_send) {
@@ -1201,15 +1338,16 @@ static void *shm_bridge_func(void *arg) {
         return NULL;
     }
 
+    init_bridge_sock_name();
     struct sockaddr_un baddr;
     memset(&baddr, 0, sizeof(baddr));
     baddr.sun_family = AF_UNIX;
-    memcpy(baddr.sun_path, BRIDGE_SOCK_NAME, BRIDGE_SOCK_NAME_LEN);
+    memcpy(baddr.sun_path, bridge_sock_name, bridge_sock_name_len);
 
     if (!real_bind_ptr)
         real_bind_ptr = (real_bind_fn)dlsym(RTLD_NEXT, "bind");
     int bret = real_bind_ptr(listenfd, (struct sockaddr *)&baddr,
-                             offsetof(struct sockaddr_un, sun_path) + BRIDGE_SOCK_NAME_LEN);
+                             offsetof(struct sockaddr_un, sun_path) + bridge_sock_name_len);
     if (bret < 0) {
         debug_int("FIX: BRIDGE: bind failed errno=", errno);
         close(listenfd);
@@ -1395,12 +1533,37 @@ static void *shm_bridge_func(void *arg) {
     return NULL;
 }
 
+/* v135: Detect if we're a Chromium subprocess (--type=...) */
+static int is_chromium_subprocess(void) {
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    for (ssize_t i = 0; i < n; ) {
+        const char *arg = buf + i;
+        if (strncmp(arg, "--type=", 7) == 0) return 1;
+        i += strlen(arg) + 1;
+    }
+    return 0;
+}
+
 __attribute__((constructor))
 static void install_fixes(void) {
     real_sigaction_ptr = (real_sigaction_fn)dlsym(RTLD_NEXT, "sigaction");
     real_syscall_ptr = (real_syscall_fn)dlsym(RTLD_NEXT, "syscall");
     if (!real_sigaction_ptr) {
         debug_msg("FIX: WARNING - could not resolve real sigaction!\n");
+        return;
+    }
+
+    /* v135: Skip most initialization for Chromium subprocesses */
+    if (is_chromium_subprocess()) {
+        debug_msg("FIX-v135: Chromium subprocess detected, minimal init\n");
+        /* Just set up basic shm redirect, no crash handlers or IPC */
+        mkdir(SHM_REDIR_DIR, 0777);
         return;
     }
 
@@ -1452,20 +1615,19 @@ static void install_fixes(void) {
     /* Re-register robust_list in forked children */
     pthread_atfork(NULL, NULL, child_fork_handler);
 
-    /* Check if FD 11 (parent IPC socket) is open.
-     * Steam passes -child-update-ui-socket 11 to steamwebhelper.
-     * If FD 11 is closed, the main IPC channel to steam is broken. */
+    /* v135: Detect IPC socket FD from -child-update-ui-socket cmdline arg */
+    detect_ipc_fd();
     {
         struct stat st;
-        if (fstat(11, &st) == 0) {
-            debug_msg("FIX: FD 11 (parent IPC socket) OPEN, type=");
-            if (S_ISSOCK(st.st_mode)) debug_msg("socket\n");
-            else if (S_ISFIFO(st.st_mode)) debug_msg("pipe\n");
-            else debug_int("other mode=", st.st_mode & S_IFMT);
+        if (fstat(ipc_socket_fd, &st) == 0) {
+            debug_int("FIX: IPC FD OPEN, fd=", ipc_socket_fd);
+            if (S_ISSOCK(st.st_mode)) debug_msg("  type=socket\n");
+            else if (S_ISFIFO(st.st_mode)) debug_msg("  type=pipe\n");
+            else debug_int("  type=other mode=", st.st_mode & S_IFMT);
         } else {
-            debug_msg("FIX: FD 11 (parent IPC socket) CLOSED!\n");
+            debug_int("FIX: IPC FD CLOSED! fd=", ipc_socket_fd);
         }
-        /* Also check FDs 3-15 for any open sockets/pipes */
+        /* Also log FDs 3-15 for debugging */
         for (int fd = 3; fd <= 15; fd++) {
             if (fstat(fd, &st) == 0 && (S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode))) {
                 debug_int("FIX: FD open: fd=", fd);
@@ -1480,14 +1642,14 @@ static void install_fixes(void) {
         pthread_detach(hb_thread);
     }
 
-    /* Start FD 11 fake ready thread — only in the process where FD 11 is open */
+    /* v135: Start IPC ready thread — only if the IPC FD is open */
     {
         struct stat st;
-        if (fstat(11, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        if (ipc_socket_fd > 0 && fstat(ipc_socket_fd, &st) == 0 && S_ISSOCK(st.st_mode)) {
             pthread_t ready_thread;
             pthread_create(&ready_thread, NULL, fd11_ready_func, NULL);
             pthread_detach(ready_thread);
-            debug_msg("FIX: started fd11_ready thread\n");
+            debug_int("FIX: started IPC ready thread for FD=", ipc_socket_fd);
         }
     }
 
