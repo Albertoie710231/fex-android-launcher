@@ -435,9 +435,17 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             if [ -x "${'$'}STEAMDIR/ubuntu12_32/steam" ]; then
                 export LD_LIBRARY_PATH="${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
                 export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
+
+                # Ensure 64-bit steamclient.so is available for the webhelper
+                # (webhelper dlmopen's it; without it WebUITransport auth fails)
+                if [ -f "${'$'}STEAMDIR/linux64/steamclient.so" ] && [ ! -f "${'$'}STEAMDIR/ubuntu12_64/steamclient.so" ]; then
+                    echo "Copying 64-bit steamclient.so to ubuntu12_64/..."
+                    cp "${'$'}STEAMDIR/linux64/steamclient.so" "${'$'}STEAMDIR/ubuntu12_64/steamclient.so"
+                fi
+
                 echo "=== Starting Steam client ==="
                 cd "${'$'}STEAMDIR"
-                bash steam.sh $loginFlag -no-cef-sandbox -noverifyfiles \
+                bash steam.sh $loginFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
                     -nobootstrapupdate -skipstreamingdrivers \
                     2>&1 | tee /tmp/steam_new.log
             else
@@ -656,6 +664,12 @@ DXVKEOF
                 export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
                 export LIBGL_ALWAYS_SOFTWARE=1
                 export LIBGL_DRIVERS_PATH=/usr/lib/i386-linux-gnu/dri
+
+                # Ensure 64-bit steamclient.so for webhelper
+                if [ -f "${'$'}STEAMDIR/linux64/steamclient.so" ] && [ ! -f "${'$'}STEAMDIR/ubuntu12_64/steamclient.so" ]; then
+                    cp "${'$'}STEAMDIR/linux64/steamclient.so" "${'$'}STEAMDIR/ubuntu12_64/steamclient.so"
+                fi
+
                 (cd "${'$'}STEAMDIR" && bash steam.sh -no-browser -no-cef-sandbox -silent -noverifyfiles \
                     -skipinitialbootstrap -nobootstrapupdate -skipstreamingdrivers \
                     -console 2>/tmp/steam_client.log) &

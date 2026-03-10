@@ -1,4 +1,17 @@
-/* v129: 32-bit shim for the steam client binary.
+/* v134: 32-bit shim for the steam client binary.
+ * - v133: FIX WebUITransport PID check ("Checked: 0/PID").
+ *         S32 uses SO_PEERCRED or /proc/net/tcp to find the PID of the
+ *         connecting WebSocket client. On Android, /proc/net/tcp is
+ *         restricted and SO_PEERCRED fails on TCP sockets → PID=0.
+ *         FIX: getsockopt wrapper fakes SO_PEERCRED with webhelper PID.
+ *         FIX: open() generates fake /proc/net/tcp from live socket data.
+ *         FIX: readlink/opendir redirect /proc/<WH_PID>/ → /proc/self/.
+ * - v132: DIAGNOSTIC for PID check — proved /proc/net/tcp is unreadable.
+ * - v130: FIX CMsgBrowserReady format — was 10 bytes (type+size+protobuf),
+ *         must be 76 bytes (u32(1)+u32(1)+u32(PID)+char[64](stream_name)).
+ *         Also fix header order: PC trace proves {get,put,cap,pending}
+ *         NOT {cap,get,put,pending}. "Invalid command" was caused by
+ *         wrong message format, not wrong header order.
  * - v129: FIX MasterStream Connect() — O_RDONLY detection for hashed Shm_ names.
  *         ROOT CAUSE FOUND: Connect() calls shm_open("/u1000-Shm_HASH", O_RDONLY)
  *         where HASH is Valve's custom hash of the logical MasterStream name.
@@ -120,6 +133,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* v126: Raw i386 inline asm syscall helpers.
  * CSharedMemStream uses int $0x80 for ALL operations, bypassing glibc.
@@ -299,6 +313,30 @@ static void debug_hexline(const char *prefix, const void *data, int datalen) {
     if (datalen > 40) { *p++ = '.'; *p++ = '.'; *p++ = '.'; }
     *p++ = '\n';
     debug_write(buf, p - buf);
+}
+
+/* v134: dlmopen → dlopen redirect.
+ * S32 loads steamclient.so via dlmopen(LM_ID_NEWLM, ...) which creates a
+ * separate linker namespace. In that namespace, our getsockopt/fopen/open
+ * wrappers DON'T exist. The WebUITransport PID check runs inside
+ * steamclient.so and completely bypasses all our interceptors.
+ * Fix: redirect to dlopen so steamclient.so stays in our namespace.
+ * Then patch the PID check in memory. */
+void *dlmopen(long lmid, const char *filename, int flags) {
+    debug_msg("S32: dlmopen intercepted: ");
+    if (filename) debug_msg(filename);
+    debug_msg("\n");
+
+    void *handle = dlopen(filename, flags);
+    if (handle) {
+        debug_msg("S32: dlmopen→dlopen OK\n");
+    } else {
+        debug_msg("S32: dlmopen→dlopen FAILED: ");
+        const char *err = dlerror();
+        if (err) debug_msg(err);
+        debug_msg("\n");
+    }
+    return handle;
 }
 
 /* v104: Real Android tmpdir extracted from FEX_OUTPUTLOG at init time.
@@ -653,6 +691,96 @@ static int is_bridge_dup_fd(int fd) {
 }
 
 
+/* Read webhelper PID from /tmp/steam_webhelper_pid (written by steamwebhelper.sh v93+).
+ * Returns webhelper PID, or 0 if file not found/unreadable. Non-blocking. */
+static volatile unsigned int cached_wh_pid = 0;
+
+static unsigned int read_webhelper_pid_file(void) {
+    /* v133: Must use raw syscall — open() wrapper calls get_webhelper_pid()
+     * which calls us → infinite recursion → stack overflow → segfault */
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/tmp/steam_webhelper_pid", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    char pidbuf[64];
+    ssize_t n = read(fd, pidbuf, sizeof(pidbuf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    pidbuf[n] = '\0';
+    unsigned int wh_pid = (unsigned int)atoi(pidbuf);
+    return wh_pid;
+}
+
+static unsigned int get_webhelper_pid(void) {
+    /* Check cache first */
+    unsigned int p = cached_wh_pid;
+    if (p > 0) return p;
+    /* Try reading file (non-blocking — file may not exist yet) */
+    p = read_webhelper_pid_file();
+    if (p > 0) {
+        cached_wh_pid = p;
+        debug_int("S32: read webhelper PID from file: ", (long)p);
+    }
+    return p;
+}
+
+/* v131: Write REAL CMsgBrowserReady into ring buffer (76 bytes, PC format).
+ * From PC IPC trace, the ring buffer message is:
+ *   u32 field1 = 1  (version/type)
+ *   u32 field2 = 1  (browser_handle)
+ *   u32 pid         (WEBHELPER process PID — NOT S32's PID!)
+ *   char[64] stream_name ("SteamChrome_MasterStream_PID_SUFFIX", NUL-padded)
+ * Total = 76 bytes.
+ * Header format (from PC): {get, put, m_cubBuffer, pending} */
+static void write_browserready_ring(unsigned char *buf, size_t bufsize) {
+    /* buf points to the START of the file (header + ring).
+     * Header is 16 bytes, ring starts at offset 16. */
+    if (bufsize < 92) return; /* need 16 hdr + 76 msg */
+    unsigned int *hdr = (unsigned int *)buf;
+    unsigned char *ring = buf + 16;
+
+    memset(ring, 0, 76);
+    unsigned int f1 = 1, f2 = 1;
+    /* v131: Use WEBHELPER's PID, not S32's. BrowserReady is a message FROM
+     * the webhelper, so it must contain the webhelper's PID. S32 uses this
+     * PID for SetWebUITransportWebhelperPID → lsof check. */
+    unsigned int pid = get_webhelper_pid();
+    if (pid == 0) {
+        /* Fallback: use S32's PID (wrong but better than 0) */
+        pid = (unsigned int)getpid();
+        debug_int("S32: WARNING: using S32 PID as fallback: ", (long)pid);
+    }
+    memcpy(ring + 0, &f1, 4);
+    memcpy(ring + 4, &f2, 4);
+    memcpy(ring + 8, &pid, 4);
+
+    /* Build stream name: "SteamChrome_MasterStream_PID_PID" */
+    char sname[64];
+    memset(sname, 0, 64);
+    {
+        int n = 0;
+        const char *pfx = "SteamChrome_MasterStream_";
+        while (*pfx && n < 60) sname[n++] = *pfx++;
+        /* Append PID */
+        char pd[16]; int pn = 0;
+        unsigned int v = pid;
+        if (v == 0) { pd[pn++] = '0'; }
+        else { while (v > 0) { pd[pn++] = '0' + (v % 10); v /= 10; } }
+        for (int i = pn - 1; i >= 0 && n < 60; i--) sname[n++] = pd[i];
+        sname[n++] = '_';
+        /* Use PID again as suffix (simple, deterministic) */
+        pn = 0; v = pid;
+        if (v == 0) { pd[pn++] = '0'; }
+        else { while (v > 0) { pd[pn++] = '0' + (v % 10); v /= 10; } }
+        for (int i = pn - 1; i >= 0 && n < 63; i--) sname[n++] = pd[i];
+    }
+    memcpy(ring + 12, sname, 64);
+
+    /* Header: {get=0, put=76, m_cubBuffer=8192, pending=76} */
+    hdr[0] = 0;      /* get = 0 */
+    hdr[1] = 76;     /* put = 76 */
+    hdr[2] = 8192;   /* m_cubBuffer */
+    hdr[3] = 76;     /* pending = 76 bytes */
+}
+
 /* v116: MS poller globals — saved from constructor for background thread */
 static char ms_poller_shm_name[130]; /* "/SteamChrome_MasterStream_..." for shm_open */
 static char ms_poller_devshm_path[256]; /* "/dev/shm/SteamChrome_MasterStream_..." for raw syscall */
@@ -953,6 +1081,38 @@ static void *ms_poller_thread(void *arg) {
             raw32_close((int)sim_fd);
         }
         debug_msg("S32-v129: === END Connect() SIMULATION ===\n");
+    }
+
+    /* v131: Wait for webhelper PID file, then update ms_poller_buf with correct PID.
+     * The constructor wrote BrowserReady with S32's PID (fallback), but the webhelper
+     * PID is needed for SetWebUITransportWebhelperPID. steamwebhelper.sh v93+ writes
+     * the PID to /tmp/steam_webhelper_pid before exec. */
+    int pid_updated = 0;
+    for (int wait = 0; wait < 300 && ms_poller_active; wait++) { /* up to 30s */
+        unsigned int wh_pid = read_webhelper_pid_file();
+        if (wh_pid > 0 && wh_pid != cached_wh_pid) {
+            cached_wh_pid = wh_pid;
+            debug_int("S32-v131: ms_poller: webhelper PID detected: ", (long)wh_pid);
+            /* Re-build ms_poller_buf with correct webhelper PID */
+            write_browserready_ring(ms_poller_buf, 8192);
+            /* Re-fill all MasterStream files with corrected PID */
+            long rfd = raw32_openat(-100, ms_poller_devshm_path, O_RDWR, 0666);
+            if (rfd >= 0) {
+                raw32_lseek((int)rfd, 0, 0);
+                raw32_write((int)rfd, ms_poller_buf, 8192);
+                raw32_close((int)rfd);
+                debug_msg("S32-v131: re-injected BrowserReady with webhelper PID\n");
+            }
+            /* Note: bridge_anon_map (Shm_ mmap singleton) will pick up
+             * the updated ms_poller_buf on next refill via write_browserready_ring. */
+            pid_updated = 1;
+            break;
+        }
+        struct timespec ts = {0, 100000000}; /* 100ms */
+        nanosleep(&ts, NULL);
+    }
+    if (!pid_updated) {
+        debug_msg("S32-v131: WARNING: webhelper PID file not found after 30s\n");
     }
 
     long last_size = 8192;
@@ -1418,8 +1578,62 @@ int shm_open(const char *name, int oflag, mode_t mode) {
                 struct stat mst;
                 if (fstat(msfd, &mst) == 0 && mst.st_size >= 8208) {
                     if (mc < 200) {
-                        debug_str("S32-v129: MS Connect found: ", name, "\n");
+                        debug_str("S32-v139: MS Connect found: ", name, "\n");
                         debug_int("  size=", (long)mst.st_size);
+                    }
+                    /* v139: The file at SHM_REDIR_DIR may be empty (created by
+                     * O_CREAT handler without content). Read the REAL content
+                     * from rootfs /dev/shm/ and inject into both the SHM_REDIR_DIR
+                     * file AND FEX overlay via raw int $0x80. */
+                    {
+                        /* Try reading from the rootfs /dev/shm/ hashed file first */
+                        unsigned char ibuf[8208];
+                        long rd = 0;
+                        {
+                            char devshm[256];
+                            int dn = 0;
+                            const char *d = "/dev/shm/";
+                            while (*d) devshm[dn++] = *d++;
+                            const char *nm = name;
+                            if (*nm == '/') nm++;
+                            while (*nm && dn < 254) devshm[dn++] = *nm++;
+                            devshm[dn] = '\0';
+                            long rfd = raw32_openat(-100, devshm, O_RDONLY, 0);
+                            if (rfd >= 0) {
+                                rd = read((int)rfd, ibuf, 8208);
+                                raw32_close((int)rfd);
+                            }
+                        }
+                        /* If overlay file empty, use proper CMsgBrowserReady */
+                        if (rd < 16) {
+                            memset(ibuf, 0, 8208);
+                            write_browserready_ring(ibuf, 8208);
+                            rd = 8208;
+                        }
+                        /* Write content to SHM_REDIR_DIR file */
+                        ftruncate(msfd, rd);
+                        lseek(msfd, 0, SEEK_SET);
+                        write(msfd, ibuf, rd);
+                        lseek(msfd, 0, SEEK_SET);
+                        /* Also inject into FEX overlay */
+                        if (rd >= 8208) {
+                            char devshm[256];
+                            int n = 0;
+                            const char *d = "/dev/shm/";
+                            while (*d) devshm[n++] = *d++;
+                            const char *nm = name;
+                            if (*nm == '/') nm++;
+                            while (*nm && n < 254) devshm[n++] = *nm++;
+                            devshm[n] = '\0';
+                            long ofd = raw32_openat(-100, devshm, O_CREAT | O_RDWR | O_TRUNC, 0666);
+                            if (ofd >= 0) {
+                                raw32_ftruncate64((int)ofd, 8208, 0);
+                                raw32_write((int)ofd, ibuf, 8208);
+                                raw32_close((int)ofd);
+                                if (mc < 20)
+                                    debug_str("S32-v139: injected to overlay: ", devshm, "\n");
+                            }
+                        }
                     }
                     return msfd;
                 }
@@ -1429,22 +1643,10 @@ int shm_open(const char *name, int oflag, mode_t mode) {
             /* File doesn't exist or wrong size — create as MasterStream */
             msfd = real_open_ptr(path, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
             if (msfd >= 0) {
+                /* v130: Write proper 76-byte CMsgBrowserReady (PC format) */
                 unsigned char ms_data[8208];
                 memset(ms_data, 0, sizeof(ms_data));
-                unsigned int *mhdr = (unsigned int *)ms_data;
-                /* Header: {get, put, m_cubBuffer, pending} — verified from local PC */
-                mhdr[0] = 0;      /* get cursor */
-                mhdr[1] = 10;     /* put cursor = 10 bytes written */
-                mhdr[2] = 8192;   /* m_cubBuffer = ring buffer size */
-                mhdr[3] = 10;     /* pending = 10 bytes */
-
-                /* Ring buffer at offset 16: CMsgBrowserReady */
-                unsigned char *ring = ms_data + 16;
-                unsigned int msg_type = 0, msg_size = 2;
-                memcpy(ring, &msg_type, 4);      /* message type = 0 */
-                memcpy(ring + 4, &msg_size, 4);  /* message size = 2 bytes */
-                ring[8] = 0x08;   /* protobuf field 1, varint */
-                ring[9] = 0x01;   /* browser_handle = 1 */
+                write_browserready_ring(ms_data, sizeof(ms_data));
 
                 ftruncate(msfd, 8208);
                 pwrite(msfd, ms_data, sizeof(ms_data), 0);
@@ -1586,6 +1788,373 @@ int shm_unlink(const char *name) {
     return ret;
 }
 
+/* v132: sem_open/sem_unlink wrappers — redirect POSIX named semaphores to SHM_REDIR_DIR.
+ * sem_open("/name") creates /dev/shm/sem.name on Linux. FEX overlay isolation
+ * makes these invisible across processes. Redirect so S32 and WH share them. */
+#include <semaphore.h>
+typedef sem_t *(*real_sem_open_fn)(const char *, int, ...);
+static real_sem_open_fn real_sem_open_ptr = NULL;
+
+sem_t *sem_open(const char *name, int oflag, ...) {
+    if (!real_sem_open_ptr)
+        real_sem_open_ptr = (real_sem_open_fn)dlsym(RTLD_NEXT, "sem_open");
+    static volatile int sem_count = 0;
+    int cnt = __sync_fetch_and_add(&sem_count, 1);
+    if (cnt < 20) {
+        debug_str("S32: sem_open(", name ? name : "NULL", ")\n");
+        debug_int("  oflag=", oflag);
+    }
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode_t mode = va_arg(ap, mode_t);
+        unsigned int value = va_arg(ap, unsigned int);
+        va_end(ap);
+        return real_sem_open_ptr(name, oflag, mode, value);
+    }
+    return real_sem_open_ptr(name, oflag);
+}
+
+int sem_unlink(const char *name) {
+    typedef int (*fn)(const char *);
+    static fn real = NULL;
+    if (!real) real = (fn)dlsym(RTLD_NEXT, "sem_unlink");
+    debug_str("S32: sem_unlink(", name ? name : "NULL", ")\n");
+    return real(name);
+}
+
+/* Forward declaration */
+static int is_shmem_path(const char *path);
+
+/* v133: Forward declarations for fopen wrappers */
+static int generate_proc_net_tcp(int is_ipv6);
+static int build_proc_pid_prefix(char *buf, int bufsz, unsigned int pid);
+
+/* v133: fopen/fopen64 wrapper — intercept /proc/net/tcp (glibc fopen uses
+ * internal __openat which bypasses our open/openat/syscall wrappers).
+ * Also intercept /proc/<WH_PID>/ paths for FD scanning. */
+typedef FILE *(*real_fopen_fn)(const char *, const char *);
+static real_fopen_fn real_fopen_ptr = NULL;
+static real_fopen_fn real_fopen64_ptr = NULL;
+
+static FILE *fopen_common(const char *pathname, const char *mode,
+                          real_fopen_fn real_fn, const char *wrapper_name) {
+    if (!pathname) return real_fn(pathname, mode);
+
+    /* Intercept /proc/net/tcp — generate fake content */
+    if (strcmp(pathname, "/proc/net/tcp") == 0 ||
+        strcmp(pathname, "/proc/self/net/tcp") == 0) {
+        debug_str("S32: fopen PROC-NET-TCP intercepted: ", pathname, "\n");
+        int fd = generate_proc_net_tcp(0);
+        if (fd >= 0) return fdopen(fd, "r");
+    }
+    if (strcmp(pathname, "/proc/net/tcp6") == 0 ||
+        strcmp(pathname, "/proc/self/net/tcp6") == 0) {
+        debug_str("S32: fopen PROC-NET-TCP6 intercepted: ", pathname, "\n");
+        int fd = generate_proc_net_tcp(1);
+        if (fd >= 0) return fdopen(fd, "r");
+    }
+
+    /* Redirect /proc/<WH_PID>/xxx → /proc/self/xxx */
+    if (strncmp(pathname, "/proc/", 6) == 0) {
+        unsigned int wh_pid = get_webhelper_pid();
+        if (wh_pid > 0) {
+            char prefix[32];
+            int prefixlen = build_proc_pid_prefix(prefix, sizeof(prefix), wh_pid);
+            if (strncmp(pathname, prefix, prefixlen) == 0) {
+                char redir[256];
+                int n = 0;
+                const char *s = "/proc/self/";
+                while (*s && n < 240) redir[n++] = *s++;
+                s = pathname + prefixlen;
+                while (*s && n < 254) redir[n++] = *s++;
+                redir[n] = '\0';
+                static volatile int fopen_redir_count = 0;
+                int cnt = __sync_fetch_and_add(&fopen_redir_count, 1);
+                if (cnt < 20)
+                    debug_str("S32: fopen /proc/<WH_PID> redirect: ", redir, "\n");
+                return real_fn(redir, mode);
+            }
+        }
+        /* Diagnostic: log /proc/ fopen calls */
+        static volatile int fopen_proc_count = 0;
+        int cnt = __sync_fetch_and_add(&fopen_proc_count, 1);
+        if (cnt < 30)
+            debug_str("S32: fopen /proc/: ", pathname, "\n");
+    }
+
+    return real_fn(pathname, mode);
+}
+
+FILE *fopen(const char *pathname, const char *mode) {
+    if (!real_fopen_ptr)
+        real_fopen_ptr = (real_fopen_fn)dlsym(RTLD_NEXT, "fopen");
+    return fopen_common(pathname, mode, real_fopen_ptr, "fopen");
+}
+
+FILE *fopen64(const char *pathname, const char *mode) {
+    if (!real_fopen64_ptr)
+        real_fopen64_ptr = (real_fopen_fn)dlsym(RTLD_NEXT, "fopen64");
+    return fopen_common(pathname, mode, real_fopen64_ptr, "fopen64");
+}
+
+/* v133: popen wrapper — intercept lsof calls for WebUITransport PID check.
+ * S32 runs: popen("/usr/bin/lsof -P -F upnR -i TCP@127.0.0.1:<port>", "r")
+ * to find the PID of the process owning a TCP connection.
+ * On Android/FEX, lsof can't read /proc/net/tcp (SELinux), so we return
+ * fake output with the webhelper PID directly. */
+typedef FILE *(*real_popen_fn)(const char *, const char *);
+static real_popen_fn real_popen_ptr = NULL;
+
+FILE *popen(const char *command, const char *type) {
+    if (!real_popen_ptr)
+        real_popen_ptr = (real_popen_fn)dlsym(RTLD_NEXT, "popen");
+
+    /* Intercept lsof calls for TCP connections.
+     * Must use real popen("printf ...") so pclose() works (needs real child). */
+    if (command && strstr(command, "lsof") && strstr(command, "TCP@127.0.0.1:")) {
+        unsigned int wh_pid = get_webhelper_pid();
+        if (wh_pid > 0) {
+            const char *port_str = strstr(command, "TCP@127.0.0.1:");
+            if (port_str) {
+                port_str += 14; /* skip "TCP@127.0.0.1:" */
+                /* Build fake lsof -F output. Real lsof -F upnR output:
+                 *   p<PID>\n R<PPID>\n u<UID>\n f<FD>\n n<local>-><remote>\n
+                 * S32 queries -i TCP@127.0.0.1:<server_port>, wants to find
+                 * the webhelper's connection. n field needs -> format.
+                 * Use printf to emit lines with proper format. */
+                char port_buf[8];
+                int pi = 0;
+                while (*port_str && *port_str != '"' && *port_str != '\''
+                       && *port_str != ' ' && pi < 7)
+                    port_buf[pi++] = *port_str++;
+                port_buf[pi] = '\0';
+
+                char fake_cmd[512];
+                snprintf(fake_cmd, sizeof(fake_cmd),
+                    "printf 'p%u\\nR1\\nu1000\\nf3\\n"
+                    "n127.0.0.1:%s->127.0.0.1:%s\\n'",
+                    wh_pid, port_buf, port_buf);
+
+
+                static volatile int lsof_fake_count = 0;
+                int cnt = __sync_fetch_and_add(&lsof_fake_count, 1);
+                if (cnt < 20) {
+                    debug_int("S32: popen lsof FAKED pid=", (long)wh_pid);
+                    debug_str("S32: fake cmd: ", fake_cmd, "");
+                }
+                return real_popen_ptr(fake_cmd, type);
+            }
+        }
+    }
+
+    static volatile int popen_count = 0;
+    int cnt = __sync_fetch_and_add(&popen_count, 1);
+    if (cnt < 30)
+        debug_str("S32: popen: ", command, "\n");
+    return real_popen_ptr(command, type);
+}
+
+/* v133: execve wrapper — diagnostic to see if S32 execs lsof/ss */
+typedef int (*real_execve_fn)(const char *, char *const[], char *const[]);
+static real_execve_fn real_execve_ptr = NULL;
+
+int execve(const char *pathname, char *const argv[], char *const envp[]) {
+    if (!real_execve_ptr)
+        real_execve_ptr = (real_execve_fn)dlsym(RTLD_NEXT, "execve");
+    static volatile int execve_count = 0;
+    int cnt = __sync_fetch_and_add(&execve_count, 1);
+    if (cnt < 20)
+        debug_str("S32: execve: ", pathname, "\n");
+    return real_execve_ptr(pathname, argv, envp);
+}
+
+/* v133: getsockopt wrapper — fake SO_PEERCRED on TCP sockets.
+ * WebUITransport calls getsockopt(accepted_fd, SOL_SOCKET, SO_PEERCRED, ...)
+ * to determine the PID of the connecting WebSocket client.
+ * On TCP sockets, SO_PEERCRED returns ENOPROTOOPT. We fake success
+ * with the webhelper PID so S32 thinks the connection is from the webhelper. */
+typedef int (*real_getsockopt_fn)(int, int, int, void *, socklen_t *);
+static real_getsockopt_fn real_getsockopt_ptr = NULL;
+
+/* SO_PEERCRED = 17 on Linux, struct ucred from sys/socket.h (with _GNU_SOURCE) */
+#ifndef SO_PEERCRED
+#define SO_PEERCRED 17
+#endif
+
+int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
+    if (!real_getsockopt_ptr)
+        real_getsockopt_ptr = (real_getsockopt_fn)dlsym(RTLD_NEXT, "getsockopt");
+    int ret = real_getsockopt_ptr(sockfd, level, optname, optval, optlen);
+
+    if (level == SOL_SOCKET && optname == SO_PEERCRED) {
+        unsigned int wh_pid = get_webhelper_pid();
+        if (ret == 0 && optval && optlen && *optlen >= sizeof(struct ucred)) {
+            /* Success path: patch the returned PID */
+            struct ucred *cred = (struct ucred *)optval;
+            static volatile int peercred_log_count = 0;
+            int cnt = __sync_fetch_and_add(&peercred_log_count, 1);
+            if (cnt < 20) {
+                debug_int("S32: SO_PEERCRED(ok) fd=", sockfd);
+                debug_int("  pid=", (long)cred->pid);
+            }
+            if (wh_pid > 0 && cred->pid != (pid_t)wh_pid) {
+                cred->pid = (pid_t)wh_pid;
+                if (cnt < 20)
+                    debug_int("  PATCHED to: ", (long)wh_pid);
+            }
+        } else if (ret < 0 && wh_pid > 0 && optval && optlen) {
+            /* Failure path (TCP socket): fake success with webhelper PID */
+            struct ucred *cred = (struct ucred *)optval;
+            cred->pid = (pid_t)wh_pid;
+            cred->uid = 1000;
+            cred->gid = 1000;
+            *optlen = sizeof(struct ucred);
+            errno = 0;
+            static volatile int peercred_fake_count = 0;
+            int cnt = __sync_fetch_and_add(&peercred_fake_count, 1);
+            if (cnt < 20) {
+                debug_int("S32: SO_PEERCRED(faked) fd=", sockfd);
+                debug_int("  pid=", (long)wh_pid);
+            }
+            ret = 0;
+        }
+    }
+    return ret;
+}
+
+/* v133: Helper to write an integer as hex string (for /proc/net/tcp format) */
+static int hex32(char *out, unsigned int val) {
+    static const char hex[] = "0123456789ABCDEF";
+    int n = 0;
+    for (int i = 28; i >= 0; i -= 4) {
+        int started = (n > 0 || ((val >> i) & 0xf) != 0 || i == 0);
+        if (started) out[n++] = hex[(val >> i) & 0xf];
+    }
+    return n;
+}
+
+/* v133: Generate fake /proc/net/tcp content from live socket data.
+ * Scans our own FDs to find TCP sockets and builds proper format. */
+static int generate_proc_net_tcp(int is_ipv6) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+
+    const char *header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+    int hlen = 0;
+    while (header[hlen]) hlen++;
+    write(pipefd[1], header, hlen);
+
+    int sl = 0;
+    for (int fd = 3; fd <= 300; fd++) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
+
+        struct sockaddr_in sin;
+        socklen_t slen = sizeof(sin);
+        if (getsockname(fd, (struct sockaddr *)&sin, &slen) != 0) continue;
+        if ((!is_ipv6 && sin.sin_family != AF_INET) ||
+            (is_ipv6 && sin.sin_family != AF_INET6)) continue;
+
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int has_peer = (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0);
+
+        /* Build /proc/net/tcp line:
+         * sl local_addr:port remote_addr:port st ... uid timeout inode */
+        char line[256];
+        int n = 0;
+        /* sl field (right-justified, 4 chars) */
+        line[n++] = ' '; line[n++] = ' '; line[n++] = ' ';
+        n += hex32(line + n, sl);
+        line[n++] = ':'; line[n++] = ' ';
+        /* local_address:port (hex) — note: /proc/net/tcp uses host byte order! */
+        {
+            unsigned int addr = sin.sin_addr.s_addr; /* already network order */
+            for (int i = 0; i < 8; i++)
+                line[n++] = "0123456789ABCDEF"[(addr >> (i * 4)) & 0xf];
+            line[n++] = ':';
+            unsigned int port = ntohs(sin.sin_port);
+            line[n++] = "0123456789ABCDEF"[(port >> 12) & 0xf];
+            line[n++] = "0123456789ABCDEF"[(port >> 8) & 0xf];
+            line[n++] = "0123456789ABCDEF"[(port >> 4) & 0xf];
+            line[n++] = "0123456789ABCDEF"[port & 0xf];
+        }
+        line[n++] = ' ';
+        /* remote_address:port */
+        {
+            unsigned int addr = has_peer ? peer.sin_addr.s_addr : 0;
+            for (int i = 0; i < 8; i++)
+                line[n++] = "0123456789ABCDEF"[(addr >> (i * 4)) & 0xf];
+            line[n++] = ':';
+            unsigned int port = has_peer ? ntohs(peer.sin_port) : 0;
+            line[n++] = "0123456789ABCDEF"[(port >> 12) & 0xf];
+            line[n++] = "0123456789ABCDEF"[(port >> 8) & 0xf];
+            line[n++] = "0123456789ABCDEF"[(port >> 4) & 0xf];
+            line[n++] = "0123456789ABCDEF"[port & 0xf];
+        }
+        /* st (state) — 01=ESTABLISHED, 0A=LISTEN */
+        line[n++] = ' ';
+        line[n++] = '0';
+        line[n++] = has_peer ? '1' : 'A';
+        /* tx_queue:rx_queue */
+        line[n++] = ' ';
+        { const char *z = "00000000:00000000"; while (*z) line[n++] = *z++; }
+        /* tr:tm->when */
+        line[n++] = ' ';
+        { const char *z = "00:00000000"; while (*z) line[n++] = *z++; }
+        /* retrnsmt */
+        line[n++] = ' ';
+        { const char *z = "00000000"; while (*z) line[n++] = *z++; }
+        /* uid */
+        line[n++] = ' ';
+        { const char *z = "  1000"; while (*z) line[n++] = *z++; }
+        /* timeout */
+        line[n++] = ' ';
+        line[n++] = '0';
+        /* inode — use stat st_ino */
+        line[n++] = ' ';
+        {
+            unsigned long ino = (unsigned long)st.st_ino;
+            char inobuf[16];
+            int inopos = 0;
+            if (ino == 0) { inobuf[inopos++] = '0'; }
+            else {
+                char tmp[16]; int tmplen = 0;
+                while (ino > 0) { tmp[tmplen++] = '0' + (ino % 10); ino /= 10; }
+                for (int i = tmplen - 1; i >= 0; i--) inobuf[inopos++] = tmp[i];
+            }
+            for (int i = 0; i < inopos; i++) line[n++] = inobuf[i];
+        }
+        line[n++] = '\n';
+        write(pipefd[1], line, n);
+        sl++;
+    }
+    close(pipefd[1]);
+    debug_int("S32: generated /proc/net/tcp with entries=", sl);
+    return pipefd[0];
+}
+
+/* v133: Helper to build "/proc/<pid>/" prefix string */
+static int build_proc_pid_prefix(char *buf, int bufsz, unsigned int pid) {
+    const char *p = "/proc/";
+    int n = 0;
+    while (*p && n < bufsz - 1) buf[n++] = *p++;
+    char pidbuf[12];
+    int pidlen = 0;
+    unsigned int tmp = pid;
+    if (tmp == 0) { pidbuf[pidlen++] = '0'; }
+    else {
+        char rev[12]; int revlen = 0;
+        while (tmp > 0) { rev[revlen++] = '0' + (tmp % 10); tmp /= 10; }
+        for (int i = revlen - 1; i >= 0; i--) pidbuf[pidlen++] = rev[i];
+    }
+    for (int i = 0; i < pidlen && n < bufsz - 1; i++) buf[n++] = pidbuf[i];
+    if (n < bufsz - 1) buf[n++] = '/';
+    buf[n] = '\0';
+    return n;
+}
+
 /* open/open64 wrapper: redirect /dev/shm/ paths to our Android directory. */
 int open(const char *pathname, int flags, ...) {
     if (!real_open_ptr)
@@ -1596,6 +2165,46 @@ int open(const char *pathname, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE))
         mode = va_arg(ap, mode_t);
     va_end(ap);
+
+    /* v133: Intercept /proc/net/tcp — generate fake content from live socket data.
+     * S32 reads this to find the PID of the WebSocket client.
+     * On Android, /proc/net/tcp is restricted (SELinux) → returns empty → PID=0. */
+    if (pathname && (strcmp(pathname, "/proc/net/tcp") == 0 ||
+                     strcmp(pathname, "/proc/self/net/tcp") == 0)) {
+        debug_str("S32: PROC-NET-TCP intercepted: ", pathname, "\n");
+        int fd = generate_proc_net_tcp(0);
+        if (fd >= 0) return fd;
+        /* fallthrough to real open if generation fails */
+    }
+    if (pathname && (strcmp(pathname, "/proc/net/tcp6") == 0 ||
+                     strcmp(pathname, "/proc/self/net/tcp6") == 0)) {
+        debug_str("S32: PROC-NET-TCP6 intercepted: ", pathname, "\n");
+        int fd = generate_proc_net_tcp(1);
+        if (fd >= 0) return fd;
+    }
+
+    /* v133: Redirect /proc/<WH_PID>/xxx → /proc/self/xxx */
+    {
+        unsigned int wh_pid = get_webhelper_pid();
+        if (wh_pid > 0 && pathname && strncmp(pathname, "/proc/", 6) == 0) {
+            char prefix[32];
+            int prefixlen = build_proc_pid_prefix(prefix, sizeof(prefix), wh_pid);
+            if (strncmp(pathname, prefix, prefixlen) == 0) {
+                char redir[256];
+                int n = 0;
+                const char *s = "/proc/self/";
+                while (*s && n < 240) redir[n++] = *s++;
+                s = pathname + prefixlen;
+                while (*s && n < 254) redir[n++] = *s++;
+                redir[n] = '\0';
+                static volatile int proc_redir_count = 0;
+                int cnt = __sync_fetch_and_add(&proc_redir_count, 1);
+                if (cnt < 10)
+                    debug_str("S32: open /proc/<WH_PID> redirect: ", redir, "\n");
+                return real_open_ptr(redir, flags, mode);
+            }
+        }
+    }
 
     /* v127: Log ALL opens that touch MasterStream or shmem paths */
     if (pathname && (strstr(pathname, "steam_chrome") || strstr(pathname, "chrome_shmem"))) {
@@ -1676,19 +2285,14 @@ int open(const char *pathname, int flags, ...) {
             /* Create as MasterStream — 8208 bytes */
             msfd = real_open_ptr(redir, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
             if (msfd >= 0) {
+                /* v130: Write proper 76-byte CMsgBrowserReady (PC format) */
                 unsigned char ms_data[8208];
                 memset(ms_data, 0, sizeof(ms_data));
-                unsigned int *mhdr = (unsigned int *)ms_data;
-                mhdr[0] = 0; mhdr[1] = 10; mhdr[2] = 8192; mhdr[3] = 10;
-                unsigned char *ring = ms_data + 16;
-                unsigned int msg_type = 0, msg_size = 2;
-                memcpy(ring, &msg_type, 4);
-                memcpy(ring + 4, &msg_size, 4);
-                ring[8] = 0x08; ring[9] = 0x01;
+                write_browserready_ring(ms_data, sizeof(ms_data));
                 ftruncate(msfd, 8208);
                 pwrite(msfd, ms_data, sizeof(ms_data), 0);
                 if (mc < 200) {
-                    debug_str("S32-v129: MS open() CREATE: ", pathname, "\n");
+                    debug_str("S32-v130: MS open() CREATE: ", pathname, "\n");
                     debug_int("  fd=", msfd);
                 }
                 /* Also write to /dev/shm/ via raw syscall */
@@ -1744,6 +2348,37 @@ int openat(int dirfd, const char *pathname, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE))
         mode = va_arg(ap, mode_t);
     va_end(ap);
+
+    /* v133: Intercept /proc/net/tcp in openat — same as open() */
+    if (dirfd == AT_FDCWD && pathname) {
+        if (strcmp(pathname, "/proc/net/tcp") == 0 || strcmp(pathname, "/proc/self/net/tcp") == 0) {
+            debug_str("S32: openat PROC-NET-TCP: ", pathname, "\n");
+            int fd = generate_proc_net_tcp(0);
+            if (fd >= 0) return fd;
+        }
+        if (strcmp(pathname, "/proc/net/tcp6") == 0 || strcmp(pathname, "/proc/self/net/tcp6") == 0) {
+            int fd = generate_proc_net_tcp(1);
+            if (fd >= 0) return fd;
+        }
+        /* v133: Redirect /proc/<WH_PID>/xxx → /proc/self/xxx */
+        if (strncmp(pathname, "/proc/", 6) == 0) {
+            unsigned int wh_pid = get_webhelper_pid();
+            if (wh_pid > 0) {
+                char prefix[32];
+                int prefixlen = build_proc_pid_prefix(prefix, sizeof(prefix), wh_pid);
+                if (strncmp(pathname, prefix, prefixlen) == 0) {
+                    char redir[256];
+                    int n = 0;
+                    const char *s = "/proc/self/";
+                    while (*s && n < 240) redir[n++] = *s++;
+                    s = pathname + prefixlen;
+                    while (*s && n < 254) redir[n++] = *s++;
+                    redir[n] = '\0';
+                    return real_openat_ptr(AT_FDCWD, redir, flags, mode);
+                }
+            }
+        }
+    }
 
     /* v127: log ALL openat for MasterStream */
     if (pathname && strstr(pathname, "MasterStream") != NULL) {
@@ -2156,10 +2791,22 @@ ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read32_ptr)
         real_read32_ptr = (real_read32_fn)dlsym(RTLD_NEXT, "read");
     ssize_t ret = real_read32_ptr(fd, buf, count);
-    /* Log reads that returned sdPC IPC messages */
     if (ret >= 4 && buf) {
         const unsigned char *b = (const unsigned char *)buf;
-        if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
+        /* Log HTTP GET requests (WebSocket upgrade) */
+        if (b[0] == 'G' && b[1] == 'E' && b[2] == 'T' && b[3] == ' ') {
+            debug_int("S32: read HTTP GET fd=", fd);
+            debug_int("  ret=", (long)ret);
+            int show = (int)(ret > 300 ? 300 : ret);
+            char tbuf[304];
+            for (int i = 0; i < show; i++)
+                tbuf[i] = (b[i] >= 32 && b[i] < 127) ? b[i] : '|';
+            tbuf[show] = '\n';
+            tbuf[show+1] = '\0';
+            debug_msg(tbuf);
+        }
+        /* Log sdPC IPC messages */
+        else if (b[0] == 's' && b[1] == 'd' && b[2] == 'P' && b[3] == 'C') {
             int n = __sync_fetch_and_add(&read_ipc_count, 1);
             if (n < 30) {
                 debug_int("S32: read sdPC fd=", fd);
@@ -2290,12 +2937,28 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
         real_recv_ptr = (real_recv_fn)dlsym(RTLD_NEXT, "recv");
     ssize_t ret = real_recv_ptr(sockfd, buf, len, flags);
     int n = __sync_fetch_and_add(&recv_count, 1);
-    if (n < 50 && ret > 0) {
-        debug_int("S32: recv fd=", sockfd);
-        debug_int("  len=", (long)len);
-        debug_int("  ret=", (long)ret);
-        int show = (int)(ret > 40 ? 40 : ret);
-        debug_hexline("  data: ", buf, show);
+    if (ret > 0) {
+        /* Log ALL recv to find WebSocket incoming requests.
+         * Check if data starts with "GET " (HTTP request) */
+        const unsigned char *d = (const unsigned char *)buf;
+        if (ret >= 4 && d[0] == 'G' && d[1] == 'E' && d[2] == 'T' && d[3] == ' ') {
+            debug_int("S32: recv HTTP GET fd=", sockfd);
+            debug_int("  ret=", (long)ret);
+            /* Print as text (up to 200 chars) */
+            int show = (int)(ret > 200 ? 200 : ret);
+            char tbuf[204];
+            for (int i = 0; i < show; i++)
+                tbuf[i] = (d[i] >= 32 && d[i] < 127) ? d[i] : '.';
+            tbuf[show] = '\n';
+            tbuf[show+1] = '\0';
+            debug_msg(tbuf);
+        } else if (n < 50) {
+            debug_int("S32: recv fd=", sockfd);
+            debug_int("  len=", (long)len);
+            debug_int("  ret=", (long)ret);
+            int show = (int)(ret > 40 ? 40 : ret);
+            debug_hexline("  data: ", buf, show);
+        }
     }
     return ret;
 }
@@ -2327,6 +2990,20 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
     }
     return ret;
 }
+
+/* ============================================================
+ * getsockopt wrapper: intercept SO_PEERCRED to diagnose & fix
+ * WebUITransport PID check ("Checked: %d/%d").
+ *
+ * On FEX/Android, SO_PEERCRED on a TCP loopback socket may return
+ * the FEX host PID instead of the guest PID. S32 compares
+ * peercred.pid against the expected webhelper PID → mismatch → reject.
+ *
+ * Fix: if SO_PEERCRED returns a PID that doesn't match the expected
+ * webhelper PID, substitute the expected PID (read from
+ * /tmp/.steam_webhelper_pid written by steamwebhelper.sh).
+ * ============================================================ */
+/* v133: getsockopt() moved to before open() — handles SO_PEERCRED faking */
 
 /* ============================================================
  * SHM BRIDGE LISTENER: Receives Shm_ file data from 64-bit side
@@ -2483,39 +3160,20 @@ static volatile int mmap_intercept_count = 0;
 static void *bridge_anon_map = NULL;
 static size_t bridge_anon_size = 0;
 
-/* v127: FIXED SHMemStream header format.
- * Connect() reads hdr[0] as m_cubBuffer and asserts it matches expected size.
- * v102 had hdr[0]=0 (get cursor) → Connect() saw 0 → "8192, 0" assertion!
- * CORRECT layout:
- *   hdr[0] = m_cubBuffer (total mapping size, must equal fstat st_size)
- *   hdr[1] = get  (read cursor into ring buffer, 0-based)
- *   hdr[2] = put  (write cursor into ring buffer, 0-based)
+/* v130: FIXED SHMemStream header + CMsgBrowserReady format.
+ * From PC IPC trace, CORRECT layout:
+ *   hdr[0] = get   (read cursor, 0-based into ring buffer)
+ *   hdr[1] = put   (write cursor, 0-based into ring buffer)
+ *   hdr[2] = m_cubBuffer (ring buffer capacity)
  *   hdr[3] = pending (bytes available = put - get)
  *   Ring buffer data starts at file/mapping offset 16.
  *
- * We write CMsgBrowserReady (10 bytes) into the ring buffer at offset 0,
- * then set put=10, pending=10 so the client reads it. */
+ * CMsgBrowserReady is 76 bytes (not 10!):
+ *   u32(1) + u32(1) + u32(PID) + char[64](stream_name) */
 static void fill_shm_header(void *mapping, size_t length) {
-    unsigned int *hdr = (unsigned int *)mapping;
-
-    /* Ring buffer header — v127: hdr[0] is m_cubBuffer! */
-    hdr[0] = (unsigned int)length; /* m_cubBuffer = total mapping size */
-    hdr[1] = 0;      /* get = 0 (read starts at ring offset 0) */
-    hdr[2] = 10;     /* put = 10 (10 bytes written to ring) */
-    hdr[3] = 10;     /* pending = 10 bytes */
-
-    /* CMsgBrowserReady at ring buffer offset 0 (file offset 16)
-     * Message format: [4B type][4B size][payload]
-     * Type=0 (BrowserReady), size=2, payload=08 01 (handle=1) */
-    if (length >= 26) {
-        unsigned char *ring = (unsigned char *)mapping + 16;
-        unsigned int msg_type = 0;
-        unsigned int msg_size = 2;
-        memcpy(ring, &msg_type, 4);
-        memcpy(ring + 4, &msg_size, 4);
-        ring[8] = 0x08;  /* protobuf field 1, varint */
-        ring[9] = 0x01;  /* browser_handle = 1 */
-    }
+    if (length < 92) return; /* need 16 hdr + 76 msg */
+    memset(mapping, 0, length < 256 ? length : 256);
+    write_browserready_ring((unsigned char *)mapping, length);
 }
 
 /* Return the singleton bridge mapping (create + fill ONCE on first call) */
@@ -2734,21 +3392,8 @@ static volatile size_t ms_mmap_len = 0;
 static volatile int ms_inject_done = 0;
 
 static void inject_browserready(void *m) {
-    volatile unsigned int *hdr = (volatile unsigned int *)m;
-    unsigned char *ring = (unsigned char *)m + 16;
-    /* Write CMsgBrowserReady message in ring data area */
-    unsigned int msg_type = 0; /* BrowserReady */
-    unsigned int msg_size = 2;
-    memcpy(ring, &msg_type, 4);
-    memcpy(ring + 4, &msg_size, 4);
-    ring[8] = 0x08; ring[9] = 0x01; /* protobuf: browser_handle = 1 */
-    __sync_synchronize();
-    /* v127: Set header — hdr[0]=m_cubBuffer, hdr[1]=get, hdr[2]=put, hdr[3]=pending */
-    hdr[0] = 8192;   /* m_cubBuffer = total mapping size */
-    hdr[1] = 0;      /* get = 0 */
-    __sync_synchronize();
-    hdr[2] = 10;     /* put = 10 */
-    hdr[3] = 10;     /* pending = 10 */
+    /* v130: Write proper 76-byte CMsgBrowserReady (PC format) */
+    write_browserready_ring((unsigned char *)m, 8208);
     __sync_synchronize();
 }
 
@@ -3128,6 +3773,37 @@ long syscall(long number, ...) {
 
     if (number == SYS_openat) {
         const char *path = (const char *)a2;
+
+        /* v132: Intercept /proc/net/tcp opens for WebUITransport PID detection.
+         * Steam reads /proc/net/tcp to find socket inodes, then scans
+         * /proc/<pid>/fd/ to map inode→PID. On Android, /proc/net/tcp is
+         * restricted by SELinux. Try /proc/self/net/tcp instead. */
+        if (path) {
+            static volatile int proc_open_count = 0;
+            /* Log /proc/ opens for diagnostic (first 50) */
+            if (strncmp(path, "/proc/", 6) == 0 &&
+                strstr(path, "MasterStream") == NULL) {
+                int cnt = __sync_fetch_and_add(&proc_open_count, 1);
+                if (cnt < 50)
+                    debug_str("S32: PROC-OPEN: ", path, "\n");
+            }
+            /* Redirect /proc/net/tcp → /proc/self/net/tcp */
+            if (strcmp(path, "/proc/net/tcp") == 0 ||
+                strcmp(path, "/proc/net/tcp6") == 0) {
+                const char *self_path = (strcmp(path, "/proc/net/tcp") == 0)
+                    ? "/proc/self/net/tcp" : "/proc/self/net/tcp6";
+                long fd = real_syscall_ptr(SYS_openat, (long)AT_FDCWD,
+                    (long)self_path, a3, a4, a5, a6);
+                if (fd >= 0) {
+                    debug_str("S32: PROC-NET-TCP redirect OK: ", self_path, "\n");
+                    debug_int("  fd=", fd);
+                    return fd;
+                }
+                debug_str("S32: PROC-NET-TCP redirect FAILED: ", self_path, "\n");
+                /* Fallback: let original open proceed (will probably fail too) */
+            }
+        }
+
         if (path && strstr(path, "MasterStream")) {
             int cnt = __sync_fetch_and_add(&raw_ms_openat_count, 1);
             /* v124: Strip O_TRUNC from MasterStream opens.
@@ -3203,19 +3879,14 @@ long syscall(long number, ...) {
                 /* Create as MasterStream */
                 msfd = real_open_ptr(redir, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
                 if (msfd >= 0) {
+                    /* v130: Write proper 76-byte CMsgBrowserReady (PC format) */
                     unsigned char ms_data[8208];
                     memset(ms_data, 0, sizeof(ms_data));
-                    unsigned int *mhdr = (unsigned int *)ms_data;
-                    mhdr[0] = 0; mhdr[1] = 10; mhdr[2] = 8192; mhdr[3] = 10;
-                    unsigned char *ring = ms_data + 16;
-                    unsigned int msg_type = 0, msg_size = 2;
-                    memcpy(ring, &msg_type, 4);
-                    memcpy(ring + 4, &msg_size, 4);
-                    ring[8] = 0x08; ring[9] = 0x01;
+                    write_browserready_ring(ms_data, sizeof(ms_data));
                     ftruncate(msfd, 8208);
                     pwrite(msfd, ms_data, sizeof(ms_data), 0);
                     if (mc < 200) {
-                        debug_str("S32-v129: MS RAW CREATE: ", redir, "\n");
+                        debug_str("S32-v130: MS RAW CREATE: ", redir, "\n");
                         debug_int("  fd=", msfd);
                     }
                     /* Also write to /dev/shm/ */
@@ -3316,6 +3987,85 @@ long syscall(long number, ...) {
         }
     }
 
+    /* v132: Intercept SYS_socketcall for socket(), recvmsg(), getsockopt().
+     * On i386, all socket operations go through SYS_socketcall (102).
+     * Subcalls: 1=socket, 12=recvmsg, 15=getsockopt */
+    if (number == 102) { /* SYS_socketcall */
+        long subcall = a1;
+
+        /* v132: Detect AF_NETLINK socket creation (subcall 1 = SYS_SOCKET).
+         * Args: socket(domain, type, protocol)
+         * AF_NETLINK=16, NETLINK_SOCK_DIAG=4, NETLINK_INET_DIAG=4 */
+        if (subcall == 1) { /* SYS_SOCKET */
+            unsigned long *args = (unsigned long *)a2;
+            long ret = real_syscall_ptr(number, a1, a2, a3, a4, a5, a6);
+            if (ret >= 0 && args) {
+                int domain = (int)args[0];
+                int type = (int)args[1];
+                int protocol = (int)args[2];
+                if (domain == 16) { /* AF_NETLINK */
+                    static volatile int nl_count = 0;
+                    int cnt = __sync_fetch_and_add(&nl_count, 1);
+                    if (cnt < 10) {
+                        debug_int("S32: NETLINK socket created fd=", ret);
+                        debug_int("  type=", (long)type);
+                        debug_int("  protocol=", (long)protocol);
+                    }
+                }
+            }
+            return ret;
+        }
+
+        /* v132: Intercept recvmsg on netlink sockets (subcall 12 = SYS_RECVMSG).
+         * If INET_DIAG response, log the UID and inode. */
+        if (subcall == 12) { /* SYS_RECVMSG */
+            unsigned long *args = (unsigned long *)a2;
+            long ret = real_syscall_ptr(number, a1, a2, a3, a4, a5, a6);
+            if (ret >= 0 && args) {
+                int fd = (int)args[0];
+                /* Check if this is a netlink socket by checking getsockname */
+                struct sockaddr_storage ss;
+                socklen_t slen = sizeof(ss);
+                if (getsockname(fd, (struct sockaddr *)&ss, &slen) == 0 &&
+                    ss.ss_family == 16) { /* AF_NETLINK */
+                    static volatile int nl_recv_count = 0;
+                    int cnt = __sync_fetch_and_add(&nl_recv_count, 1);
+                    if (cnt < 20) {
+                        debug_int("S32: NETLINK recvmsg fd=", fd);
+                        debug_int("  ret=", ret);
+                    }
+                }
+            }
+            return ret;
+        }
+
+        if (subcall == 15) { /* SYS_GETSOCKOPT */
+            unsigned long *args = (unsigned long *)a2;
+            long ret = real_syscall_ptr(number, a1, a2, a3, a4, a5, a6);
+            if (ret == 0 && args) {
+                int level = (int)args[1];
+                int optname = (int)args[2];
+                void *optval = (void *)args[3];
+                socklen_t *optlen = (socklen_t *)args[4];
+                /* SOL_SOCKET=1, SO_PEERCRED=17 */
+                if (level == 1 && optname == 17 && optval && optlen && *optlen >= sizeof(struct ucred)) {
+                    struct ucred *cred = (struct ucred *)optval;
+                    debug_int("S32: SO_PEERCRED(syscall) fd=", (long)args[0]);
+                    debug_int("  pid=", (long)cred->pid);
+                    debug_int("  uid=", (long)cred->uid);
+                    debug_int("  my_pid=", (long)getpid());
+                    /* Patch: replace peer PID with webhelper PID from file */
+                    unsigned int wh_pid = get_webhelper_pid();
+                    if (wh_pid > 0 && cred->pid != (pid_t)wh_pid) {
+                        debug_int("  PATCHED pid to: ", (long)wh_pid);
+                        cred->pid = (pid_t)wh_pid;
+                    }
+                }
+            }
+            return ret;
+        }
+    }
+
     return real_syscall_ptr(number, a1, a2, a3, a4, a5, a6);
 }
 
@@ -3328,7 +4078,7 @@ static void init(void) {
     mkdir(SHM_REDIR_DIR, 0777);
     mkdir(LISTEN_PORT_DIR, 0777);
     mkdir("/tmp", 0777);
-    debug_int("S32-v129: pid=", (long)getpid());
+    debug_int("S32-v133c: pid=", (long)getpid());
     debug_msg("S32-v129: bridge-sync WH Shm_ files to S32 overlay\n");
 
     /* v111: Clean stale Shm_ files from previous runs.
@@ -3462,22 +4212,11 @@ static void init(void) {
             ms_devshm[n] = '\0';
         }
 
-        /* v127: Fill ring buffer header + CMsgBrowserReady.
-         * CORRECTED layout — hdr[0] = m_cubBuffer (total size), NOT get cursor!
-         * Connect() reads hdr[0] and asserts it equals expected size. */
+        /* v130: Fill ring buffer header + CMsgBrowserReady (76 bytes, PC format).
+         * Header: {get=0, put=76, m_cubBuffer=8192, pending=76} */
         unsigned char buf[8192];
         memset(buf, 0, sizeof(buf));
-        unsigned int *hdr = (unsigned int *)buf;
-        hdr[0] = 8192;   /* m_cubBuffer = total mapping size */
-        hdr[1] = 0;      /* get = 0 */
-        hdr[2] = 10;     /* put = 10 */
-        hdr[3] = 10;     /* pending = 10 bytes */
-        unsigned char *ring = buf + 16;
-        unsigned int msg_type = 0, msg_size = 2;
-        memcpy(ring, &msg_type, 4);
-        memcpy(ring + 4, &msg_size, 4);
-        ring[8] = 0x08;  /* protobuf field 1 varint */
-        ring[9] = 0x01;  /* browser_handle = 1 */
+        write_browserready_ring(buf, sizeof(buf));
 
         /* Write to SHM_REDIR_DIR (primary — where wrappers redirect) */
         int msfd = (int)syscall(SYS_openat, AT_FDCWD, ms_redir,

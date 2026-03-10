@@ -76,16 +76,18 @@ fi
 
 export SDL_VIDEODRIVER=dummy
 
-log "PATCHED v91b: single-process + stat S_IFSOCK fake + proxy-server=direct://"
+log "PATCHED v93: write PID for fake lsof, then exec steamwebhelper"
 
-# Capture ALL output to a debug file (logcat buffer too small).
-# Also keep output on stderr for the Android app's reader.
-DEBUG_LOG="${REAL_DATADIR}/webhelper_debug.log"
-> "${DEBUG_LOG}"
-log "Debug log: ${DEBUG_LOG}"
+# Write PID/PPID/UID for fake /usr/bin/lsof (used by S32's GetIPCConnectionDetails).
+# S32 runs: lsof -P -F upnR -i TCP@127.0.0.1:<port>
+# Our fake lsof reads /tmp/steam_webhelper_pid and returns p<PID> R<PPID> u<UID>.
+# Must write BEFORE exec — $$ is our PID, exec keeps same PID.
+echo "$$ $PPID $(id -u)" > /tmp/steam_webhelper_pid
+log "Wrote PID=$$ PPID=$PPID UID=$(id -u) to /tmp/steam_webhelper_pid"
 
-# Run steamwebhelper and tee output (can't use exec with pipe)
-"${DIR}/steamwebhelper" \
+# Use exec so steamwebhelper REPLACES the shell process (keeps same PID).
+# The PID in /tmp/steam_webhelper_pid matches the actual process PID.
+exec "${DIR}/steamwebhelper" \
     --headless \
     --ozone-platform=headless \
     --no-sandbox \
@@ -112,5 +114,4 @@ log "Debug log: ${DEBUG_LOG}"
     --icu-data-dir="${REAL_DATADIR}" \
     --user-data-dir="${REAL_DATADIR}" \
     --browser-subprocess-path="${DIR}/steamwebhelper" \
-    "${ARGS[@]}" \
-    2>&1 | tee -a "${DEBUG_LOG}"
+    "${ARGS[@]}"

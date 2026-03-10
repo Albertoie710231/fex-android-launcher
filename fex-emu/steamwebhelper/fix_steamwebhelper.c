@@ -1,4 +1,9 @@
-/* v93: v91b + fake SHMemStream (creates shared memory + socket for steam IPC).
+/* v94: + /dev/shm/ open() redirect + sem_open/sem_unlink wrappers.
+ *       steamclient.so IPC needs cross-process shared memory (SysMgrMutex).
+ *       FEX overlay isolation breaks this — redirect all /dev/shm/ paths
+ *       and semaphores to SHM_REDIR_DIR (shared Android directory).
+ *
+ * v93: v91b + fake SHMemStream (creates shared memory + socket for steam IPC).
  *
  * v85: + shm_open redirect works (ValveIPC + chrome_shmem)
  * v86: + heartbeat (38 threads, process ALIVE)
@@ -378,6 +383,38 @@ int open(const char *pathname, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE))
         mode = va_arg(ap, mode_t);
     va_end(ap);
+    /* Strip O_TRUNC for MasterStream — S32 creates the file,
+     * WH re-opens it and O_TRUNC would zero the header. */
+    if (pathname && strstr(pathname, "MasterStream"))
+        flags &= ~O_TRUNC;
+    /* v94: Redirect /dev/shm/ opens to shared Android path.
+     * steamclient.so (loaded via dlopen) uses open() for IPC shared memory
+     * and mutexes (SysMgrMutex). FEX overlay isolation means each process
+     * has its own /dev/shm/. Redirect so both S32 and WH see same files. */
+    if (pathname && strncmp(pathname, "/dev/shm/", 9) == 0) {
+        char redir[256];
+        const char *base = "/data/data/com.mediatek.steamlauncher/cache/s/shm/";
+        const char *name = pathname + 9; /* skip "/dev/shm/" */
+        int n = 0;
+        const char *s = base;
+        while (*s && n < 254) redir[n++] = *s++;
+        s = name;
+        while (*s && n < 254) redir[n++] = *s++;
+        redir[n] = '\0';
+        static volatile int devshm_open_count = 0;
+        int cnt = __sync_fetch_and_add(&devshm_open_count, 1);
+        if (cnt < 30) {
+            debug_msg("FIX: open /dev/shm redirect: ");
+            debug_msg(pathname);
+            debug_msg(" → ");
+            debug_msg(redir);
+            debug_int("\n  flags=", flags);
+        }
+        if (flags & O_CREAT) {
+            if (!mode) mode = 0666;
+        }
+        return real_open_ptr(redir, flags, mode);
+    }
     return real_open_ptr(pathname, flags, mode);
 }
 
@@ -389,6 +426,35 @@ int open64(const char *pathname, int flags, ...) {
         mode = va_arg(ap, mode_t);
     va_end(ap);
     return open(pathname, flags, mode);
+}
+
+/* dlmopen wrapper: redirect dlmopen(LM_ID_NEWLM, ...) to dlopen(...).
+ * steamclient.so is loaded via dlmopen which creates a new linker namespace.
+ * In that namespace, our LD_PRELOAD overrides (connect, bind, shm_open, etc.)
+ * do NOT apply. steamclient.so then fails to connect to S32 via Unix sockets
+ * because the abstract→filesystem redirect is missing.
+ * Fix: intercept dlmopen and use dlopen instead, keeping everything in the
+ * same namespace so our socket redirects work. */
+void *dlmopen(long lmid, const char *filename, int flags) {
+    debug_msg("FIX: dlmopen intercepted: ");
+    if (filename) debug_msg(filename);
+    debug_msg("\n");
+    debug_int("FIX: dlmopen lmid=", lmid);
+    debug_int("FIX: dlmopen flags=", flags);
+
+    /* Use dlopen instead — same namespace, our overrides apply */
+    void *handle = dlopen(filename, flags);
+    if (handle) {
+        debug_msg("FIX: dlmopen→dlopen OK: ");
+        if (filename) debug_msg(filename);
+        debug_msg("\n");
+    } else {
+        debug_msg("FIX: dlmopen→dlopen FAILED: ");
+        const char *err = dlerror();
+        if (err) debug_msg(err);
+        debug_msg("\n");
+    }
+    return handle;
 }
 
 /* bind/connect wrappers: filesystem AF_UNIX → abstract socket.
@@ -773,7 +839,7 @@ int shm_open(const char *name, int oflag, mode_t mode) {
     int real_flags;
     if (oflag & O_CREAT) {
         /* Caller wants to create: strip O_EXCL, force O_RDWR */
-        real_flags = (oflag & ~O_EXCL) | O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
+        real_flags = (oflag & ~(O_EXCL | O_TRUNC)) | O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW;
     } else {
         /* Caller is polling/reading (O_RDONLY): preserve original flags.
          * Steam client polls shm_open("Shm_<hash>", O_RDONLY) to detect
@@ -829,6 +895,49 @@ int shm_unlink(const char *name) {
     debug_msg(name);
     debug_int(") ret=", ret);
     return (ret < 0) ? -1 : 0;
+}
+
+/* v94: sem_open/sem_unlink wrappers — redirect POSIX named semaphores to SHM_REDIR_DIR.
+ * On Linux, sem_open("/name") creates /dev/shm/sem.name. FEX overlay isolation
+ * makes these invisible across processes. Redirect to shared Android path.
+ * Steam's IPC uses named semaphores for SysMgrMutex cross-process synchronization. */
+#include <semaphore.h>
+typedef sem_t *(*real_sem_open_fn)(const char *, int, ...);
+static real_sem_open_fn real_sem_open_ptr = NULL;
+typedef int (*real_sem_unlink_fn)(const char *);
+static real_sem_unlink_fn real_sem_unlink_ptr = NULL;
+
+sem_t *sem_open(const char *name, int oflag, ...) {
+    if (!real_sem_open_ptr)
+        real_sem_open_ptr = (real_sem_open_fn)dlsym(RTLD_NEXT, "sem_open");
+    static volatile int sem_count = 0;
+    int cnt = __sync_fetch_and_add(&sem_count, 1);
+    if (cnt < 20) {
+        debug_msg("FIX: sem_open(");
+        debug_msg(name ? name : "NULL");
+        debug_int(") oflag=", oflag);
+    }
+    /* Pass through — glibc sem_open creates files in /dev/shm/sem.NAME.
+     * Our open() wrapper above redirects /dev/shm/ to SHM_REDIR_DIR,
+     * so the semaphore file will end up in the shared location. */
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode_t mode = va_arg(ap, mode_t);
+        unsigned int value = va_arg(ap, unsigned int);
+        va_end(ap);
+        return real_sem_open_ptr(name, oflag, mode, value);
+    }
+    return real_sem_open_ptr(name, oflag);
+}
+
+int sem_unlink(const char *name) {
+    if (!real_sem_unlink_ptr)
+        real_sem_unlink_ptr = (real_sem_unlink_fn)dlsym(RTLD_NEXT, "sem_unlink");
+    debug_msg("FIX: sem_unlink(");
+    debug_msg(name ? name : "NULL");
+    debug_msg(")\n");
+    return real_sem_unlink_ptr(name);
 }
 
 /* Heartbeat thread: logs every 15 seconds to confirm the process is alive.
@@ -1159,25 +1268,95 @@ static void *shm_bridge_func(void *arg) {
                         PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
                     if (bmap != MAP_FAILED) {
                         unsigned int *bhdr = (unsigned int *)bmap;
-                        if (bhdr[0] == 0 && bhdr[1] == 0 && bhdr[2] == 8192) {
-                            /* Write CMsgBrowserReady to ring buffer at offset 0.
-                             * Message format: [4B type][4B size][payload]
-                             * Type=0 (BrowserReady), size=2, payload=08 01 */
+                        if (bhdr[2] == 8192) {
+                            /* v130: Write REAL CMsgBrowserReady to ring buffer.
+                             * From PC trace, the message is 76 bytes:
+                             *   u32 field1 = 1  (version/type)
+                             *   u32 field2 = 1  (browser_handle)
+                             *   u32 pid          (S32 PID)
+                             *   char[64] stream_name (NUL-padded)
+                             * Header format: {get, put, m_cubBuffer, pending} */
                             unsigned char *ring = (unsigned char *)bmap + 16;
-                            unsigned int msg_type = 0;
-                            unsigned int msg_size = 2;
-                            memcpy(ring, &msg_type, 4);
-                            memcpy(ring + 4, &msg_size, 4);
-                            ring[8] = 0x08;  /* protobuf field 1, varint */
-                            ring[9] = 0x01;  /* browser_handle = 1 */
+                            memset(ring, 0, 76);
 
-                            /* Set cursors: 10 bytes written, ready to read */
+                            /* Get S32 PID — walk up ppid chain past shell wrapper */
+                            unsigned int s32_pid = (unsigned int)getppid();
+                            {
+                                /* ppid might be steamwebhelper.sh, go one more level */
+                                char ppid_path[64];
+                                int k = 0;
+                                const char *pp = "/proc/";
+                                while (*pp) ppid_path[k++] = *pp++;
+                                /* write ppid digits */
+                                char pd[16]; int pn = 0;
+                                unsigned int v = s32_pid;
+                                if (v == 0) { pd[pn++] = '0'; }
+                                else { while (v > 0) { pd[pn++] = '0' + (v % 10); v /= 10; } }
+                                for (int i = pn - 1; i >= 0; i--) ppid_path[k++] = pd[i];
+                                const char *st = "/status";
+                                while (*st) ppid_path[k++] = *st++;
+                                ppid_path[k] = '\0';
+                                int sfd2 = open(ppid_path, O_RDONLY);
+                                if (sfd2 >= 0) {
+                                    char sbuf[512];
+                                    int rd = read(sfd2, sbuf, sizeof(sbuf) - 1);
+                                    close(sfd2);
+                                    if (rd > 0) {
+                                        sbuf[rd] = '\0';
+                                        /* Find "PPid:\t" line */
+                                        const char *needle = "PPid:\t";
+                                        char *found = strstr(sbuf, needle);
+                                        if (found) {
+                                            found += 6; /* skip "PPid:\t" */
+                                            unsigned int gpp = 0;
+                                            while (*found >= '0' && *found <= '9') {
+                                                gpp = gpp * 10 + (*found - '0');
+                                                found++;
+                                            }
+                                            if (gpp > 1) s32_pid = gpp;
+                                        }
+                                    }
+                                }
+                            }
+
+                            unsigned int f1 = 1, f2 = 1;
+                            memcpy(ring + 0, &f1, 4);
+                            memcpy(ring + 4, &f2, 4);
+                            memcpy(ring + 8, &s32_pid, 4);
+
+                            /* Build stream name: "SteamChrome_MasterStream_PID_PID" */
+                            char sname[64];
+                            memset(sname, 0, 64);
+                            {
+                                int n = 0;
+                                const char *pfx = "SteamChrome_MasterStream_";
+                                while (*pfx && n < 60) sname[n++] = *pfx++;
+                                /* Append S32 PID */
+                                char pd2[16]; int pn2 = 0;
+                                unsigned int vv = s32_pid;
+                                if (vv == 0) { pd2[pn2++] = '0'; }
+                                else { while (vv > 0) { pd2[pn2++] = '0' + (vv % 10); vv /= 10; } }
+                                for (int i = pn2 - 1; i >= 0 && n < 60; i--) sname[n++] = pd2[i];
+                                sname[n++] = '_';
+                                /* Append webhelper PID as suffix */
+                                unsigned int wpid = (unsigned int)getpid();
+                                pn2 = 0;
+                                vv = wpid;
+                                if (vv == 0) { pd2[pn2++] = '0'; }
+                                else { while (vv > 0) { pd2[pn2++] = '0' + (vv % 10); vv /= 10; } }
+                                for (int i = pn2 - 1; i >= 0 && n < 63; i--) sname[n++] = pd2[i];
+                            }
+                            memcpy(ring + 12, sname, 64);
+
+                            /* Header: {get=0, put=76, m_cubBuffer=8192, pending=76} */
                             bhdr[0] = 0;    /* get = 0 */
-                            bhdr[1] = 10;   /* put = 10 */
-                            bhdr[3] = 10;   /* pending = 10 */
+                            bhdr[1] = 76;   /* put = 76 */
+                            /* bhdr[2] already = 8192 (m_cubBuffer) */
+                            bhdr[3] = 76;   /* pending = 76 */
                             __sync_synchronize();
-                            msync(bmap, 32, MS_SYNC);
-                            debug_msg("FIX: BRIDGE: patched hdr (get=0 put=10 pending=10) + CMsgBrowserReady\n");
+                            msync(bmap, 96, MS_SYNC);
+                            debug_msg("FIX: BRIDGE: patched CMsgBrowserReady (76 bytes, PC format)\n");
+                            debug_int("  s32_pid=", (long)s32_pid);
                         }
                         munmap(bmap, bst.st_size);
                     }
@@ -1321,5 +1500,5 @@ static void install_fixes(void) {
         debug_msg("FIX: started shm_bridge thread\n");
     }
 
-    debug_msg("FIX-v100: + mmap header patch in bridge server\n");
+    debug_msg("FIX-v131: + dlmopen→dlopen redirect for steamclient.so\n");
 }
