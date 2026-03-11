@@ -638,6 +638,9 @@ DXVKEOF
             for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
                 [ -f "${'$'}DXVK_DIR/${'$'}dll" ] && cp "${'$'}DXVK_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
             done
+            # Stub DLLs
+            [ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "${'$'}SYS32/d3dcompiler_47.dll"
+            [ -f "/opt/stubs/xaudio2_7.dll" ] && cp "/opt/stubs/xaudio2_7.dll" "${'$'}SYS32/xaudio2_7.dll"
 
             # d3dcompiler_43/d3dx11_43: custom native PE stubs in system32 (=n override)
             # Remove Wine builtins from Proton dirs (they depend on wined3d which we disable)
@@ -654,6 +657,15 @@ DXVKEOF
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # Wine registry: disable XRandR, enable virtual desktop (same as dump mode)
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
+            wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
+            # Kill wineserver so the game starts fresh (reg commands may leave stale X11 state)
+            wineserver -k 2>/dev/null
+            sleep 1
 
             # Launch via wine64 directly
             START_TIME=${'$'}(date +%s)
