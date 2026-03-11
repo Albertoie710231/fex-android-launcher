@@ -328,19 +328,8 @@ class TerminalActivity : AppCompatActivity() {
             ))
         }
 
-        // Launch Steam client with login dialog
-        findViewById<Button>(R.id.btnSteam).setOnClickListener {
-            if (x11Server?.isRunning() != true) {
-                x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started for Steam]\n") } }
-                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
-                    start()
-                }
-            }
-            // Show login dialog
-            val dialogView = android.view.LayoutInflater.from(this).inflate(
-                android.R.layout.simple_list_item_1, null
-            )
+        // Show Steam login dialog, then run a command
+        fun showLoginDialog(title: String, onLogin: (loginArgs: String) -> Unit) {
             val layout = android.widget.LinearLayout(this).apply {
                 orientation = android.widget.LinearLayout.VERTICAL
                 setPadding(50, 30, 50, 10)
@@ -356,50 +345,64 @@ class TerminalActivity : AppCompatActivity() {
             layout.addView(userInput)
             layout.addView(passInput)
             android.app.AlertDialog.Builder(this)
-                .setTitle("Steam Login")
-                .setMessage("Enter credentials (leave password blank for cached login)")
+                .setTitle(title)
+                .setMessage("Enter Steam credentials")
                 .setView(layout)
                 .setPositiveButton("Login") { _, _ ->
                     val user = userInput.text.toString().trim()
                     val pass = passInput.text.toString().trim()
                     val loginArgs = if (user.isNotEmpty() && pass.isNotEmpty()) "$user $pass" else ""
-                    executeCommand(protonManager.getSteamCommand(loginArgs))
+                    onLogin(loginArgs)
                 }
                 .setNegativeButton("Cancel", null)
                 .show()
         }
 
-        findViewById<Button>(R.id.btnLaunchRE4).setOnClickListener {
+        fun ensureX11() {
             if (x11Server?.isRunning() != true) {
                 x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started for RE4]\n") } }
+                    onServerStarted = { handler.post { appendOutput("[X11 started]\n") } }
                     onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
                     start()
                 }
             }
-            executeCommand(protonManager.getLaunchCommand(
-                exePath = "/home/user/Steam/steamapps/common/RESIDENT EVIL 4  BIOHAZARD RE4/re4.exe",
-                steamAppId = "2050650",
-                dllOverrides = "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=n;d3d12core=n;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d",
-                useVirtualDesktop = false
-            ))
         }
 
-        // Launch Sekiro
-        findViewById<Button>(R.id.btnLaunchSekiro).setOnClickListener {
-            if (x11Server?.isRunning() != true) {
-                x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started for Sekiro]\n") } }
-                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
-                    start()
-                }
+        // Launch Steam client (login only)
+        findViewById<Button>(R.id.btnSteam).setOnClickListener {
+            ensureX11()
+            showLoginDialog("Steam Login") { loginArgs ->
+                executeCommand(protonManager.getSteamCommand(loginArgs))
             }
-            if (!isDisplayMode) toggleDisplayMode()
-            executeCommand(protonManager.getLaunchCommand(
-                exePath = "/home/user/Steam/steamapps/common/Sekiro Shadows Die Twice/sekiro.exe",
-                steamAppId = "814380",
-                dllOverrides = "d3d11=n;dxgi=n;d3d9=n;d3dcompiler_43=n;d3dcompiler_47=n;steam_api64=n;amd_ags_x64=d;d3dx11_43=n"
-            ))
+        }
+
+        // Launch RE4: Steam in background + Wine/Proton
+        findViewById<Button>(R.id.btnLaunchRE4).setOnClickListener {
+            ensureX11()
+            showLoginDialog("RE4 — Steam Login") { loginArgs ->
+                if (!isDisplayMode) toggleDisplayMode()
+                executeCommand(protonManager.getLaunchCommand(
+                    exePath = "/home/user/Steam/steamapps/common/RESIDENT EVIL 4  BIOHAZARD RE4/re4.exe",
+                    steamAppId = "2050650",
+                    dllOverrides = "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=n;d3d12core=n;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d",
+                    useVirtualDesktop = false,
+                    loginArgs = loginArgs
+                ))
+            }
+        }
+
+        // Launch Sekiro: Steam in background + Wine/Proton
+        findViewById<Button>(R.id.btnLaunchSekiro).setOnClickListener {
+            ensureX11()
+            showLoginDialog("Sekiro — Steam Login") { loginArgs ->
+                if (!isDisplayMode) toggleDisplayMode()
+                executeCommand(protonManager.getLaunchCommand(
+                    exePath = "/home/user/Steam/steamapps/common/Sekiro Shadows Die Twice/sekiro.exe",
+                    steamAppId = "814380",
+                    dllOverrides = "d3d11=n;dxgi=n;d3d9=n;d3dcompiler_47=n;d3dcompiler_43=n;d3dx11_43=n;amd_ags_x64=n;steam_api64=n",
+                    loginArgs = loginArgs
+                ))
+            }
         }
     }
 

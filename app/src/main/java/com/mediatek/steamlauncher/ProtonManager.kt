@@ -422,7 +422,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
      * Returns a command to launch Steam client standalone (for login/UI).
      * Steam runs directly on the X11 display so the user can interact with it.
      */
-    fun getSteamCommand(loginArgs: String = ""): String {
+    fun getSteamCommand(loginArgs: String = "", appId: String = ""): String {
         // Shell-escape each login arg individually with single quotes to protect
         // special characters like $ in passwords (e.g. "$4K4T3P0nG0L4$")
         val loginFlag = if (loginArgs.isNotBlank()) {
@@ -431,6 +431,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             val pass = if (parts.size > 1) parts[1].replace("'", "'\\''") else ""
             if (pass.isNotEmpty()) "-login '$user' '$pass'" else "-login '$user'"
         } else ""
+        val appLaunchFlag = if (appId.isNotBlank()) "-applaunch $appId" else ""
         return """
             export DISPLAY=:0
             export HOME=/home/user
@@ -452,8 +453,9 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
 
                 echo "=== Starting Steam client ==="
                 cd "${'$'}STEAMDIR"
-                bash steam.sh $loginFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
+                bash steam.sh $loginFlag $appLaunchFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
                     -nobootstrapupdate -skipstreamingdrivers \
+                    -nofriendsui -nochatui -vrdisable -silent \
                     2>&1 | tee /tmp/steam_new.log
             else
                 echo "ERROR: Steam client not found at ${'$'}STEAMDIR/ubuntu12_32/steam"
@@ -472,20 +474,41 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
         extraArgs: String = "",
         steamAppId: String = "1351630",
         dllOverrides: String? = null,
-        useVirtualDesktop: Boolean = true
+        useVirtualDesktop: Boolean = true,
+        loginArgs: String = ""
     ): String {
+        // Shell-escape login credentials for Steam background process
+        val steamLoginFlag = if (loginArgs.isNotBlank()) {
+            val parts = loginArgs.trim().split("\\s+".toRegex(), limit = 2)
+            val user = parts[0].replace("'", "'\\''")
+            val pass = if (parts.size > 1) parts[1].replace("'", "'\\''") else ""
+            if (pass.isNotEmpty()) "-login '$user' '$pass'" else "-login '$user'"
+        } else ""
         val exeDir = File(exePath).parent ?: "/home/user/games"
         val effectiveDllOverrides = dllOverrides
-            ?: "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
+            ?: "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;d3dx11_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
 
         return """
+            export DISPLAY=:0
+            export HOME=/home/user
             export WINEPREFIX="$winePrefix"
             export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
             export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
             export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
-            export DISPLAY=:0
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            export SteamAppId=$steamAppId
+            export SteamGameId=$steamAppId
+
+            # Vulkan ICD — colon-separated: guest path + host path
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
+            export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
+            export MALI_NO_ASYNC_COMPUTE=1
+
+            # Headless frame capture → TCP 19850 → Android SurfaceView
+            export HEADLESS_LAYER=1
+            export DISABLE_HOST_HEADLESS=1
 
             # DXVK settings
             export DXVK_ASYNC=1
@@ -494,87 +517,20 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export DXVK_LOG_PATH=/tmp/dxvk
             export DXVK_HUD=fps,devinfo
 
-            # Proton compatibility — esync ENABLED (Android kernel supports eventfd)
+            # Proton compatibility
             export PROTON_NO_FSYNC=1
             export PROTON_USE_WINED3D=0
 
-            # Vulkan ICD — colon-separated: guest path + host path.
-            # Both loaders (guest x86-64 + host ARM64 thunk) read VK_ICD_FILENAMES.
-            # Host path is needed for FEX thunk chain to find Vortek.
-            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
-            export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
-            export MALI_NO_ASYNC_COMPUTE=1
-
-            # Headless frame capture → TCP 19850 → Android SurfaceView
-            # Use Vulkan implicit layer instead of LD_PRELOAD (LD_PRELOAD blocked by AT_SECURE on Android)
-            export HEADLESS_LAYER=1
-            # Disable the HOST-side headless layer (the guest layer handles surfaces;
-            # the HOST copy creates a second instance that corrupts the heap)
-            export DISABLE_HOST_HEADLESS=1
-
-            # DLL overrides: DXVK for D3D, disable wined3d (SIGILL), use stub DLLs
-            # d3dcompiler_47=n: our stub with working D3DReflect (game needs 229 shader reflections)
-            # xaudio2_7=n: our stub (mock COM server) — FAudio's version crashes under FEX
+            # DLL overrides
             export WINEDLLOVERRIDES="$effectiveDllOverrides"
-            # Trace wineserver calls to find what the main thread blocks on
-            # +server goes to file to avoid SIGPIPE from pipe flooding
-            export WINEDEBUG=err+all
 
             # Misc
             export XDG_RUNTIME_DIR=/tmp
             export TMPDIR=/tmp
-            # Heap debug: detect corruption at the call that caused it
-            export MALLOC_CHECK_=3
-            export LIBC_FATAL_STDERR_=1
+            export WINEDEBUG=err+all
 
-            # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
-            if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
-                rm -f "${'$'}WINEPREFIX/dosdevices/z:"
-                ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
-            fi
-
-            # Ensure critical EXEs are in the prefix (pre-seed may have missed them)
-            PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
-            SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
-            WINDIR="${'$'}WINEPREFIX/drive_c/windows"
-            if [ ! -f "${'$'}SYS32/explorer.exe" ] || [ ! -f "${'$'}SYS32/winex11.drv" ]; then
-                echo "Fixing missing EXEs/DRVs in prefix..."
-                cp "${'$'}PROTON_WIN64"/*.exe "${'$'}SYS32/" 2>/dev/null || true
-                cp "${'$'}PROTON_WIN64"/*.drv "${'$'}SYS32/" 2>/dev/null || true
-                for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
-                    [ -f "${'$'}PROTON_WIN64/${'$'}exe" ] && cp "${'$'}PROTON_WIN64/${'$'}exe" "${'$'}WINDIR/${'$'}exe"
-                done
-                echo "  Deployed EXEs + DRVs to system32 + windows root"
-            fi
-
-            # Install standalone DXVK DLLs to system32 (from Proton's dxvk/ directory)
-            # These use Vulkan directly — unlike Wine's builtins which need wined3d/VKD3D
-            DXVK_DIR="$PROTON_INSTALL_DIR/files/lib/wine/dxvk/x86_64-windows"
-            mkdir -p "${'$'}SYS32"
-            for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
-                if [ -f "${'$'}DXVK_DIR/${'$'}dll" ]; then
-                    cp "${'$'}DXVK_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
-                fi
-            done
-            # d3dcompiler_47 stub (with working D3DReflect — game needs 229 shader reflections)
-            [ -f "/opt/stubs/d3dcompiler_47.dll" ] && cp "/opt/stubs/d3dcompiler_47.dll" "${'$'}SYS32/d3dcompiler_47.dll"
-            # xaudio2_7 stub — FAudio's xaudio2_7.dll crashes under FEX, our stub provides
-            # mock IXAudio2 COM objects so the game's audio init succeeds (no-op audio)
-            [ -f "/opt/stubs/xaudio2_7.dll" ] && cp "/opt/stubs/xaudio2_7.dll" "${'$'}SYS32/xaudio2_7.dll"
-            echo "DXVK standalone DLLs + stubs installed to system32"
-
-            # Install vkd3d-proton DLLs (DX12→Vulkan, for games like RE4 Remake)
-            VKD3D_DIR="$PROTON_INSTALL_DIR/files/lib/wine/vkd3d-proton/x86_64-windows"
-            for dll in d3d12.dll d3d12core.dll; do
-                if [ -f "${'$'}VKD3D_DIR/${'$'}dll" ]; then
-                    cp "${'$'}VKD3D_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
-                    echo "  vkd3d-proton: ${'$'}dll installed"
-                fi
-            done
-
-            # Create DXVK config to disable OpenVR/OpenXR (no VR hardware, avoids extension query crash)
+            # DXVK config
             cat > "$exeDir/dxvk.conf" << 'DXVKEOF'
-# DXVK config for Android/FEX-Emu
 dxgi.enableOpenVR = False
 dxgi.enableOpenXR = False
 dxgi.maxFrameLatency = 1
@@ -582,85 +538,23 @@ dxvk.logLevel = trace
 dxvk.numCompilerThreads = 1
 dxvk.enableAsync = False
 d3d11.reproducibleCommandStream = True
-
-# Memory limits: Vortek/FEX thunks have ~174MB host-visible mapping limit.
-# Reduce chunk sizes so DXVK creates smaller allocations (8MB instead of 64MB).
 dxvk.maxChunkSize = 8
-
-# Disable graphics pipeline library — Mali/Vortek doesn't expose
-# VK_KHR_pipeline_library, and we no longer spoof it.
 dxvk.enableGraphicsPipelineLibrary = False
 DXVKEOF
-
-            # Deploy game-specific stub DLLs (backup originals if present)
-            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
-                if [ -f "/opt/stubs/${'$'}stub" ]; then
-                    if [ -f "$exeDir/${'$'}stub" ] && [ ! -f "$exeDir/${'$'}{stub}.orig" ]; then
-                        cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
-                        echo "Backed up ${'$'}stub -> ${'$'}{stub}.orig"
-                    fi
-                    cp "/opt/stubs/${'$'}stub" "$exeDir/${'$'}stub"
-                    echo "Deployed stub: ${'$'}stub"
-                fi
-            done
-
-            # X11: always use abstract socket (libXlorie), never TCP
-            echo "=== X11 Display Check ==="
-            export DISPLAY=:0
-            echo "DISPLAY=:0 (abstract socket)"
-
-            # Disable XRandR — libXlorie doesn't support mode switching,
-            # causing NtUserChangeDisplaySettings to return -2 and Wine to poll forever.
-            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
-            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
-            echo "Disabled XRandR/XVidMode in Wine registry"
-
-            # Virtual desktop configuration
-            if ${if (useVirtualDesktop) "true" else "false"}; then
-                # Enable virtual desktop via registry — CRITICAL for headless rendering.
-                # Wine virtual desktop needs TWO registry keys:
-                #   1. Explorer\Desktops\<name> = WxH  → defines the desktop size
-                #   2. Explorer\Desktop = <name>        → activates it
-                wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
-                wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
-                echo "Virtual desktop: 1280x720 (ACTIVATED)"
-            else
-                # Disable virtual desktop — delete the activation key
-                wine64 reg delete 'HKCU\Software\Wine\Explorer' /v Desktop /f 2>/dev/null
-                echo "Virtual desktop: DISABLED"
-            fi
-
-            # Verify both keys were written
-            echo "--- Registry verification ---"
-            wine64 reg query 'HKCU\Software\Wine\Explorer' 2>/dev/null | grep -i desktop || echo "(Explorer key query failed)"
-            wine64 reg query 'HKCU\Software\Wine\Explorer\Desktops' 2>/dev/null | grep -i default || echo "(Desktops key query failed)"
-            echo "---"
-
-            echo "=== Launching: $exePath ==="
-            echo "Working dir: $exeDir"
-            echo "Wine prefix: $winePrefix"
-            echo ""
-
-            # Clear old trace logs for this run
-            rm -f /tmp/layer_trace.log
-            rm -f /tmp/icd_trace.log
-
-            cd "$exeDir"
             export DXVK_CONFIG_FILE="$exeDir/dxvk.conf"
 
-            # Wine returns "unix\home\user\..." from GetModuleFileName. The game
-            # builds absolute paths from it that fail. This symlink makes them resolve.
-            ln -sf / "$exeDir/unix" 2>/dev/null
-
-            # Create steam_appid.txt BEFORE wine launch (prevents Steam client check)
+            # steam_appid.txt for DRM
             echo "$steamAppId" > "$exeDir/steam_appid.txt" 2>/dev/null
 
-            # Dump game's PE imports to identify which DLLs are loaded
+            cd "$exeDir"
+            ln -sf / "$exeDir/unix" 2>/dev/null
+
             echo "=== PE IMPORTS ==="
             objdump -p "$exePath" 2>/dev/null | grep "DLL Name" | head -30 || echo "(objdump not available)"
             echo "=== END PE IMPORTS ==="
 
-            # Start Steam client in background for DRM authentication
+            # Start Steam client in background for DRM authentication (only if login credentials provided)
+            if [ -n "$steamLoginFlag" ]; then
             echo "=== Starting Steam client ==="
             export STEAM_COMPAT_CLIENT_INSTALL_PATH="${'$'}HOME/.steam/steam"
             export STEAM_COMPAT_DATA_PATH="${'$'}HOME/.steam/steam/steamapps/compatdata/$steamAppId"
@@ -677,30 +571,103 @@ DXVKEOF
                     cp "${'$'}STEAMDIR/linux64/steamclient.so" "${'$'}STEAMDIR/ubuntu12_64/steamclient.so"
                 fi
 
-                (cd "${'$'}STEAMDIR" && bash steam.sh -no-browser -no-cef-sandbox -silent -noverifyfiles \
-                    -skipinitialbootstrap -nobootstrapupdate -skipstreamingdrivers \
-                    -console 2>/tmp/steam_client.log) &
+                # Clean stale lock files so Steam doesn't think it's already running
+                rm -f "${'$'}HOME/.steam/steam.pid" "${'$'}HOME/.steam/steam.pipe" 2>/dev/null
+
+                # Launch Steam with login credentials in background
+                CONN_LOG="${'$'}STEAMDIR/logs/connection_log.txt"
+                rm -f "${'$'}CONN_LOG" 2>/dev/null
+                cd "${'$'}STEAMDIR"
+                bash steam.sh $steamLoginFlag -noreactlogin -no-cef-sandbox -noverifyfiles \
+                    -nobootstrapupdate -skipstreamingdrivers \
+                    -nofriendsui -nochatui -vrdisable -silent \
+                    </dev/null >/tmp/steam_client.log 2>&1 &
                 STEAM_PID=${'$'}!
-                echo "Steam PID: ${'$'}STEAM_PID"
-                echo "Waiting 15s for Steam to initialize..."
-                sleep 15
-                if kill -0 ${'$'}STEAM_PID 2>/dev/null; then
-                    echo "Steam client is running"
-                else
-                    echo "WARNING: Steam client exited early"
-                    cat /tmp/steam_client.log 2>/dev/null | tail -20
+                disown ${'$'}STEAM_PID 2>/dev/null
+                echo "Steam PID: ${'$'}STEAM_PID (background)"
+
+                # Wait for [Logged On] in connection_log.txt (up to 120s)
+                echo "Waiting for Steam to log on..."
+                WAITED=0
+                LOGGED_ON=0
+                while [ ${'$'}WAITED -lt 120 ]; do
+                    if [ -f "${'$'}CONN_LOG" ] && grep -q "Logged On" "${'$'}CONN_LOG" 2>/dev/null; then
+                        echo "=== Steam logged on! ==="
+                        grep "Logged On" "${'$'}CONN_LOG" | tail -1
+                        LOGGED_ON=1
+                        break
+                    fi
+                    sleep 2
+                    WAITED=${'$'}((WAITED + 2))
+                    if [ ${'$'}((WAITED % 10)) -eq 0 ]; then
+                        echo "  ...still waiting (${'$'}WAITED s)"
+                        tail -1 "${'$'}CONN_LOG" 2>/dev/null
+                    fi
+                done
+                if [ ${'$'}LOGGED_ON -eq 0 ]; then
+                    echo "WARNING: Steam login not detected after ${'$'}WAITED s, launching game anyway"
+                    tail -5 "${'$'}CONN_LOG" 2>/dev/null
                 fi
+                # Check Steam IPC files exist for game's steam_api to connect
+                echo "=== Steam IPC check ==="
+                ls -la "${'$'}HOME/.steam/steam.pid" 2>/dev/null || echo "  steam.pid: MISSING"
+                ls -la "${'$'}HOME/.steam/steam.pipe" 2>/dev/null || echo "  steam.pipe: MISSING"
+                ls -la /tmp/dumps/*/steam.pipe 2>/dev/null || echo "  /tmp steam.pipe: MISSING"
             else
                 echo "WARNING: Steam client not found, launching without it"
             fi
+            else
+                echo "=== No login credentials, skipping Steam client ==="
+            fi
 
-            # Launch directly (virtual desktop configured via registry above).
-            # +server trace goes to file (too verbose for pipe — would SIGPIPE)
+            # Ensure critical DLLs in prefix (same as dump mode)
+            PROTON_WIN64="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows"
+            SYS32="${'$'}WINEPREFIX/drive_c/windows/system32"
+            WINDIR="${'$'}WINEPREFIX/drive_c/windows"
+            mkdir -p "${'$'}SYS32"
+            if [ ! -f "${'$'}SYS32/explorer.exe" ] || [ ! -f "${'$'}SYS32/winex11.drv" ]; then
+                cp "${'$'}PROTON_WIN64"/*.exe "${'$'}SYS32/" 2>/dev/null || true
+                cp "${'$'}PROTON_WIN64"/*.drv "${'$'}SYS32/" 2>/dev/null || true
+                for exe in explorer.exe notepad.exe regedit.exe hh.exe; do
+                    [ -f "${'$'}PROTON_WIN64/${'$'}exe" ] && cp "${'$'}PROTON_WIN64/${'$'}exe" "${'$'}WINDIR/${'$'}exe"
+                done
+            fi
+
+            # DXVK DLLs
+            DXVK_DIR="$PROTON_INSTALL_DIR/files/lib/wine/dxvk/x86_64-windows"
+            for dll in d3d11.dll dxgi.dll d3d10core.dll d3d9.dll d3d8.dll; do
+                [ -f "${'$'}DXVK_DIR/${'$'}dll" ] && cp "${'$'}DXVK_DIR/${'$'}dll" "${'$'}SYS32/${'$'}dll"
+            done
+
+            # d3dcompiler_43/d3dx11_43: custom native PE stubs in system32 (=n override)
+            # Remove Wine builtins from Proton dirs (they depend on wined3d which we disable)
+            for dir in x86_64-unix x86_64-windows i386-unix i386-windows; do
+                for dll in d3dcompiler_43 d3dx11_43; do
+                    rm -f "$PROTON_INSTALL_DIR/files/lib/wine/${'$'}dir/${'$'}dll.so" 2>/dev/null
+                    rm -f "$PROTON_INSTALL_DIR/files/lib/wine/${'$'}dir/${'$'}dll.dll" 2>/dev/null
+                done
+            done
+
+            # Re-export Wine/Proton env (Steam background login may have clobbered LD_LIBRARY_PATH)
+            export PATH="$PROTON_INSTALL_DIR/files/bin:${'$'}PATH"
+            export WINEDLLPATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib/wine/x86_64-windows:$PROTON_INSTALL_DIR/files/lib/wine/i386-unix:$PROTON_INSTALL_DIR/files/lib/wine/i386-windows"
+            export WINELOADER="$PROTON_INSTALL_DIR/files/bin/wine"
+            export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
+            export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
+
+            # Launch via wine64 directly
             START_TIME=${'$'}(date +%s)
-            WINEDEBUG=+server,err+all wine64 "$exePath" $extraArgs 2>/tmp/wine_server_trace.log &
+            cd "$exeDir"
+            echo "=== Launching game via wine64 ==="
+            echo "SteamAppId=${'$'}SteamAppId"
+            echo "WINEPREFIX=${'$'}WINEPREFIX"
+            echo "WINEDLLPATH=${'$'}WINEDLLPATH"
+            echo "exePath=$exePath"
+            echo "WINEDLLOVERRIDES=${'$'}WINEDLLOVERRIDES"
+            WINEDEBUG=+loaddll,err+all $PROTON_INSTALL_DIR/files/bin/wine64 "$exePath" $extraArgs >/tmp/proton_stdout.log 2>&1 &
             WINE_PID=${'$'}!
-            echo "Wine PID: ${'$'}WINE_PID"
-            echo "Server trace: /tmp/wine_server_trace.log"
+            echo "Proton PID: ${'$'}WINE_PID"
+            echo "Log: /tmp/wine_server_trace.log"
 
             # Thread diagnostic — sample at t+15s and t+45s to see if CPU increases
             dump_threads() {
@@ -804,6 +771,11 @@ DXVKEOF
             WINE_EXIT=${'$'}?
             echo ""
             echo "[wine64 exit code: ${'$'}WINE_EXIT]"
+
+            # Dump proton stdout (contains Python errors if any)
+            echo "=== /tmp/proton_stdout.log ==="
+            cat /tmp/proton_stdout.log 2>/dev/null || echo "(empty)"
+            echo "=== end proton_stdout.log ==="
 
             # Dump headless layer trace log (critical for BC spoofing diagnostics)
             echo "=== /tmp/layer_trace.log ==="
