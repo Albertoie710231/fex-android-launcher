@@ -423,7 +423,14 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
      * Steam runs directly on the X11 display so the user can interact with it.
      */
     fun getSteamCommand(loginArgs: String = ""): String {
-        val loginFlag = if (loginArgs.isNotBlank()) "-login $loginArgs" else ""
+        // Shell-escape each login arg individually with single quotes to protect
+        // special characters like $ in passwords (e.g. "$4K4T3P0nG0L4$")
+        val loginFlag = if (loginArgs.isNotBlank()) {
+            val parts = loginArgs.trim().split("\\s+".toRegex(), limit = 2)
+            val user = parts[0].replace("'", "'\\''")
+            val pass = if (parts.size > 1) parts[1].replace("'", "'\\''") else ""
+            if (pass.isNotEmpty()) "-login '$user' '$pass'" else "-login '$user'"
+        } else ""
         return """
             export DISPLAY=:0
             export HOME=/home/user
