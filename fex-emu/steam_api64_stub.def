@@ -9,6 +9,12 @@ EXPORTS
     SteamAPI_IsSteamRunning
     SteamAPI_GetHSteamPipe
     SteamAPI_GetHSteamUser
+    SteamAPI_GetSteamInstallPath
+    SteamAPI_SetBreakpadAppID
+    SteamAPI_SetMiniDumpComment
+    SteamAPI_SetTryCatchCallbacks
+    SteamAPI_UseBreakpadCrashHandler
+    SteamAPI_WriteMiniDump
     SteamAPI_RegisterCallback
     SteamAPI_UnregisterCallback
     SteamAPI_RegisterCallResult
@@ -17,6 +23,11 @@ EXPORTS
     SteamAPI_ManualDispatch_RunFrame
     SteamAPI_ManualDispatch_GetNextCallback
     SteamAPI_ManualDispatch_FreeLastCallback
+    GetHSteamPipe
+    GetHSteamUser
+    Steam_GetHSteamUserCurrent
+    Steam_RegisterInterfaceFuncs
+    Steam_RunCallbacks
     SteamUser
     SteamFriends
     SteamApps
@@ -42,6 +53,28 @@ EXPORTS
     SteamClient
     SteamInventory
     SteamGameSearch
+    SteamUnifiedMessages
+    SteamContentServer
+    SteamContentServerUtils
+    SteamGameServer
+    SteamGameServerApps
+    SteamGameServerHTTP
+    SteamGameServerInventory
+    SteamGameServerNetworking
+    SteamGameServerNetworkingSockets
+    SteamGameServerNetworkingUtils
+    SteamGameServerStats
+    SteamGameServerUGC
+    SteamGameServerUtils
+    SteamGameServer_Init
+    SteamGameServer_InitSafe
+    SteamGameServer_Shutdown
+    SteamGameServer_RunCallbacks
+    SteamGameServer_BSecure
+    SteamGameServer_GetSteamID
+    SteamGameServer_GetHSteamPipe
+    SteamGameServer_GetHSteamUser
+    g_pSteamClientGameServer DATA
     SteamInternal_ContextInit
     SteamInternal_FindOrCreateUserInterface
     SteamInternal_FindOrCreateGameServerInterface
