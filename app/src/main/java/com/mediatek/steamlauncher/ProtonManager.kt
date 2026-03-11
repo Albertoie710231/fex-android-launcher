@@ -441,7 +441,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
 
             STEAMDIR="${'$'}HOME/.steam/steam"
             if [ -x "${'$'}STEAMDIR/ubuntu12_32/steam" ]; then
-                export LD_LIBRARY_PATH="${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+                export LD_LIBRARY_PATH="${'$'}STEAMDIR/linux64:${'$'}STEAMDIR/ubuntu12_64:${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
                 export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
 
                 # Ensure 64-bit steamclient.so is available for the webhelper
@@ -561,7 +561,7 @@ DXVKEOF
             mkdir -p "${'$'}STEAM_COMPAT_DATA_PATH"
             if [ -x "${'$'}HOME/.steam/steam/ubuntu12_32/steam" ]; then
                 STEAMDIR="${'$'}HOME/.steam/steam"
-                export LD_LIBRARY_PATH="${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+                export LD_LIBRARY_PATH="${'$'}STEAMDIR/linux64:${'$'}STEAMDIR/ubuntu12_64:${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
                 export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
                 export LIBGL_ALWAYS_SOFTWARE=1
                 export LIBGL_DRIVERS_PATH=/usr/lib/i386-linux-gnu/dri
@@ -658,14 +658,59 @@ DXVKEOF
             export WINESERVER="$PROTON_INSTALL_DIR/files/bin/wineserver"
             export LD_LIBRARY_PATH="$PROTON_INSTALL_DIR/files/lib/wine/x86_64-unix:$PROTON_INSTALL_DIR/files/lib:${'$'}{LD_LIBRARY_PATH:-}"
 
-            # Wine registry: disable XRandR, enable virtual desktop (same as dump mode)
-            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
-            wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
-            wine64 reg add 'HKCU\Software\Wine\Explorer\Desktops' /v Default /t REG_SZ /d 1280x720 /f 2>/dev/null
-            wine64 reg add 'HKCU\Software\Wine\Explorer' /v Desktop /t REG_SZ /d Default /f 2>/dev/null
-            # Kill wineserver so the game starts fresh (reg commands may leave stale X11 state)
-            wineserver -k 2>/dev/null
-            sleep 1
+            # Wine registry: disable XRandR only, NO virtual desktop
+            # (explorer.exe virtual desktop hits BadWindow on libXlorie)
+            USERREG="${'$'}WINEPREFIX/user.reg"
+            if [ -f "${'$'}USERREG" ]; then
+                # Remove virtual desktop entries so Wine doesn't start explorer desktop
+                sed -i '/\[Software\\\\Wine\\\\Explorer\\\\Desktops\]/,/^\[/{ /Default/d; }' "${'$'}USERREG" 2>/dev/null
+                sed -i '/\[Software\\\\Wine\\\\Explorer\]/,/^\[/{ /"Desktop"/d; }' "${'$'}USERREG" 2>/dev/null
+            fi
+            # XRandR off only
+            cat >> "${'$'}USERREG" << 'REGEOF'
+
+[Software\\Wine\\X11 Driver]
+"UseXRandr"="N"
+"UseXVidMode"="N"
+
+[Software\\Valve\\Steam]
+"SteamPath"="C:\\\\steamclient"
+"SteamExe"="C:\\\\steamclient\\\\steam.exe"
+"SourceModInstallPath"="C:\\\\steamclient\\\\steamapps\\\\common"
+
+[Software\\Valve\\Steam\\ActiveProcess]
+"pid"=dword:00000001
+"SteamClientDll"="C:\\\\steamclient\\\\steamclient.dll"
+"SteamClientDll64"="C:\\\\steamclient\\\\steamclient64.dll"
+"Universe"=dword:00000001
+"ActiveUser"=dword:09c1180a
+REGEOF
+            # Symlink steamclient DLLs so game's steam_api64 can find them
+            STEAMCLIENT_DIR="${'$'}WINEPREFIX/drive_c/steamclient"
+            mkdir -p "${'$'}STEAMCLIENT_DIR"
+            STEAM_REAL="${'$'}HOME/.steam/steam"
+            for f in steamclient64.dll steamclient.dll; do
+                [ -f "${'$'}STEAM_REAL/${'$'}f" ] && cp "${'$'}STEAM_REAL/${'$'}f" "${'$'}STEAMCLIENT_DIR/${'$'}f"
+            done
+            echo "Registry: XRandR off, Steam path set, steamclient DLLs copied"
+
+            # Deploy steam_api64 stub to system32 AND game directory
+            # (=n override loads from game dir first, so we must replace there too)
+            [ -f "/opt/stubs/steam_api64.dll" ] && cp "/opt/stubs/steam_api64.dll" "${'$'}SYS32/steam_api64.dll"
+            if [ -f "/opt/stubs/steam_api64.dll" ] && [ -f "$exeDir/steam_api64.dll" ]; then
+                [ ! -f "$exeDir/steam_api64.dll.orig" ] && cp "$exeDir/steam_api64.dll" "$exeDir/steam_api64.dll.orig"
+                cp "/opt/stubs/steam_api64.dll" "$exeDir/steam_api64.dll"
+                echo "Replaced game's steam_api64.dll with stub"
+            fi
+
+            # Create steam_appid.txt in game dir (some DRM checks this)
+            echo "${'$'}SteamAppId" > "$exeDir/steam_appid.txt"
+
+            # Create steam.pipe file (Steam IPC pipe) — DRM checks for this
+            STEAM_PIPE="${'$'}HOME/.steam/steam.pipe"
+            mkdir -p "${'$'}HOME/.steam"
+            echo "1" > "${'$'}STEAM_PIPE"
+            echo "Created steam.pipe: ${'$'}STEAM_PIPE"
 
             # Launch via wine64 directly
             START_TIME=${'$'}(date +%s)

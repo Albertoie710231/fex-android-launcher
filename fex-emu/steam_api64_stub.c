@@ -49,7 +49,9 @@ static unsigned long long __cdecl mock_get_steam_id(void) {
 
 /* Return a fake app ID */
 static unsigned int __cdecl mock_get_app_id(void) {
-    return 1351630; /* Ys IX */
+    /* Read from SteamAppId env var, fallback to 814380 (Sekiro) */
+    const char *env = getenv("SteamAppId");
+    return env ? (unsigned int)atoi(env) : 814380;
 }
 
 /* Return "en" for language queries */
@@ -107,9 +109,20 @@ static void init_mocks(void)
     /* BLoggedOn (index 0) — return true */
     user_vtable[0] = (void *)mock_method_true;
 
-    /* ISteamApps vtable: BIsSubscribedApp (varies by SDK version) */
+    /* ISteamApps vtable: mix of bool (true) and pointer/string returns */
     for (int i = 0; i < 256; i++)
-        apps_vtable[i] = (void *)mock_method_true;  /* Most apps queries → true */
+        apps_vtable[i] = (void *)mock_method;  /* Default: return 0 (safe for pointers) */
+    /* BIsSubscribed (0), BIsLowViolence (1), BIsCybercafe (2), BIsVACBanned (3) */
+    apps_vtable[0] = (void *)mock_method_true;   /* BIsSubscribed */
+    /* BGetDLCDataByIndex (4) → 0, GetCurrentBetaName (5) → 0 */
+    apps_vtable[6] = (void *)mock_method_true;   /* MarkContentCorrupt → true */
+    apps_vtable[7] = (void *)mock_get_language;   /* GetCurrentGameLanguage → "english" */
+    /* GetAvailableGameLanguages (8) → return "english" */
+    apps_vtable[8] = (void *)mock_get_language;
+    /* BIsSubscribedApp (9) */
+    apps_vtable[9] = (void *)mock_method_true;
+    /* BIsDlcInstalled (10) */
+    apps_vtable[10] = (void *)mock_method;  /* false — no DLC */
 
     /* ISteamUtils vtable: GetAppID, GetCurrentBatteryPower, etc. */
     for (int i = 0; i < 256; i++)
@@ -526,6 +539,300 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
         fflush(stderr);
     }
     return 0;
+}
+
+/* ========================================================================
+ * MessageBox IAT Hook — intercept error dialogs to see text on Android
+ * ======================================================================== */
+
+static int (WINAPI *real_MessageBoxA)(HWND, LPCSTR, LPCSTR, UINT) = NULL;
+static int (WINAPI *real_MessageBoxW)(HWND, LPCWSTR, LPCWSTR, UINT) = NULL;
+
+static void log_msgbox(const char *type, const char *caption, const char *text) {
+    fprintf(stderr, "[steam_api64] %s: caption='%s' text='%s'\n",
+            type, caption ? caption : "(null)", text ? text : "(null)");
+    fflush(stderr);
+    /* Also write to file so we can read it on Android */
+    FILE *f = fopen("Z:\\tmp\\msgbox_log.txt", "a");
+    if (!f) f = fopen("C:\\msgbox_log.txt", "a");
+    if (f) {
+        fprintf(f, "%s: caption='%s' text='%s'\n",
+                type, caption ? caption : "(null)", text ? text : "(null)");
+        fclose(f);
+    }
+}
+
+static int WINAPI hooked_MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type) {
+    log_msgbox("MessageBoxA", caption, text);
+    /* Return IDOK to let the game continue past the error */
+    return IDOK;
+}
+
+static int WINAPI hooked_MessageBoxW(HWND h, LPCWSTR text, LPCWSTR caption, UINT type) {
+    char cap_buf[256] = "(null)";
+    char txt_buf[1024] = "(null)";
+    if (caption) WideCharToMultiByte(CP_UTF8, 0, caption, -1, cap_buf, sizeof(cap_buf), NULL, NULL);
+    if (text)    WideCharToMultiByte(CP_UTF8, 0, text, -1, txt_buf, sizeof(txt_buf), NULL, NULL);
+    log_msgbox("MessageBoxW", cap_buf, txt_buf);
+    /* Return IDOK to auto-dismiss and let the game continue */
+    return IDOK;
+}
+
+/* Patch IAT of a module to redirect imports */
+static void patch_iat(HMODULE module, const char *target_dll,
+                      const char *func_name, void *hook, void **original) {
+    if (!module) return;
+
+    BYTE *base = (BYTE *)module;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    IMAGE_DATA_DIRECTORY *imp_dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imp_dir->VirtualAddress || !imp_dir->Size) return;
+
+    IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + imp_dir->VirtualAddress);
+    for (; imp->Name; imp++) {
+        const char *dll_name = (const char *)(base + imp->Name);
+        if (_stricmp(dll_name, target_dll) != 0) continue;
+
+        IMAGE_THUNK_DATA *orig_thunk = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
+        IMAGE_THUNK_DATA *iat_thunk  = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+
+        for (; orig_thunk->u1.AddressOfData; orig_thunk++, iat_thunk++) {
+            if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
+
+            IMAGE_IMPORT_BY_NAME *ibn =
+                (IMAGE_IMPORT_BY_NAME *)(base + orig_thunk->u1.AddressOfData);
+            if (strcmp(ibn->Name, func_name) == 0) {
+                DWORD old_prot;
+                if (VirtualProtect(&iat_thunk->u1.Function, sizeof(void *),
+                                   PAGE_READWRITE, &old_prot)) {
+                    if (original) *original = (void *)iat_thunk->u1.Function;
+                    iat_thunk->u1.Function = (ULONGLONG)hook;
+                    VirtualProtect(&iat_thunk->u1.Function, sizeof(void *),
+                                   old_prot, &old_prot);
+                    fprintf(stderr, "[steam_api64] IAT hooked %s!%s\n",
+                            target_dll, func_name);
+                }
+                return;
+            }
+        }
+    }
+}
+
+/* Hook MessageBox in ALL loaded modules (exe + DLLs) */
+static void install_messagebox_hooks(void) {
+    HMODULE exe = GetModuleHandleA(NULL);
+    patch_iat(exe, "user32.dll", "MessageBoxA",
+              (void *)hooked_MessageBoxA, (void **)&real_MessageBoxA);
+    patch_iat(exe, "user32.dll", "MessageBoxW",
+              (void *)hooked_MessageBoxW, (void **)&real_MessageBoxW);
+
+    /* Also try common DLLs that might call MessageBox on behalf of the game */
+    const char *dlls[] = { "msvcrt.dll", "msvcp140.dll", "vcruntime140.dll",
+                           "kernelbase.dll", "kernel32.dll", NULL };
+    for (int i = 0; dlls[i]; i++) {
+        HMODULE h = GetModuleHandleA(dlls[i]);
+        if (h) {
+            patch_iat(h, "user32.dll", "MessageBoxA",
+                      (void *)hooked_MessageBoxA, (void **)&real_MessageBoxA);
+            patch_iat(h, "user32.dll", "MessageBoxW",
+                      (void *)hooked_MessageBoxW, (void **)&real_MessageBoxW);
+        }
+    }
+
+    /* Fallback: get real functions for the hooked versions to call */
+    if (!real_MessageBoxA) {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        if (u32) {
+            real_MessageBoxA = (int (WINAPI *)(HWND, LPCSTR, LPCSTR, UINT))
+                               GetProcAddress(u32, "MessageBoxA");
+            real_MessageBoxW = (int (WINAPI *)(HWND, LPCWSTR, LPCWSTR, UINT))
+                               GetProcAddress(u32, "MessageBoxW");
+        }
+    }
+}
+
+/* ========================================================================
+ * Missing Exports for Older Steamworks SDK (Sekiro ~2019)
+ * ======================================================================== */
+
+/* Global getters (non-SteamAPI_ prefixed) */
+HSteamPipe __cdecl GetHSteamPipe(void) {
+    trace("GetHSteamPipe()");
+    return 1;
+}
+
+HSteamUser __cdecl GetHSteamUser(void) {
+    trace("GetHSteamUser()");
+    return 1;
+}
+
+HSteamUser __cdecl Steam_GetHSteamUserCurrent(void) {
+    trace("Steam_GetHSteamUserCurrent()");
+    return 1;
+}
+
+/* SteamAPI_GetSteamInstallPath — KEY: game may check this for DRM */
+const char* __cdecl SteamAPI_GetSteamInstallPath(void) {
+    trace("SteamAPI_GetSteamInstallPath()");
+    return "C:\\Program Files (x86)\\Steam";
+}
+
+/* Breakpad/minidump (no-ops) */
+void __cdecl SteamAPI_SetBreakpadAppID(uint32_t appId) {
+    trace("SteamAPI_SetBreakpadAppID()");
+}
+
+void __cdecl SteamAPI_SetMiniDumpComment(const char *msg) {
+    trace("SteamAPI_SetMiniDumpComment()");
+}
+
+void __cdecl SteamAPI_SetTryCatchCallbacks(int bTryCatchCallbacks) {
+    trace("SteamAPI_SetTryCatchCallbacks()");
+}
+
+void __cdecl SteamAPI_UseBreakpadCrashHandler(const char *pchVersion,
+        const char *pchDate, const char *pchTime, int bFullMemoryDumps,
+        void *pvContext, void *pfnPreMinidumpCallback) {
+    trace("SteamAPI_UseBreakpadCrashHandler()");
+}
+
+void __cdecl SteamAPI_WriteMiniDump(uint32_t uStructuredExceptionCode,
+        void *pvExceptionInfo, uint32_t uBuildID) {
+    trace("SteamAPI_WriteMiniDump()");
+}
+
+/* Steam_RegisterInterfaceFuncs / Steam_RunCallbacks */
+void __cdecl Steam_RegisterInterfaceFuncs(void *hModule) {
+    trace("Steam_RegisterInterfaceFuncs()");
+}
+
+void __cdecl Steam_RunCallbacks(HSteamPipe hSteamPipe, int bGameServerCallbacks) {
+    trace("Steam_RunCallbacks()");
+}
+
+/* SteamContentServer — return NULL (not used by games) */
+void* __cdecl SteamContentServer(void) {
+    return NULL;
+}
+
+void* __cdecl SteamContentServerUtils(void) {
+    return NULL;
+}
+
+/* SteamGameServer interfaces */
+static MockObj mock_gameserver;
+static int gameserver_mocks_initialized = 0;
+static void init_gameserver_mocks(void) {
+    if (gameserver_mocks_initialized) return;
+    gameserver_mocks_initialized = 1;
+    mock_gameserver.vptr = mock_vtable;
+}
+
+void* __cdecl SteamGameServer(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerApps(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerHTTP(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerInventory(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerNetworking(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerNetworkingSockets(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerNetworkingUtils(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerStats(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerUGC(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+void* __cdecl SteamGameServerUtils(void) {
+    init_gameserver_mocks();
+    return &mock_gameserver;
+}
+
+int __cdecl SteamGameServer_Init(uint32_t unIP, uint16_t usSteamPort,
+        uint16_t usGamePort, uint16_t usQueryPort, int eServerMode,
+        const char *pchVersionString) {
+    trace("SteamGameServer_Init()");
+    init_gameserver_mocks();
+    return 1;
+}
+
+int __cdecl SteamGameServer_InitSafe(uint32_t unIP, uint16_t usSteamPort,
+        uint16_t usGamePort, uint16_t usQueryPort, int eServerMode,
+        const char *pchVersionString) {
+    trace("SteamGameServer_InitSafe()");
+    init_gameserver_mocks();
+    return 1;
+}
+
+void __cdecl SteamGameServer_Shutdown(void) {
+    trace("SteamGameServer_Shutdown()");
+}
+
+void __cdecl SteamGameServer_RunCallbacks(void) {
+}
+
+int __cdecl SteamGameServer_BSecure(void) {
+    return 0;
+}
+
+uint64_t __cdecl SteamGameServer_GetSteamID(void) {
+    return 0x0110000100000001ULL;
+}
+
+HSteamPipe __cdecl SteamGameServer_GetHSteamPipe(void) {
+    return 1;
+}
+
+HSteamUser __cdecl SteamGameServer_GetHSteamUser(void) {
+    return 1;
+}
+
+/* SteamUnifiedMessages (deprecated but may still be imported) */
+void* __cdecl SteamUnifiedMessages(void) {
+    return &mock_networking;  /* reuse any mock */
+}
+
+/* Global variable: g_pSteamClientGameServer */
+void *g_pSteamClientGameServer = NULL;
+
+/* SteamAPI_GetSteamInstallPath alternative names */
+const char* __cdecl SteamAPI_GetSteamInstallPath_alt(void) {
+    return "C:\\Program Files (x86)\\Steam";
 }
 
 /* ========================================================================
@@ -976,9 +1283,19 @@ BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hDll);
         init_mocks();
+        init_gameserver_mocks();
+        g_pSteamClientGameServer = &mock_client;
 
-        /* Install VEH to handle entity table NULL crashes */
-        AddVectoredExceptionHandler(1, ys9_null_table_veh);
+        /* Hook MessageBoxA/W to capture error text on Android */
+        install_messagebox_hooks();
+
+        /* Install VEH ONLY for Ys IX — check exe name */
+        {
+            char _exename[MAX_PATH];
+            GetModuleFileNameA(NULL, _exename, MAX_PATH);
+            if (strstr(_exename, "ys9") || strstr(_exename, "Ys9") || strstr(_exename, "YS9"))
+                AddVectoredExceptionHandler(1, ys9_null_table_veh);
+        }
 
         char exename[MAX_PATH];
         GetModuleFileNameA(NULL, exename, MAX_PATH);
