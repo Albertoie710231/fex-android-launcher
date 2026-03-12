@@ -464,6 +464,199 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
     }
 
     /**
+     * Launch a game via Steam's own protocol: steam://rungameid/APPID
+     * This is the universal approach — Steam handles DRM, Proton launch, everything.
+     * Requires: app manifest in steamapps/, CompatToolMapping in config.vdf,
+     * Proton in compatibilitytools.d/, and the 32-bit dummy ICD for topology check.
+     */
+    fun getSteamRunGameCommand(loginArgs: String = "", appId: String): String {
+        val loginFlag = if (loginArgs.isNotBlank()) {
+            val parts = loginArgs.trim().split("\\s+".toRegex(), limit = 2)
+            val user = parts[0].replace("'", "'\\''")
+            val pass = if (parts.size > 1) parts[1].replace("'", "'\\''") else ""
+            if (pass.isNotEmpty()) "-login '$user' '$pass'" else "-login '$user'"
+        } else ""
+        return """
+            export DISPLAY=:0
+            export HOME=/home/user
+            export DBUS_SESSION_BUS_ADDRESS=disabled
+
+            STEAMDIR="${'$'}HOME/.steam/steam"
+            if [ ! -x "${'$'}STEAMDIR/ubuntu12_32/steam" ]; then
+                echo "ERROR: Steam client not found at ${'$'}STEAMDIR/ubuntu12_32/steam"
+                exit 1
+            fi
+
+            export LD_LIBRARY_PATH="${'$'}STEAMDIR/linux64:${'$'}STEAMDIR/ubuntu12_64:${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+            export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
+
+            # Both 64-bit (game) and 32-bit (Steam topology) ICDs
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:/usr/share/vulkan/icd.d/vulkan_dummy_i386.json"
+            export VK_DRIVER_FILES="${'$'}VK_ICD_FILENAMES"
+
+            # Proton/Wine env for when Steam spawns the game
+            export STEAM_COMPAT_CLIENT_INSTALL_PATH="${'$'}HOME/.steam/steam"
+            export STEAM_COMPAT_DATA_PATH="${'$'}HOME/.steam/steam/steamapps/compatdata/$appId"
+            mkdir -p "${'$'}STEAM_COMPAT_DATA_PATH"
+
+            # Headless frame capture via Vulkan implicit layer
+            export HEADLESS_LAYER=1
+
+            # DXVK config
+            export DXVK_ASYNC=1
+            export DXVK_STATE_CACHE=1
+            export DXVK_LOG_LEVEL=warn
+            export DXVK_LOG_PATH=/tmp/dxvk
+
+            # VKD3D config (DX12 games)
+            export VKD3D_FEATURE_LEVEL=12_1
+
+            # Proton flags
+            export PROTON_NO_FSYNC=1
+            export PROTON_USE_WINED3D=0
+            export PROTON_ENABLE_NVAPI=0
+            export PROTON_HIDE_NVIDIA_GPU=0
+
+            # Mali workarounds
+            export MALI_NO_ASYNC_COMPUTE=1
+
+            # FEX performance (TSO off = 6x speedup)
+            export FEX_TSOMODE=0
+
+            # Ensure 64-bit steamclient.so is available
+            if [ -f "${'$'}STEAMDIR/linux64/steamclient.so" ] && [ ! -f "${'$'}STEAMDIR/ubuntu12_64/steamclient.so" ]; then
+                cp "${'$'}STEAMDIR/linux64/steamclient.so" "${'$'}STEAMDIR/ubuntu12_64/steamclient.so"
+            fi
+
+            # Clean stale lock files
+            rm -f "${'$'}HOME/.steam/steam.pid" 2>/dev/null
+            rm -f "${'$'}HOME/.steam/steam.pipe" 2>/dev/null
+
+            LOGFILE=/tmp/steam_rungame.log
+            CONN_LOG="${'$'}STEAMDIR/logs/connection_log.txt"
+            PIPE_PATH="${'$'}HOME/.steam/steam.pipe"
+            JS_LOG="${'$'}STEAMDIR/logs/webhelper_js.txt"
+            cd "${'$'}STEAMDIR"
+
+            # Clear old logs so we only detect THIS session's events
+            : > "${'$'}CONN_LOG" 2>/dev/null
+            : > "${'$'}STEAMDIR/logs/gameprocess_log.txt" 2>/dev/null
+            : > "${'$'}STEAMDIR/logs/content_log.txt" 2>/dev/null
+
+            # All output (echo + steam) goes to both terminal and log
+            exec > >(tee "${'$'}LOGFILE") 2>&1
+
+            echo "=== Phase 1: Starting Steam (login only) ==="
+
+            # Launch Steam in background — login only, no URL yet
+            bash steam.sh $loginFlag \
+                -noreactlogin -no-cef-sandbox -noverifyfiles \
+                -nobootstrapupdate -skipstreamingdrivers \
+                -nofriendsui -nochatui -vrdisable -silent &
+            STEAM_SH_PID=${'$'}!
+
+            # Wait for FRESH "Logged On" + pipe + JS stores ready
+            echo "Waiting for Steam login (fresh logs)..."
+            WAITED=0
+            MAX_WAIT=120
+            LOGGED_IN=0
+            while [ ${'$'}WAITED -lt ${'$'}MAX_WAIT ]; do
+                # Must see fresh "Logged On" in cleared connection_log
+                if grep -q "Logged On" "${'$'}CONN_LOG" 2>/dev/null; then
+                    if [ -p "${'$'}PIPE_PATH" ]; then
+                        # Also wait for SteamURLStore to load in JS
+                        if grep -q "SteamURLStore" "${'$'}JS_LOG" 2>/dev/null; then
+                            echo "Login + pipe + JS stores ready after ${'$'}WAITED seconds"
+                            LOGGED_IN=1
+                            # Extra 5s for React event loop to fully initialize
+                            echo "Waiting 5s for UI to stabilize..."
+                            sleep 5
+                            break
+                        fi
+                    fi
+                fi
+                sleep 2
+                WAITED=${'$'}((WAITED + 2))
+                if [ ${'$'}((WAITED % 10)) -eq 0 ]; then
+                    echo "Still waiting... (${'$'}WAITED/${'$'}MAX_WAIT sec)"
+                    grep -o "Logged On.*\|Logging On.*\|Connecting.*" "${'$'}CONN_LOG" 2>/dev/null | tail -1
+                    ls -la "${'$'}PIPE_PATH" 2>/dev/null || echo "(pipe not yet created)"
+                    grep -o "SteamURLStore.*\|URLStore.*" "${'$'}JS_LOG" 2>/dev/null | tail -1 || echo "(JS stores not yet loaded)"
+                fi
+            done
+
+            if [ ${'$'}LOGGED_IN -eq 0 ]; then
+                echo "ERROR: Timed out waiting for Steam login (${'$'}MAX_WAIT sec)"
+                echo "--- connection_log tail ---"
+                tail -10 "${'$'}CONN_LOG" 2>/dev/null
+                echo "Falling back to direct URL pass..."
+                kill ${'$'}STEAM_SH_PID 2>/dev/null
+                wait ${'$'}STEAM_SH_PID 2>/dev/null
+                rm -f "${'$'}HOME/.steam/steam.pid" "${'$'}HOME/.steam/steam.pipe" 2>/dev/null
+                bash steam.sh $loginFlag steam://rungameid/$appId \
+                    -noreactlogin -no-cef-sandbox -noverifyfiles \
+                    -nobootstrapupdate -skipstreamingdrivers \
+                    -nofriendsui -nochatui -vrdisable -silent
+            else
+                # Phase 2: Send URL via pipe — how Linux protocol handler works
+                echo "=== Phase 2: Sending steam://rungameid/$appId via pipe ==="
+                # Write URL to pipe (this is what the second steam instance does)
+                echo "steam://rungameid/$appId" > "${'$'}PIPE_PATH" &
+                PIPE_WRITE_PID=${'$'}!
+                echo "Pipe write PID: ${'$'}PIPE_WRITE_PID"
+
+                # The pipe write may block if Steam isn't reading — give it 10s
+                sleep 10
+                if kill -0 ${'$'}PIPE_WRITE_PID 2>/dev/null; then
+                    echo "WARNING: Pipe write still blocked after 10s — Steam may not be reading the pipe"
+                    kill ${'$'}PIPE_WRITE_PID 2>/dev/null
+                else
+                    echo "URL sent to pipe successfully!"
+                fi
+
+                # Monitor for game launch
+                echo "Monitoring for game launch..."
+                GAME_WAITED=0
+                GAME_MAX=60
+                while [ ${'$'}GAME_WAITED -lt ${'$'}GAME_MAX ]; do
+                    # Check gameprocess_log for this session's entry
+                    LATEST=${'$'}(grep "AppID $appId" "${'$'}STEAMDIR/logs/gameprocess_log.txt" 2>/dev/null | tail -1)
+                    if [ -n "${'$'}LATEST" ]; then
+                        echo "Game $appId launched! ${'$'}LATEST"
+                        break
+                    fi
+                    # Also check content_log
+                    CONTENT=${'$'}(grep "814380.*App Running" "${'$'}STEAMDIR/logs/content_log.txt" 2>/dev/null | tail -1)
+                    if [ -n "${'$'}CONTENT" ]; then
+                        echo "Game running per content_log: ${'$'}CONTENT"
+                        break
+                    fi
+                    sleep 3
+                    GAME_WAITED=${'$'}((GAME_WAITED + 3))
+                    if [ ${'$'}((GAME_WAITED % 15)) -eq 0 ]; then
+                        echo "Waiting for game... (${'$'}GAME_WAITED/${'$'}GAME_MAX sec)"
+                        echo "  compat: ${'$'}(grep '$appId' "${'$'}STEAMDIR/logs/compat_log.txt" 2>/dev/null | tail -1)"
+                        echo "  content: ${'$'}(grep '$appId' "${'$'}STEAMDIR/logs/content_log.txt" 2>/dev/null | tail -1)"
+                    fi
+                done
+
+                if [ ${'$'}GAME_WAITED -ge ${'$'}GAME_MAX ]; then
+                    echo "WARNING: Game $appId not detected after ${'$'}GAME_MAX sec"
+                    echo "--- content_log ---"
+                    tail -20 "${'$'}STEAMDIR/logs/content_log.txt" 2>/dev/null
+                    echo "--- compat_log ---"
+                    tail -20 "${'$'}STEAMDIR/logs/compat_log.txt" 2>/dev/null
+                    echo "--- webhelper_js ---"
+                    grep -i "url\|rungame\|launch\|appid" "${'$'}STEAMDIR/logs/webhelper_js.txt" 2>/dev/null | tail -20
+                fi
+
+                # Keep Steam running
+                wait ${'$'}STEAM_SH_PID 2>/dev/null
+            fi
+        """.trimIndent()
+    }
+
+    /**
      * @param exePath Path to the .exe inside the rootfs (e.g., /home/user/games/ysix/YsIX.exe)
      * @param winePrefix Wine prefix path
      * @param extraArgs Additional arguments for the exe
