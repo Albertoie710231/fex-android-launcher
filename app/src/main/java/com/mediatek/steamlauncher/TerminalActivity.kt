@@ -391,16 +391,14 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
-        // Launch Sekiro: Steam in background + Wine/Proton
+        // Launch Sekiro via steam://rungameid/ — Steam handles DRM + Proton
         findViewById<Button>(R.id.btnLaunchSekiro).setOnClickListener {
             ensureX11()
             showLoginDialog("Sekiro — Steam Login") { loginArgs ->
                 if (!isDisplayMode) toggleDisplayMode()
-                executeCommand(protonManager.getLaunchCommand(
-                    exePath = "/home/user/Steam/steamapps/common/Sekiro Shadows Die Twice/sekiro.exe",
-                    steamAppId = "814380",
-                    dllOverrides = "d3d11=n;dxgi=n;d3d9=n;d3dcompiler_47=n;d3dcompiler_43=n;d3dx11_43=n;amd_ags_x64=n;steam_api64=n",
-                    loginArgs = loginArgs
+                executeCommand(protonManager.getSteamRunGameCommand(
+                    loginArgs = loginArgs,
+                    appId = "814380"
                 ))
             }
         }

@@ -708,6 +708,9 @@ class ContainerManager(private val context: Context) {
             // FEX thunk ICD shim: bridges guest Vulkan loader → FEX thunks → host Vortek
             "libfex_thunk_icd.so" to File(fexRootfsDir, "usr/lib/x86_64-linux-gnu/libfex_thunk_icd.so"),
             "fex_thunk_icd.json" to File(fexRootfsDir, "usr/share/vulkan/icd.d/fex_thunk_icd.json"),
+            // 32-bit dummy ICD: makes Steam's CVulkanTopology check pass
+            "libvulkan_dummy_i386.so" to File(fexRootfsDir, "usr/lib/i386-linux-gnu/libvulkan_dummy_i386.so"),
+            "vulkan_dummy_i386.json" to File(fexRootfsDir, "usr/share/vulkan/icd.d/vulkan_dummy_i386.json"),
             // Vulkan loader test (debug tool)
             "test_vulkan_loader" to File(fexRootfsDir, "usr/local/bin/test_vulkan_loader")
         )
@@ -726,6 +729,11 @@ class ContainerManager(private val context: Context) {
         } catch (e: IOException) {
             Log.w(TAG, "Headless Vulkan wrapper install failed: ${e.message}")
         }
+
+        // Fix GE-Proton toolmanifest: remove require_tool_appid (SLR Sniper)
+        // Our FEX rootfs already provides all libraries SLR would provide.
+        // Without this fix, Steam silently refuses to launch games via rungameid.
+        setupSteamLinuxRuntime()
 
         // Deploy ARM64 native headless layer for the HOST Vulkan loader.
         // Wine's winevulkan.so calls the host ARM64 Vulkan loader via FEX thunks.
@@ -775,6 +783,85 @@ class ContainerManager(private val context: Context) {
     }
 }""")
         Log.i(TAG, "Host headless layer JSON: ${layerJsonFile.absolutePath} → $layerSoPath")
+    }
+
+    /**
+     * Set up fake Steam Linux Runtime (Sniper, AppID 1628350) so Steam's
+     * compat tool chain doesn't block game launch. GE-Proton's toolmanifest
+     * has require_tool_appid=1628350; without SLR installed, Steam silently
+     * refuses to launch games via steam://rungameid/.
+     *
+     * Also patches the GE-Proton toolmanifest to remove the dependency.
+     */
+    private fun setupSteamLinuxRuntime() {
+        try {
+            val steamAppsDir = File(fexRootfsDir, "home/user/.steam/debian-installation/steamapps")
+
+            // 1. Create fake appmanifest for SLR Sniper (1628350)
+            val slrManifest = File(steamAppsDir, "appmanifest_1628350.acf")
+            if (!slrManifest.exists()) {
+                slrManifest.writeText(""""AppState"
+{
+	"appid"		"1628350"
+	"Universe"		"1"
+	"name"		"Steam Linux Runtime 3.0 (sniper)"
+	"StateFlags"		"4"
+	"installdir"		"SteamLinuxRuntime_sniper"
+	"SizeOnDisk"		"0"
+	"buildid"		"0"
+	"LastOwner"		"0"
+	"BytesToDownload"		"0"
+	"BytesDownloaded"		"0"
+}
+""")
+                Log.i(TAG, "Created fake SLR appmanifest: ${slrManifest.absolutePath}")
+            }
+
+            // 2. Create minimal SLR directory with toolmanifest and run script
+            val slrDir = File(steamAppsDir, "common/SteamLinuxRuntime_sniper")
+            slrDir.mkdirs()
+
+            val slrToolManifest = File(slrDir, "toolmanifest.vdf")
+            if (!slrToolManifest.exists()) {
+                slrToolManifest.writeText(""""manifest"
+{
+  "version" "2"
+  "commandline" "/run %verb%"
+  "use_sessions" "1"
+  "compatmanager_layer_name" "container-runtime"
+}
+""")
+            }
+
+            // SLR's "run" script — just pass through to the next tool (Proton)
+            // On real Linux, this sets up the container. We don't need it.
+            val slrRun = File(slrDir, "run")
+            if (!slrRun.exists()) {
+                slrRun.writeText("""#!/bin/bash
+# Fake Steam Linux Runtime - pass through directly
+# Our FEX rootfs already provides all required libraries
+exec "${'$'}@"
+""")
+                slrRun.setExecutable(true)
+            }
+
+            // 3. Patch GE-Proton toolmanifest: remove require_tool_appid
+            val protonToolManifest = File(fexRootfsDir, "opt/proton-ge/toolmanifest.vdf")
+            if (protonToolManifest.exists()) {
+                val content = protonToolManifest.readText()
+                if (content.contains("require_tool_appid")) {
+                    val patched = content.lines()
+                        .filter { !it.contains("require_tool_appid") }
+                        .joinToString("\n")
+                    protonToolManifest.writeText(patched)
+                    Log.i(TAG, "Patched GE-Proton toolmanifest: removed require_tool_appid")
+                }
+            }
+
+            Log.i(TAG, "Steam Linux Runtime shim installed")
+        } catch (e: Exception) {
+            Log.w(TAG, "SLR setup failed: ${e.message}")
+        }
     }
 
     // ============================================================
