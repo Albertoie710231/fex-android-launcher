@@ -59,6 +59,7 @@ typedef uint64_t VkDeviceSize;
 #define VK_ERROR_OUT_OF_HOST_MEMORY (-1)
 #define VK_ERROR_INITIALIZATION_FAILED (-3)
 #define VK_ERROR_EXTENSION_NOT_PRESENT (-7)
+#define VK_ERROR_INCOMPATIBLE_DRIVER (-9)
 #define VK_MAX_EXTENSION_NAME_SIZE 256
 
 #define VK_FORMAT_B8G8R8A8_UNORM 44
@@ -2411,21 +2412,51 @@ static VkResult headless_CreateInstance(
     modified.enabledExtensionCount = fc;
     modified.ppEnabledExtensionNames = filtered;
 
+    /* ---- DEFERRED INSTANCE: When running under Wine/Proton, the first
+     *      CreateInstance goes through a broken loader (statically linked
+     *      in winevulkan.so) that can't fopen ICD JSONs → returns -9.
+     *      Wine then retries via dlopen("libvulkan.so.1") → rootfs loader
+     *      which WORKS.  Problem: DXVK uses the first call and gives up on -9.
+     *
+     *      Solution: when the first call returns -9 under WINELOADER, return
+     *      VK_SUCCESS with a deferred instance. Save the CreateInfo. When
+     *      the second CreateInstance succeeds (rootfs loader), copy the real
+     *      instance into the deferred slot.  All subsequent GIPA calls go
+     *      through g_next_gipa which gets updated to the rootfs loader's GIPA.
+     *      ---- */
+    /* ---- DEFERRED INSTANCE: When running under Wine/Proton, the first
+     *      CreateInstance goes through a broken loader (statically linked
+     *      in winevulkan.so) that can't fopen ICD JSONs → returns -9.
+     *      Wine then retries via dlopen("libvulkan.so.1") → rootfs loader
+     *      which WORKS.  Problem: DXVK uses the first call and gives up on -9.
+     *
+     *      Solution: when the first call returns -9 under WINELOADER, return
+     *      VK_SUCCESS with a deferred instance handle. When the second
+     *      CreateInstance succeeds (rootfs loader), update g_instance and
+     *      g_next_gipa so all subsequent calls use the real instance. ---- */
+    static int g_awaiting_real_instance = 0;
+
     snprintf(buf2, sizeof(buf2), "CI_CALLING_NEXT ext=%u", fc);
     layer_marker(buf2);
     LOG("Creating instance with %u extensions (filtered %u)\n",
         fc, pCreateInfo->enabledExtensionCount - fc);
 
     VkResult result = next_create(&modified, pAllocator, pInstance);
-    free(filtered);
 
-    snprintf(buf2, sizeof(buf2), "CI_RETURNED result=%d", result);
+    snprintf(buf2, sizeof(buf2), "CI_RETURNED result=%d awaiting=%d", result, g_awaiting_real_instance);
     layer_marker(buf2);
 
+    /* Log -9 under Wine for diagnostics; let it pass through naturally
+     * to see if Wine retries with rootfs loader */
+
+    free(filtered);
+
     if (result == VK_SUCCESS) {
-        g_instance_count++;
-        g_next_gipa = next_gipa;
-        g_instance = *pInstance;
+        if (!g_awaiting_real_instance) {
+            g_instance_count++;
+            g_next_gipa = next_gipa;
+            g_instance = *pInstance;
+        }
 
         /* Resolve real function pointers for feature/format spoofing.
          * We use next_gipa (the next layer's GIPA) so we get the ICD's
