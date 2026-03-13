@@ -487,12 +487,17 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
                 exit 1
             fi
 
-            export LD_LIBRARY_PATH="${'$'}STEAMDIR/linux64:${'$'}STEAMDIR/ubuntu12_64:${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
+            # Rootfs loader MUST come first — Steam Runtime bundles its own libvulkan.so.1.3.239
+            # which can't open our ICD JSON (different filesystem resolution under FEX)
+            export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu:${'$'}STEAMDIR/linux64:${'$'}STEAMDIR/ubuntu12_64:${'$'}STEAMDIR/ubuntu12_32:${'$'}STEAMDIR/ubuntu12_32/panorama:${'$'}{LD_LIBRARY_PATH:-}"
             export STEAMSCRIPT="${'$'}STEAMDIR/steam.sh"
 
-            # Both 64-bit (game) and 32-bit (Steam topology) ICDs
-            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:/usr/share/vulkan/icd.d/vulkan_dummy_i386.json"
+            # Both 64-bit (game/DXVK) and 32-bit (Steam client) ICDs
+            # Also include host ICD JSON at REAL Android path for FEX thunk's host-side
+            # Khronos loader (1.3.283) which can't read FEX overlay paths
+            export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:/usr/share/vulkan/icd.d/vulkan_dummy_i386.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
             export VK_DRIVER_FILES="${'$'}VK_ICD_FILENAMES"
+            export VK_LOADER_DEBUG=all
 
             # Proton/Wine env for when Steam spawns the game
             export STEAM_COMPAT_CLIENT_INSTALL_PATH="${'$'}HOME/.steam/steam"

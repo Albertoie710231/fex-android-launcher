@@ -759,13 +759,59 @@ static void wrapped_GetPhysicalDeviceFeatures2(void* physDev, void* pFeatures) {
 typedef VkResult (*PFN_vkCreateInstance)(const void*, const void*, void**);
 static PFN_vkCreateInstance real_create_instance = NULL;
 
+/* Worker thread for CreateInstance — avoids FEX thunk hang when called
+ * from within Wine's embedded Vulkan loader context */
+struct ci_args {
+    PFN_vkCreateInstance fn;
+    const void* pCreateInfo;
+    const void* pAllocator;
+    void** pInstance;
+    VkResult result;
+};
+
+static void* ci_thread_func(void* arg) {
+    struct ci_args* a = (struct ci_args*)arg;
+    a->result = a->fn(a->pCreateInfo, a->pAllocator, a->pInstance);
+    return NULL;
+}
+
 static VkResult wrapped_CreateInstance(const void* pCreateInfo,
                                        const void* pAllocator, void** pInstance) {
-    if (!real_create_instance) return -3;
-    VkResult res = real_create_instance(pCreateInfo, pAllocator, pInstance);
+    LOG("CreateInstance ENTER: real_create_instance=%p pCreateInfo=%p\n",
+        (void*)real_create_instance, pCreateInfo);
+    if (!real_create_instance) {
+        LOG("CreateInstance ABORT: real_create_instance is NULL!\n");
+        return -3;
+    }
+
+    /* Call real_create_instance from a separate thread to avoid FEX thunk
+     * hanging when called from within Wine's embedded Vulkan loader context.
+     * The loader may hold locks or create a context that blocks the thunk. */
+    struct ci_args args = {
+        .fn = real_create_instance,
+        .pCreateInfo = pCreateInfo,
+        .pAllocator = pAllocator,
+        .pInstance = pInstance,
+        .result = -3
+    };
+
+    pthread_t tid;
+    LOG("CreateInstance: spawning worker thread...\n");
+    if (pthread_create(&tid, NULL, ci_thread_func, &args) == 0) {
+        pthread_join(tid, NULL);
+        LOG("CreateInstance: worker returned %d\n", args.result);
+    } else {
+        LOG("CreateInstance: pthread_create failed, calling directly...\n");
+        args.result = real_create_instance(pCreateInfo, pAllocator, pInstance);
+        LOG("CreateInstance: direct returned %d\n", args.result);
+    }
+
+    VkResult res = args.result;
     if (res == 0 && pInstance && *pInstance) {
         saved_instance = *pInstance;
         LOG("CreateInstance OK: instance=%p\n", *pInstance);
+    } else {
+        LOG("CreateInstance FAIL: result=%d\n", res);
     }
     return res;
 }
@@ -6914,6 +6960,35 @@ static VkResult wrapped_EnumerateDeviceExtensionProperties(
     return 0;
 }
 
+/* ==== vkEnumerateInstanceVersion ==== */
+
+/* The x86-64 Vulkan loader calls GIPA(NULL, "vkEnumerateInstanceVersion") during
+ * ICD scanning. If this returns NULL, the loader assumes the ICD only supports
+ * Vulkan 1.0.  When an app (e.g. DXVK) then requests apiVersion >= 1.1, the
+ * loader returns VK_ERROR_INCOMPATIBLE_DRIVER (-9) without ever calling the
+ * ICD's vkCreateInstance.
+ *
+ * Fix: report Vulkan 1.3 (matching Vortek/Mali) so the loader accepts 1.1+ requests. */
+static VkResult wrapped_EnumerateInstanceVersion(uint32_t *pApiVersion) {
+    if (!pApiVersion) return -3;  /* VK_ERROR_INITIALIZATION_FAILED */
+    /* Try to get real version from Vortek via thunk */
+    if (real_gipa) {
+        typedef VkResult (*PFN_EIV)(uint32_t*);
+        PFN_EIV real_eiv = (PFN_EIV)real_gipa(NULL, "vkEnumerateInstanceVersion");
+        if (real_eiv) {
+            VkResult res = real_eiv(pApiVersion);
+            LOG("EnumerateInstanceVersion: real=%u.%u.%u (0x%x)\n",
+                (*pApiVersion >> 22) & 0x7F, (*pApiVersion >> 12) & 0x3FF,
+                *pApiVersion & 0xFFF, *pApiVersion);
+            return res;
+        }
+    }
+    /* Fallback: report 1.3.0 */
+    *pApiVersion = (1u << 22) | (3u << 12);  /* VK_API_VERSION_1_3 */
+    LOG("EnumerateInstanceVersion: fallback 1.3.0\n");
+    return 0;  /* VK_SUCCESS */
+}
+
 /* ==== ICD entry points ==== */
 
 __attribute__((visibility("default")))
@@ -6929,8 +7004,18 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(void *instance, const char *pName) 
     ensure_init();
     if (!real_gipa || !pName) return NULL;
 
+    /* Log all pre-instance (NULL) GIPA calls to diagnose loader behavior */
+    if (!instance) {
+        LOG("GIPA(NULL, \"%s\")\n", pName);
+    }
+
+    if (strcmp(pName, "vkEnumerateInstanceVersion") == 0) {
+        return (PFN_vkVoidFunction)wrapped_EnumerateInstanceVersion;
+    }
     if (strcmp(pName, "vkCreateInstance") == 0) {
         real_create_instance = (PFN_vkCreateInstance)real_gipa(instance, pName);
+        LOG("GIPA: vkCreateInstance -> wrapped=%p real=%p\n",
+            (void*)wrapped_CreateInstance, (void*)real_create_instance);
         return (PFN_vkVoidFunction)wrapped_CreateInstance;
     }
     if (strcmp(pName, "vkDestroyInstance") == 0) {
