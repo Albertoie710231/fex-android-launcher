@@ -392,14 +392,52 @@ class TerminalActivity : AppCompatActivity() {
         }
 
         // Launch Sekiro via steam://rungameid/ — Steam handles DRM + Proton
+        // Pre-downloads AppID 228980 (Steamworks Common Redistributables) natively
+        // to avoid FEX filesystem overlay issues with Steam's download pipeline
         findViewById<Button>(R.id.btnLaunchSekiro).setOnClickListener {
             ensureX11()
             showLoginDialog("Sekiro — Steam Login") { loginArgs ->
                 if (!isDisplayMode) toggleDisplayMode()
-                executeCommand(protonManager.getSteamRunGameCommand(
-                    loginArgs = loginArgs,
-                    appId = "814380"
-                ))
+
+                val parts = loginArgs.trim().split("\\s+".toRegex(), limit = 2)
+                val user = parts.getOrElse(0) { "" }
+                val pass = parts.getOrElse(1) { "" }
+
+                val downloader = app.contentDownloader
+
+                // Check if 228980 already downloaded
+                if (downloader.isAppInstalled(228980)) {
+                    appendOutput("[228980 already installed, launching Sekiro]\n")
+                    executeCommand(protonManager.getSteamRunGameCommand(
+                        loginArgs = loginArgs,
+                        appId = "814380"
+                    ))
+                    return@showLoginDialog
+                }
+
+                appendOutput("[Pre-downloading AppID 228980 via JavaSteam...]\n")
+                val authenticator = DialogAuthenticator(this@TerminalActivity, handler)
+                downloader.onProgress = { msg -> handler.post { appendOutput("[DL] $msg\n") } }
+                downloader.onError = { msg -> handler.post { appendOutput("[DL ERROR] $msg\n") } }
+                downloader.onComplete = {
+                    handler.post {
+                        appendOutput("[228980 download complete, launching Sekiro]\n")
+                        executeCommand(protonManager.getSteamRunGameCommand(
+                            loginArgs = loginArgs,
+                            appId = "814380"
+                        ))
+                    }
+                }
+
+                scope.launch {
+                    downloader.downloadApp(
+                        appId = 228980,
+                        installDir = "Steamworks Shared",
+                        username = user,
+                        password = pass,
+                        authenticator = authenticator
+                    )
+                }
             }
         }
     }

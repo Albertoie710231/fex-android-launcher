@@ -97,6 +97,17 @@ dependencies {
     implementation("org.tukaani:xz:1.9")  // XZ compression support for commons-compress
     implementation("com.github.luben:zstd-jni:1.5.5-11")  // Zstd compression support
 
+    // JavaSteam — native Steam protocol client for depot downloading
+    implementation("io.github.joshuatam:javasteam:1.8.0-11-SNAPSHOT") {
+        isChanging = true
+    }
+    implementation("io.github.joshuatam:javasteam-depotdownloader:1.8.0-11-SNAPSHOT") {
+        isChanging = true
+    }
+    implementation("com.google.protobuf:protobuf-java:4.31.1")
+    implementation("org.apache.commons:commons-lang3:3.17.0")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")  // Required by JavaSteam CryptoHelper
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")

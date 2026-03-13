@@ -522,6 +522,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
 
             # FEX performance (TSO off = 6x speedup)
             export FEX_TSOMODE=0
+            export FEX_SILENTLOG=1
 
             # Ensure 64-bit steamclient.so is available
             if [ -f "${'$'}STEAMDIR/linux64/steamclient.so" ] && [ ! -f "${'$'}STEAMDIR/ubuntu12_64/steamclient.so" ]; then
@@ -598,8 +599,22 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
                     -nobootstrapupdate -skipstreamingdrivers \
                     -nofriendsui -nochatui -vrdisable -silent
             else
+                # Phase 1.5 removed — 228980 is now pre-downloaded natively via JavaSteam
+                # before this shell script runs. No need to wait for Steam's download pipeline.
+
+                # Small settle time after login
+                sleep 3
+
                 # Phase 2: Send URL via pipe — how Linux protocol handler works
                 echo "=== Phase 2: Sending steam://rungameid/$appId via pipe ==="
+
+                # Kill webhelper to free memory BEFORE game launch
+                # Main Steam process handles URL dispatch — webhelper only needed for UI
+                echo "Killing steamwebhelper to free memory..."
+                pkill -f steamwebhelper 2>/dev/null
+                sleep 3
+                echo "Webhelper killed. Sending URL..."
+
                 # Write URL to pipe (this is what the second steam instance does)
                 echo "steam://rungameid/$appId" > "${'$'}PIPE_PATH" &
                 PIPE_WRITE_PID=${'$'}!

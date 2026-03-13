@@ -124,9 +124,10 @@ class GameActivity : AppCompatActivity() {
 
         // Set up the MainActivity stub with our LorieView
         // Native libXlorie code looks for MainActivity.getInstance().lorieView
-        com.termux.x11.MainActivity.instance = com.termux.x11.MainActivity()
-        com.termux.x11.MainActivity.setLorieView(lorieView)
-        com.termux.x11.MainActivity.win = window
+        // TODO: termux x11 integration disabled (library not present)
+        // com.termux.x11.MainActivity.instance = com.termux.x11.MainActivity()
+        // com.termux.x11.MainActivity.setLorieView(lorieView)
+        // com.termux.x11.MainActivity.win = window
         Log.i(TAG, "MainActivity stub configured with LorieView")
 
         // Set up surface ready callback to notify service when we're ready to render

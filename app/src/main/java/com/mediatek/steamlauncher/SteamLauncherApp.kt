@@ -25,6 +25,7 @@ class SteamLauncherApp : Application() {
     val containerManager: ContainerManager by lazy { ContainerManager(this) }
     val fexExecutor: FexExecutor by lazy { FexExecutor(this) }
     val protonManager: ProtonManager by lazy { ProtonManager(this) }
+    val contentDownloader: SteamContentDownloader by lazy { SteamContentDownloader(this) }
 
     override fun onCreate() {
         super.onCreate()
