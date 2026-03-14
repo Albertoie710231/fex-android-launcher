@@ -544,6 +544,36 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             rm -f "${'$'}HOME/.steam/steam.pid" 2>/dev/null
             rm -f "${'$'}HOME/.steam/steam.pipe" 2>/dev/null
 
+            # Replace steam-launch-wrapper with a script that exec's the game directly.
+            # The real wrapper uses systemd D-Bus (unavailable on Android) for process tracking,
+            # and the 32-bit reaper can't run (missing /lib/i386-linux-gnu/ld-linux.so.2).
+            # Without this fix, Steam loses the game PID instantly.
+            SLW="${'$'}STEAMDIR/ubuntu12_32/steam-launch-wrapper"
+            if file "${'$'}SLW" 2>/dev/null | grep -q "ELF"; then
+                mv "${'$'}SLW" "${'$'}SLW.orig" 2>/dev/null
+            fi
+            # Deploy compiled x86-64 SLW binary (from assets)
+            # Static ELF avoids shebang/interpreter re-exec issues under FEX's sh -c chain
+            if [ -f /tmp/steam-launch-wrapper-elf ]; then
+                cp /tmp/steam-launch-wrapper-elf "${'$'}SLW"
+                chmod +x "${'$'}SLW"
+                echo "Deployed compiled SLW binary"
+            else
+                # Fallback: minimal shell script
+                cat > "${'$'}SLW" << 'SLWEOF'
+#!/bin/sh
+_L=/tmp/slw_debug.log
+echo "SLW-sh pid=${'$'}${'$'}" >> "${'$'}_L"
+i=0; for a in "${'$'}@"; do if [ "${'$'}a" = "--" ]; then i=${'$'}((i+1)); fi; done
+set -- "${'$'}@"; while [ ${'$'}# -gt 0 ]; do [ "${'$'}1" = "--" ] && shift && break; shift; done
+while [ ${'$'}# -gt 0 ]; do [ "${'$'}1" = "--" ] && shift && break; shift; done
+echo "EXEC: ${'$'}*" >> "${'$'}_L"
+exec "${'$'}@"
+SLWEOF
+                chmod +x "${'$'}SLW"
+                echo "Deployed shell SLW (compiled binary not found at /tmp/steam-launch-wrapper-elf)"
+            fi
+
             LOGFILE=/tmp/steam_rungame.log
             CONN_LOG="${'$'}STEAMDIR/logs/connection_log.txt"
             PIPE_PATH="${'$'}HOME/.steam/steam.pipe"
