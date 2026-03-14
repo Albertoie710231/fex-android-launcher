@@ -481,6 +481,12 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export HOME=/home/user
             export DBUS_SESSION_BUS_ADDRESS=disabled
 
+            # Force software OpenGL for Steam's UI — it needs to render
+            # (via llvmpipe/swrast) to proceed with game launches.
+            # Our Vulkan headless layer captures game frames separately.
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+
             STEAMDIR="${'$'}HOME/.steam/steam"
             if [ ! -x "${'$'}STEAMDIR/ubuntu12_32/steam" ]; then
                 echo "ERROR: Steam client not found at ${'$'}STEAMDIR/ubuntu12_32/steam"
@@ -555,10 +561,12 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             echo "=== Phase 1: Starting Steam (login only) ==="
 
             # Launch Steam in background — login only, no URL yet
+            # Don't use -silent: Steam needs to initialize its UI pipeline
+            # to be able to launch games (even if we don't display it)
             bash steam.sh $loginFlag \
                 -noreactlogin -no-cef-sandbox -noverifyfiles \
                 -nobootstrapupdate -skipstreamingdrivers \
-                -nofriendsui -nochatui -vrdisable -silent &
+                -nofriendsui -nochatui -vrdisable &
             STEAM_SH_PID=${'$'}!
 
             # Wait for FRESH "Logged On" + pipe + JS stores ready
@@ -602,7 +610,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
                 bash steam.sh $loginFlag steam://rungameid/$appId \
                     -noreactlogin -no-cef-sandbox -noverifyfiles \
                     -nobootstrapupdate -skipstreamingdrivers \
-                    -nofriendsui -nochatui -vrdisable -silent
+                    -nofriendsui -nochatui -vrdisable
             else
                 # Phase 1.5 removed — 228980 is now pre-downloaded natively via JavaSteam
                 # before this shell script runs. No need to wait for Steam's download pipeline.
@@ -699,7 +707,7 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
         } else ""
         val exeDir = File(exePath).parent ?: "/home/user/games"
         val effectiveDllOverrides = dllOverrides
-            ?: "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;d3dx11_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
+            ?: "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;d3dx11_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=n;d3d12core=n;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
 
         return """
             export DISPLAY=:0
