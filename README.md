@@ -5,16 +5,14 @@ Run Windows/Steam games on Android via x86-64 emulation with GPU-accelerated Vul
 ## Architecture
 
 ```
-Windows Game (.exe)
-  → Wine/Proton-GE 10-30 (Windows compatibility layer)
-    → DXVK 2.6+ (DirectX 11 → Vulkan translation)
-      → winevulkan (Wine's Vulkan dispatch)
-        → x86-64 Ubuntu Vulkan loader (v1.3.204)
-          → Implicit Layer: VK_LAYER_HEADLESS_surface (surfaces, swapchain, frame capture)
-            → ICD: fex_thunk_icd.so (x86-64 shim, feature spoofing, handle wrapping)
-              → FEX-Emu thunks (x86-64 → ARM64 bridge)
-                → Vortek (glibc↔Bionic IPC, Vulkan command serialization)
-                  → Mali-G720 Immortalis MC12 GPU
+Android App (Kotlin)
+  -> FEX-Emu (x86-64 -> ARM64 JIT)
+    -> Ubuntu 22.04 rootfs overlay
+      -> Steam Client (native Linux x86-64)
+      -> Wine/Proton-GE 10-30 (Windows compatibility)
+        -> DXVK 2.6+ (DirectX 11 -> Vulkan)
+        -> vkd3d-proton (DirectX 12 -> Vulkan)
+          -> Vulkan ICD chain -> Vortek -> Mali GPU
 ```
 
 ### Display Pipeline
@@ -23,48 +21,50 @@ Two separate pipelines work together for Wine/DXVK games:
 
 | Pipeline | Purpose | Transport | Renderer |
 |----------|---------|-----------|----------|
-| **Vulkan/3D** | Game frames (DXVK) | Headless layer → TCP 19850 | FrameSocketServer → SurfaceView |
-| **X11** | Window management, input, 2D | libXlorie (ARM64 native) → abstract socket | LorieView |
+| **Vulkan/3D** | Game frames (DXVK) | Headless layer -> shared memory (`/tmp/headless_frames`) | FrameShmReader -> SurfaceView |
+| **X11** | Window management, input, 2D | libXlorie (ARM64 native) -> abstract socket | LorieView |
 
-### Dual-Loader Architecture
+### Vulkan Loader Chain
+
+```
+DXVK (PE) -> vulkan-1.dll (PE) -> winevulkan.so (Unix)
+  -> dlopen("libvulkan.so.1") -> rootfs loader 1.3.204
+  -> headless layer (surfaces, swapchain, frame capture)
+  -> fex_thunk_icd.so (handle wrappers, features, barriers)
+  -> libvulkan-guest.so (FEX thunk)
+  -> host-side Khronos loader 1.3.283
+  -> vortek_host_icd.json -> libvortek_icd_wrapper.so -> Vortek -> Mali GPU
+```
 
 Vulkan thunks are **disabled** for Wine (`"Vulkan": 0` in thunks.json). This forces Wine's
 `dlopen("libvulkan.so.1")` to load the real x86-64 Ubuntu Vulkan loader (not the FEX thunk
 overlay). The x86-64 loader supports `VK_KHR_xlib_surface` (compiled-in), which the ARM64
-host loader filters out at compile time (`wsi_unsupported_instance_extension()` in
-`Vulkan-Loader/loader/wsi.c`). No environment variable can bypass this ARM64 filter.
+host loader filters out at compile time.
 
 ## What Works
 
 - **Full x86-64 emulation** via FEX-Emu (FEX-2601, Ubuntu 22.04 rootfs)
-- **Vulkan GPU passthrough** — vkcube at 118 FPS via FEX thunks → Vortek → Mali
-- **32-bit Vulkan** — verified via test_vulkan32 (4 extensions)
-- **Wine/Proton-GE 10-30** — boots with 15+ processes, services running
-- **Wine Vulkan test** — all 7 stages pass (including multi-threaded ACB)
-- **DXVK initialization** — device creation, pipeline compilation, 55k+ queue submits
-- **Game rendering on-screen** — Ys IX menu visible at ~10 FPS (FEX emulation speed)
-- **Frame capture pipeline** — headless layer → TCP → FrameSocketServer → SurfaceView
-- **X11 windowing** — libXlorie handles text overlays, 2D UI, input
-- **Live display** — 1:1 frame delivery via lockHardwareCanvas, R↔B swizzle, alpha=255 fix
+- **Vulkan GPU passthrough** -- vkcube at 118 FPS via FEX thunks -> Vortek -> Mali
+- **32-bit Vulkan** -- verified via test_vulkan32 (4 extensions)
+- **Wine/Proton-GE 10-30** -- boots with 15+ processes, services running
+- **Wine Vulkan test** -- all 7 stages pass (including multi-threaded ACB)
+- **DXVK initialization** -- device creation, pipeline compilation, 55k+ queue submits
+- **Game rendering on-screen** -- Ys IX menu at **60 FPS** (with TSO disabled)
+- **Frame capture pipeline** -- headless layer -> shared memory -> FrameShmReader -> SurfaceView
+- **X11 windowing** -- libXlorie handles text overlays, 2D UI, input
+- **Steam login & DRM** -- Steam client authenticates, DRM passes (RE4 Denuvo verified)
+- **Steam rungameid pipeline** -- full launch pipeline works for RE4 and Sekiro
+- **JavaSteam depot downloader** -- native ARM64 228980 pre-download (no FEX needed)
 - **dpkg/apt** inside rootfs (overlay filesystem + linkat fallback)
 - **Interactive terminal** with Display/Terminal toggle
 
-## Current Status: Exploded Vertices
+## Games Tested
 
-The game menu (Ys IX) renders with scattered/exploded white triangles. Text overlays
-render correctly (2D path works). 3D mesh geometry has wrong vertex positions.
-
-**Ruled out** (tested, no improvement):
-- BC format substitution vs passthrough — identical result either way
-- Dynamic rendering (Vulkan 1.3) — DXVK hard-requires it
-- Maintenance5 / inline shaders — DXVK hard-requires it
-- Vulkan 1.2 API cap — breaks DXVK entirely
-
-**Likely causes**:
-- robustness2 spoofing (OOB reads returning garbage instead of 0 on Mali)
-- Vertex/index buffer handle unwrapping in Cmd intercepts
-- Push constant or descriptor set data corruption through thunk/IPC chain
-- Vortek vertex input format handling
+| Game | Status | Notes |
+|------|--------|-------|
+| **Ys IX** | Renders at 60 FPS | Menu renders on-screen, exploded vertices issue under investigation |
+| **RE4 Remake** (DX12) | Full Steam launch pipeline works | DRM authenticates via running Steam client. Game exits in ~1s (reaper tracking) |
+| **Sekiro** | Full Steam launch pipeline works | Game checks for Steam client IPC independently of steam_api64.dll. Shows "Steam Error" MessageBox on device |
 
 ## Components
 
@@ -75,16 +75,20 @@ render correctly (2D path works). 3D mesh geometry has wrong vertex positions.
 | `FexExecutor.kt` | ld.so wrapper, FEXServer lifecycle, FEX config env vars |
 | `ContainerManager.kt` | Rootfs download/setup, ICD JSON, headless layer deploy |
 | `ProtonManager.kt` | Proton-GE download/extract, Wine env, DXVK config, game launch |
-| `TerminalActivity.kt` | VortekRenderer, FrameSocketServer, X11Server (libXlorie) |
-| `FrameSocketServer.kt` | TCP frame receiver, R↔B swizzle, alpha=255 fix, direct rendering |
+| `TerminalActivity.kt` | VortekRenderer, FrameShmReader, X11Server (libXlorie), game buttons |
+| `SteamContentDownloader.kt` | JavaSteam native depot downloader (228980 pre-download) |
+| `FrameShmReader.kt` | Shared memory frame reader (polls /tmp/headless_frames at 8ms) |
+| `FrameSocketServer.kt` | TCP frame receiver (legacy fallback) |
 
 ### x86-64 Vulkan Components
 
 | File | Role |
 |------|------|
-| `fex-emu/fex_thunk_icd.c` | ICD shim: handle wrappers, barrier v2→v1, feature spoofing, inline shader fixup, BC passthrough, cmd tracing |
-| `app/src/main/assets/vulkan_headless_layer.c` | Implicit layer: surfaces, swapchain, frame capture → TCP 19850 |
+| `fex-emu/fex_thunk_icd.c` | ICD shim: handle wrappers, barrier v2->v1, feature spoofing, inline shader fixup, BC passthrough, cmd tracing |
+| `app/src/main/assets/vulkan_headless_layer.c` | Implicit layer: surfaces, swapchain, frame capture -> shared memory |
 | `fex-emu/test_wine_vulkan.c` | 7-stage Wine Vulkan pipeline validation test |
+| `fex-emu/steamwebhelper/` | SDL3, libdecor, pipewire stubs for steamwebhelper |
+| `fex-emu/steam_api64_stub.c` | Native PE stub for steam_api64.dll (30+ exports, watchdog) |
 
 ### Native Libraries (ARM64, in `jniLibs/arm64-v8a/`)
 
@@ -96,6 +100,25 @@ render correctly (2D path works). 3D mesh geometry has wrong vertex positions.
 | `libvulkan-host.so` | FEX host Vulkan thunk (ARM64, for DT_NEEDED intercept path) |
 | `libFEX.so` | FEX-Emu x86-64 emulator (custom build FEX-2601) |
 | `libXlorie.so` | Termux:X11 native X server |
+
+## Steam Game Launch Pipeline
+
+Games are launched via `steam://rungameid/<appid>`:
+
+```
+UnlockingH264 -> CheckShaderDepotManifest -> ProcessingInstallScript
+  -> SynchronizingCloud -> SynchronizingStats -> ShowInterstitials
+  -> ProcessingShaderCache -> SiteLicenseSeatCheckout -> DelayLaunch
+  -> CreatingProcess -> Game process spawned
+```
+
+### Prerequisites for rungameid
+
+1. **AppID 228980** (Steamworks Common Redistributables) must be installed with valid manifest (`StateFlags "4"`, real `buildid`, populated `InstalledDepots`). The app pre-downloads this via JavaSteam.
+2. **Game files** must be in `~/.steam/debian-installation/steamapps/common/` (NOT via symlink -- FEX overlay can't read/write through symlinks for Steam's staging/validation).
+3. **EULA** must be pre-accepted for games that require it (add `"<appid>_eula_0" "2"` to `localconfig.vdf`).
+4. **Software OpenGL** for Steam UI (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`).
+5. **No `-silent` flag** -- Steam must initialize UI pipeline to launch games.
 
 ## Building
 
@@ -113,7 +136,7 @@ cp fex_thunk_icd.so ../app/src/main/assets/libfex_thunk_icd_x86_64.so
 ### Headless Layer
 
 ```bash
-# Must use Ubuntu 22.04 toolchain (glibc ≤2.35)
+# Must use Ubuntu 22.04 toolchain (glibc <=2.35)
 docker run --rm -v "$(pwd)/app/src/main/assets:/work" ubuntu:22.04 bash -c "
     apt-get update -qq &&
     apt-get install -y -qq gcc-x86-64-linux-gnu > /dev/null 2>&1 &&
@@ -130,6 +153,11 @@ docker run --rm -v "$(pwd)/app/src/main/assets:/work" ubuntu:22.04 bash -c "
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+## PC Test Scripts
+
+- `test_re4.sh` -- Compare RE4 DRM/steam_api behavior between PC and device
+- `test_sekiro.sh` -- Test Sekiro rungameid launch on PC
 
 ## ICD Feature Summary (fex_thunk_icd.c)
 
@@ -162,7 +190,7 @@ race conditions with Wine's multi-threaded dispatch. All Cmd functions unwrap vi
 - **Inline shader conversion**: DXVK embeds `VkShaderModuleCreateInfo` inline in pipeline
   stages when maintenance5 is available. ICD creates real `VkShaderModule` objects and strips
   `VkPipelineCreateFlags2CreateInfoKHR` from pNext.
-- **CmdPipelineBarrier2→v1**: DXVK uses v2 (Vulkan 1.3); FEX thunks only support v1. ICD
+- **CmdPipelineBarrier2->v1**: DXVK uses v2 (Vulkan 1.3); FEX thunks only support v1. ICD
   converts barrier structs on the fly.
 - **QueueSubmit2 handle unwrapping**: Unwraps queue + command buffer HandleWrappers.
 - **BC format passthrough**: Vortek handles BCn textures natively.
@@ -177,6 +205,17 @@ Mali reports a single large DEVICE_LOCAL heap. ICD splits into:
 DXVK creates D1 (feature level 11_1 probe, destroyed) then D2 (real rendering). The ICD
 shares a single real VkDevice across both CreateDevice calls (refcounted), avoiding
 DEVICE_LOST from dual-device HOST state corruption.
+
+## FEX Performance Tuning
+
+| Setting | Effect |
+|---------|--------|
+| `TSOEnabled=0` | **THE key optimization.** 10 -> 60 FPS (6x). Removes x86 memory ordering barriers |
+| `VectorTSOEnabled=0` | No barriers on SSE/AVX |
+| `MemcpySetTSOEnabled=0` | No barriers on REP MOVS/STOS |
+| `SilentLog=1` | Suppress FEX log I/O overhead |
+| `X87ReducedPrecision=1` | 64-bit instead of 80-bit x87 |
+| `Multiblock=1, MaxInst=5000` | Multi-block JIT, large blocks |
 
 ## Debugging
 
@@ -207,6 +246,11 @@ FEXServer must be running (launch app first). See `gotchas.md` for the full temp
 | DEVICE_LOST from shared device | Refcounted single VkDevice, reject second CreateDevice |
 | Xvnc/Xvfb crash in FEX | Use libXlorie (ARM64 native X11 server) |
 | Stale paths after APK install | `refreshNativeLibPaths()` auto-updates on launch |
+| Steam 228980 dependency broken | JavaSteam native downloader + real manifest from PC |
+| Steam EULA blocks invisible launch | Pre-accept via localconfig.vdf entry |
+| Symlinks in steamapps don't work | Move game files directly into debian-installation path |
+| Steam needs OpenGL for UI | Force llvmpipe via LIBGL_ALWAYS_SOFTWARE=1 |
+| VK_ERROR_INCOMPATIBLE_DRIVER (-9) | Add vortek_host_icd.json (real path) to VK_ICD_FILENAMES |
 
 ## First Run Setup
 
@@ -220,11 +264,13 @@ FEXServer must be running (launch app first). See `gotchas.md` for the full temp
 ```
 app/src/main/
 ├── java/com/mediatek/steamlauncher/
-│   ├── TerminalActivity.kt         # Terminal + Display, Vortek, X11
+│   ├── TerminalActivity.kt         # Terminal + Display, Vortek, X11, game buttons
 │   ├── ContainerManager.kt         # Rootfs setup, ICD/layer deploy
 │   ├── FexExecutor.kt              # FEX invocation, env vars
-│   ├── ProtonManager.kt            # Wine/Proton, DXVK config
-│   ├── FrameSocketServer.kt        # TCP frame receiver, rendering
+│   ├── ProtonManager.kt            # Wine/Proton, DXVK config, game launch
+│   ├── SteamContentDownloader.kt   # JavaSteam depot downloader (228980)
+│   ├── FrameShmReader.kt           # Shared memory frame reader
+│   ├── FrameSocketServer.kt        # TCP frame receiver (legacy)
 │   └── ...
 ├── assets/
 │   ├── vulkan_headless_layer.c     # x86-64 headless layer source
@@ -235,9 +281,14 @@ app/src/main/
 
 fex-emu/
 ├── fex_thunk_icd.c                 # ICD shim source (main Vulkan interception)
+├── steam_api64_stub.c              # Native PE steam_api64.dll stub
 ├── test_wine_vulkan.c              # 7-stage Wine Vulkan test
+├── steamwebhelper/                 # SDL3, libdecor, pipewire stubs
 ├── build_fex_thunks.sh             # Docker FEX build
 └── Vulkan-Loader/                  # Loader source (reference)
+
+test_re4.sh                         # PC test: RE4 DRM behavior comparison
+test_sekiro.sh                      # PC test: Sekiro rungameid launch
 ```
 
 ## Device
