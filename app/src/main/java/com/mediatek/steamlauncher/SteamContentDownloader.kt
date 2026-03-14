@@ -138,7 +138,7 @@ class SteamContentDownloader(private val context: Context) {
 
     private fun getSteamappsDir(): String {
         val app = SteamLauncherApp.instance
-        return "${app.getFexRootfsDir()}/home/user/Steam/steamapps"
+        return "${app.getFexRootfsDir()}/home/user/.steam/debian-installation/steamapps"
     }
 
     // ---- Connection ----
@@ -370,10 +370,12 @@ class SteamContentDownloader(private val context: Context) {
         val installPath = "$steamappsDir/common/$installDir"
         notify("Install path: $installPath")
 
-        // 228980 depot 228981 must be specified explicitly — it's a "tool" app
-        // whose depots aren't auto-discovered by the standard depot enumeration
+        // 228980 depots must be specified explicitly — it's a "tool" app
+        // whose depots aren't auto-discovered by the standard depot enumeration.
+        // Both 228981 (main) and 228983 (additional redists) are needed — Steam
+        // blocks game launches if 228983 is missing/incomplete.
         val depotIds = when (appId) {
-            228980 -> listOf(228981)
+            228980 -> listOf(228981, 228983)
             else -> emptyList()
         }
         val appItem = AppItem(

@@ -376,18 +376,53 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
-        // Launch RE4: Steam in background + Wine/Proton
+        // Launch RE4 via steam://rungameid/ — Steam handles DRM + Proton
+        // Pre-downloads AppID 228980 (Steamworks Common Redistributables) natively
+        // to avoid FEX filesystem overlay issues with Steam's download pipeline
         findViewById<Button>(R.id.btnLaunchRE4).setOnClickListener {
             ensureX11()
             showLoginDialog("RE4 — Steam Login") { loginArgs ->
                 if (!isDisplayMode) toggleDisplayMode()
-                executeCommand(protonManager.getLaunchCommand(
-                    exePath = "/home/user/Steam/steamapps/common/RESIDENT EVIL 4  BIOHAZARD RE4/re4.exe",
-                    steamAppId = "2050650",
-                    dllOverrides = "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=n;d3d12core=n;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d",
-                    useVirtualDesktop = false,
-                    loginArgs = loginArgs
-                ))
+
+                val parts = loginArgs.trim().split("\\s+".toRegex(), limit = 2)
+                val user = parts.getOrElse(0) { "" }
+                val pass = parts.getOrElse(1) { "" }
+
+                val downloader = app.contentDownloader
+
+                // Check if 228980 already downloaded
+                if (downloader.isAppInstalled(228980)) {
+                    appendOutput("[228980 already installed, launching RE4]\n")
+                    executeCommand(protonManager.getSteamRunGameCommand(
+                        loginArgs = loginArgs,
+                        appId = "2050650"
+                    ))
+                    return@showLoginDialog
+                }
+
+                appendOutput("[Pre-downloading AppID 228980 via JavaSteam...]\n")
+                val authenticator = DialogAuthenticator(this@TerminalActivity, handler)
+                downloader.onProgress = { msg -> handler.post { appendOutput("[DL] $msg\n") } }
+                downloader.onError = { msg -> handler.post { appendOutput("[DL ERROR] $msg\n") } }
+                downloader.onComplete = {
+                    handler.post {
+                        appendOutput("[228980 download complete, launching RE4]\n")
+                        executeCommand(protonManager.getSteamRunGameCommand(
+                            loginArgs = loginArgs,
+                            appId = "2050650"
+                        ))
+                    }
+                }
+
+                scope.launch {
+                    downloader.downloadApp(
+                        appId = 228980,
+                        installDir = "Steamworks Shared",
+                        username = user,
+                        password = pass,
+                        authenticator = authenticator
+                    )
+                }
             }
         }
 
