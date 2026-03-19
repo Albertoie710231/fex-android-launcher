@@ -22,7 +22,8 @@ class VmManager(private val context: Context) {
         private const val VORTEK_TCP_PORT = 5900
     }
 
-    private var qemuProcess: Process? = null
+    var qemuProcess: Process? = null
+        private set
     private var proxyProcess: Process? = null
 
     private fun getQemuPath(): String {
@@ -59,6 +60,9 @@ class VmManager(private val context: Context) {
         outputCallback("Kernel: $kernelPath\n")
         outputCallback("Initrd: $initrdPath\n")
 
+        // Kill any old proxy/QEMU from previous runs
+        killOldProcesses()
+
         // Start Vortek TCP proxy (TCP 5900 → Vortek Unix socket)
         startVortekProxy(outputCallback)
 
@@ -68,9 +72,10 @@ class VmManager(private val context: Context) {
             val cmd = listOf(
                 qemuPath,
                 "-machine", "virt",
+                "-accel", "tcg,thread=multi",
                 "-cpu", "max",
-                "-m", "2048",
-                "-smp", "4",
+                "-m", "4096",
+                "-smp", "8",
                 "-nographic",
                 "-nodefaults",
                 "-serial", "stdio",
@@ -99,14 +104,25 @@ class VmManager(private val context: Context) {
                 try {
                     val reader = BufferedReader(InputStreamReader(process.inputStream))
                     var line: String?
+                    var shellReady = false
                     while (reader.readLine().also { line = it } != null) {
-                        val l = line
-                        outputCallback("[VM] $l\n")
+                        val l = stripAnsiEscapes(line ?: "")
+                        if (!shellReady) {
+                            if (l.isNotBlank()) outputCallback("[boot] $l\n")
+                            // Detect shell prompt (root@fex-vm or Last login)
+                            if (l.contains("root@") || l.contains("Last login")) {
+                                shellReady = true
+                                outputCallback("\n=== VM Shell Ready ===\n")
+                                outputCallback("root@fex-vm:~# \n")
+                            }
+                        } else {
+                            if (l.isNotBlank()) outputCallback("$l\n")
+                        }
                     }
                     val exitCode = process.waitFor()
-                    outputCallback("\n[QEMU exited with code $exitCode]\n")
+                    outputCallback("\n[VM exited]\n")
                 } catch (e: Exception) {
-                    outputCallback("[QEMU read error: ${e.message}]\n")
+                    outputCallback("[VM error: ${e.message}]\n")
                 } finally {
                     qemuProcess = null
                     stopVortekProxy()
@@ -258,9 +274,22 @@ class VmManager(private val context: Context) {
             Log.i(TAG, "QEMU stopped")
         }
         stopVortekProxy()
+        killOldProcesses()
+    }
+
+    private fun killOldProcesses() {
+        try {
+            Runtime.getRuntime().exec(arrayOf("killall", "libvortek_proxy.so")).waitFor()
+            Runtime.getRuntime().exec(arrayOf("killall", "vortek_proxy")).waitFor()
+        } catch (_: Exception) {}
     }
 
     fun isRunning(): Boolean = qemuProcess?.isAlive == true
+
+    private fun stripAnsiEscapes(s: String): String {
+        return s.replace(Regex("\\x1b\\[[0-9;?]*[a-zA-Z]"), "")
+                .replace(Regex("\\x1b\\]\\d+;[^\\x07]*\\x07"), "")
+    }
 
     private fun extractAsset(assetName: String, targetFile: File) {
         if (targetFile.exists() && targetFile.length() > 0) return
