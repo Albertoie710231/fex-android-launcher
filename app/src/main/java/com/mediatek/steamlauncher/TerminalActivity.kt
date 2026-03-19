@@ -476,14 +476,14 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
-        // Boot QEMU VM (ARM64-on-ARM64, TCG mode)
+        // Boot QEMU VM (ARM64-on-ARM64, TCG mode, with GPU bridge)
         findViewById<Button>(R.id.btnBootVm).setOnClickListener {
             if (app.vmManager.isRunning()) {
                 app.vmManager.stop()
                 appendOutput("[VM stopped]\n")
             } else {
                 scope.launch {
-                    app.vmManager.smokeTest { line ->
+                    app.vmManager.bootFull { line ->
                         handler.post { appendOutput(line) }
                     }
                 }
