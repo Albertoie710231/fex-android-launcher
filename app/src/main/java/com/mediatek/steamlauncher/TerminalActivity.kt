@@ -481,10 +481,16 @@ class TerminalActivity : AppCompatActivity() {
             if (app.vmManager.isRunning()) {
                 app.vmManager.stop()
                 appendOutput("[VM stopped]\n")
+                etCommand.hint = "Enter command..."
             } else {
                 scope.launch {
                     app.vmManager.bootFull { line ->
-                        handler.post { appendOutput(line) }
+                        handler.post {
+                            appendOutput(line)
+                            if (line.contains("VM Shell Ready")) {
+                                etCommand.hint = "VM shell (Ubuntu) — type command..."
+                            }
+                        }
                     }
                 }
             }
@@ -538,8 +544,24 @@ class TerminalActivity : AppCompatActivity() {
 
         etCommand.text.clear()
 
+        // If VM is running, send command to QEMU's stdin
+        if (app.vmManager.isRunning()) {
+            appendOutput("$text\n")
+            scope.launch(Dispatchers.IO) {
+                try {
+                    app.vmManager.qemuProcess?.outputStream?.let { stdin ->
+                        stdin.write((text + "\n").toByteArray())
+                        stdin.flush()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to write to VM stdin", e)
+                }
+            }
+            return
+        }
+
         if (isRunning && currentProcess != null) {
-            // Pipe input to running process's stdin
+            // Pipe input to running FEX process's stdin
             appendOutput("$text\n")
             scope.launch(Dispatchers.IO) {
                 try {
