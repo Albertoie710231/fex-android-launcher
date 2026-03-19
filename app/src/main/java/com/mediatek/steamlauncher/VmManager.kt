@@ -7,13 +7,13 @@ import java.io.File
 import java.io.InputStreamReader
 
 /**
- * Manages a QEMU ARM64-on-ARM64 virtual machine (TCG mode, no KVM needed).
+ * Manages a QEMU x86-64 virtual machine (TCG mode on ARM64, no KVM needed).
  *
- * The VM runs an ARM64 Linux kernel with vm.max_map_count=1048576,
- * solving the webhelper Chromium crash on Android's default ~65K limit.
+ * Steam runs natively as x86-64 inside the VM — no FEX needed.
+ * The VM kernel has vm.max_map_count=1048576 for webhelper/Chromium.
  *
  * GPU passthrough via Vortek TCP bridge:
- *   VM (vortek_vm_bridge) → TCP → vortek_proxy → VortekRenderer → Mali GPU
+ *   VM → TCP → vortek_proxy → VortekRenderer → Mali GPU
  */
 class VmManager(private val context: Context) {
 
@@ -34,10 +34,31 @@ class VmManager(private val context: Context) {
     private fun getApp(): SteamLauncherApp = context as SteamLauncherApp
 
     /**
-     * Boot full Ubuntu VM with networking and GPU bridge.
+     * Extract QEMU BIOS/ROM files from assets to app files dir.
+     */
+    private fun extractFirmware(): String {
+        val fwDir = File(context.filesDir, "qemu-fw")
+        fwDir.mkdirs()
+        val fwFiles = listOf("bios-256k.bin", "kvmvapic.bin", "linuxboot_dma.bin",
+            "linuxboot.bin", "efi-e1000.rom", "efi-virtio.rom", "vgabios-virtio.bin")
+        for (name in fwFiles) {
+            val target = File(fwDir, name)
+            if (!target.exists() || target.length() == 0L) {
+                try {
+                    context.assets.open("qemu-fw/$name").use { inp ->
+                        target.outputStream().use { out -> inp.copyTo(out) }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        return fwDir.absolutePath
+    }
+
+    /**
+     * Boot x86-64 Ubuntu VM with networking and GPU bridge.
      */
     fun bootFull(outputCallback: (String) -> Unit) {
-        outputCallback("=== Booting Ubuntu VM ===\n")
+        outputCallback("=== Booting x86-64 Ubuntu VM ===\n")
 
         val qemuPath = getQemuPath()
         if (!File(qemuPath).exists()) {
@@ -45,49 +66,49 @@ class VmManager(private val context: Context) {
             return
         }
 
-        // Check for rootfs, kernel, initrd on device
         val dataDir = "/data/local/tmp"
-        val rootfsPath = "$dataDir/vm_rootfs.img"
-        val kernelPath = "$dataDir/vm_kernel"
-        val initrdPath = "$dataDir/vm_initrd.gz"
+        val rootfsPath = "$dataDir/vm_rootfs_x86.img"
+        val kernelPath = "$dataDir/vm_kernel_x86"
+        val initrdPath = "$dataDir/vm_initrd_x86.gz"
 
-        // Also check app files dir for kernel/initrd (fallback)
-        val appKernel = File(context.filesDir, "vm-assets/vm_kernel.gz")
-        val appInitrd = File(context.filesDir, "vm-assets/vm_initrd.gz")
-
-        // Use /data/local/tmp paths (pushed via adb)
         outputCallback("Rootfs: $rootfsPath\n")
         outputCallback("Kernel: $kernelPath\n")
         outputCallback("Initrd: $initrdPath\n")
 
+        // Extract BIOS firmware
+        val fwDir = extractFirmware()
+        outputCallback("Firmware: $fwDir\n")
+
         // Kill any old proxy/QEMU from previous runs
         killOldProcesses()
 
-        // Start Vortek TCP proxy (TCP 5900 → Vortek Unix socket)
+        // Start Vortek TCP proxy
         startVortekProxy(outputCallback)
 
-        outputCallback("Starting QEMU with networking + GPU bridge...\n\n")
+        outputCallback("Starting QEMU x86-64 VM...\n\n")
 
         try {
             val cmd = listOf(
                 qemuPath,
-                "-machine", "virt",
+                "-machine", "q35",
                 "-accel", "tcg,thread=multi",
-                "-cpu", "max",
+                "-cpu", "qemu64",
                 "-m", "4096",
                 "-smp", "8",
                 "-nographic",
                 "-nodefaults",
                 "-serial", "stdio",
+                "-no-reboot",
+                "-L", fwDir,
                 // Networking with slirp + Vortek port forward
                 "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:${VORTEK_TCP_PORT + 1}-:$VORTEK_TCP_PORT",
-                "-device", "virtio-net-device,netdev=net0",
+                "-device", "e1000,netdev=net0",
                 // Rootfs disk
                 "-drive", "file=$rootfsPath,format=raw,if=virtio",
-                // Kernel + initrd (external boot)
+                // Kernel + initrd
                 "-kernel", kernelPath,
                 "-initrd", initrdPath,
-                "-append", "console=ttyAMA0 root=/dev/vda rw quiet"
+                "-append", "console=ttyS0 root=/dev/vda rw quiet"
             )
 
             outputCallback("CMD: ${cmd.joinToString(" ")}\n\n")
@@ -109,11 +130,10 @@ class VmManager(private val context: Context) {
                         val l = stripAnsiEscapes(line ?: "")
                         if (!shellReady) {
                             if (l.isNotBlank()) outputCallback("[boot] $l\n")
-                            // Detect shell prompt (root@fex-vm or Last login)
                             if (l.contains("root@") || l.contains("Last login")) {
                                 shellReady = true
-                                outputCallback("\n=== VM Shell Ready ===\n")
-                                outputCallback("root@fex-vm:~# \n")
+                                outputCallback("\n=== VM Shell Ready (x86-64 Ubuntu + Steam) ===\n")
+                                outputCallback("root@steam-vm:~# \n")
                             }
                         } else {
                             if (l.isNotBlank()) outputCallback("$l\n")
@@ -136,88 +156,7 @@ class VmManager(private val context: Context) {
     }
 
     /**
-     * Run smoke test — boot minimal kernel+initrd only.
-     */
-    fun smokeTest(outputCallback: (String) -> Unit) {
-        outputCallback("=== QEMU Smoke Test ===\n")
-
-        val qemuPath = getQemuPath()
-        if (!File(qemuPath).exists()) {
-            outputCallback("ERROR: QEMU binary not found at $qemuPath\n")
-            return
-        }
-
-        val assetsDir = File(context.filesDir, "vm-assets")
-        assetsDir.mkdirs()
-        val kernelFile = File(assetsDir, "vm_kernel.gz")
-        val initrdFile = File(assetsDir, "vm_initrd.gz")
-
-        try {
-            extractAsset("vm_kernel.gz", kernelFile)
-            extractAsset("vm_initrd.gz", initrdFile)
-        } catch (e: Exception) {
-            outputCallback("ERROR: Could not extract VM assets: ${e.message}\n")
-            return
-        }
-
-        if (kernelFile.length() < 1000) {
-            outputCallback("ERROR: vm_kernel.gz too small — push a real ARM64 kernel\n")
-            return
-        }
-
-        outputCallback("Kernel: ${kernelFile.length()} bytes\n")
-        outputCallback("Initrd: ${initrdFile.length()} bytes\n")
-        outputCallback("Starting QEMU...\n\n")
-
-        try {
-            val cmd = listOf(
-                qemuPath,
-                "-machine", "virt",
-                "-cpu", "max",
-                "-m", "256",
-                "-nographic",
-                "-no-reboot",
-                "-nodefaults",
-                "-serial", "stdio",
-                "-kernel", kernelFile.absolutePath,
-                "-initrd", initrdFile.absolutePath,
-                "-append", "console=ttyAMA0 panic=-1"
-            )
-
-            val pb = ProcessBuilder(cmd)
-            pb.redirectErrorStream(true)
-            pb.environment()["HOME"] = context.filesDir.absolutePath
-            pb.environment()["TMPDIR"] = context.cacheDir.absolutePath
-
-            val process = pb.start()
-            qemuProcess = process
-
-            Thread {
-                try {
-                    val reader = BufferedReader(InputStreamReader(process.inputStream))
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        val l = line
-                        outputCallback("[VM] $l\n")
-                    }
-                    val exitCode = process.waitFor()
-                    outputCallback("\n[QEMU exited with code $exitCode]\n")
-                } catch (e: Exception) {
-                    outputCallback("[QEMU read error: ${e.message}]\n")
-                } finally {
-                    qemuProcess = null
-                }
-            }.start()
-
-        } catch (e: Exception) {
-            outputCallback("ERROR: ${e.javaClass.simpleName}: ${e.message}\n")
-            Log.e(TAG, "Smoke test failed", e)
-        }
-    }
-
-    /**
      * Start Vortek TCP proxy (bridges TCP port → Vortek Unix socket).
-     * The proxy binary is bundled as libvortek_proxy.so in jniLibs for SELinux exec permission.
      */
     private fun startVortekProxy(outputCallback: (String) -> Unit) {
         val app = getApp()
@@ -225,14 +164,12 @@ class VmManager(private val context: Context) {
         val proxyBin = File("${app.applicationInfo.nativeLibraryDir}/libvortek_proxy.so")
 
         if (!proxyBin.exists()) {
-            outputCallback("[Proxy] WARNING: libvortek_proxy.so not found in nativeLibDir\n")
+            outputCallback("[Proxy] WARNING: libvortek_proxy.so not found\n")
             return
         }
 
-        // Check if Vortek socket exists
         if (!File(vortekSocket).exists()) {
-            outputCallback("[Proxy] WARNING: Vortek socket not found at $vortekSocket\n")
-            outputCallback("[Proxy] VortekRenderer may not be running — GPU bridge disabled\n")
+            outputCallback("[Proxy] WARNING: Vortek socket not found — GPU bridge disabled\n")
             return
         }
 
@@ -242,7 +179,6 @@ class VmManager(private val context: Context) {
             val process = pb.start()
             proxyProcess = process
 
-            // Read proxy output in background
             Thread {
                 try {
                     val reader = BufferedReader(InputStreamReader(process.inputStream))
@@ -253,9 +189,9 @@ class VmManager(private val context: Context) {
                 } catch (_: Exception) {}
             }.start()
 
-            outputCallback("[Proxy] Vortek TCP proxy started on port $VORTEK_TCP_PORT → $vortekSocket\n")
+            outputCallback("[Proxy] Vortek proxy on port $VORTEK_TCP_PORT → $vortekSocket\n")
         } catch (e: Exception) {
-            outputCallback("[Proxy] Failed to start proxy: ${e.message}\n")
+            outputCallback("[Proxy] Failed: ${e.message}\n")
         }
     }
 
@@ -289,14 +225,5 @@ class VmManager(private val context: Context) {
     private fun stripAnsiEscapes(s: String): String {
         return s.replace(Regex("\\x1b\\[[0-9;?]*[a-zA-Z]"), "")
                 .replace(Regex("\\x1b\\]\\d+;[^\\x07]*\\x07"), "")
-    }
-
-    private fun extractAsset(assetName: String, targetFile: File) {
-        if (targetFile.exists() && targetFile.length() > 0) return
-        context.assets.open(assetName).use { input ->
-            targetFile.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        }
     }
 }

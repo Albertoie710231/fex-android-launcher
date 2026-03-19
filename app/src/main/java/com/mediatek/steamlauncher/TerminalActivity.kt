@@ -488,7 +488,7 @@ class TerminalActivity : AppCompatActivity() {
                         handler.post {
                             appendOutput(line)
                             if (line.contains("VM Shell Ready")) {
-                                etCommand.hint = "VM shell (Ubuntu) — type command..."
+                                etCommand.hint = "x86-64 VM (Steam) — type command..."
                             }
                         }
                     }
