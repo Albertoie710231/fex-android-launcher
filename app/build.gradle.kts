@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "com.mediatek.steamlauncher"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.mediatek.steamlauncher"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
 
@@ -107,6 +107,9 @@ dependencies {
     implementation("com.google.protobuf:protobuf-java:4.31.1")
     implementation("org.apache.commons:commons-lang3:3.17.0")
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")  // Required by JavaSteam CryptoHelper
+
+    // AVF (Android Virtualization Framework) — runtime-only on device, compile against JAR
+    compileOnly(files("libs/framework-virtualization.jar"))
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

@@ -264,6 +264,15 @@
                 android:padding="8dp"
                 android:layout_marginStart="4dp" />
 
+            <Button
+                android:id="@+id/btnBootVm"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Boot VM"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
         </LinearLayout>
 
     </HorizontalScrollView>

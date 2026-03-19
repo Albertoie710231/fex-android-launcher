@@ -475,6 +475,20 @@ class TerminalActivity : AppCompatActivity() {
                 }
             }
         }
+
+        // Boot QEMU VM (ARM64-on-ARM64, TCG mode)
+        findViewById<Button>(R.id.btnBootVm).setOnClickListener {
+            if (app.vmManager.isRunning()) {
+                app.vmManager.stop()
+                appendOutput("[VM stopped]\n")
+            } else {
+                scope.launch {
+                    app.vmManager.smokeTest { line ->
+                        handler.post { appendOutput(line) }
+                    }
+                }
+            }
+        }
     }
 
     private fun showX11Display() {
