@@ -101,7 +101,8 @@ class VmManager(private val context: Context) {
                 "-no-reboot",
                 "-L", fwDir,
                 // Networking with slirp + Vortek port forward
-                "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:${VORTEK_TCP_PORT + 1}-:$VORTEK_TCP_PORT",
+                // Port forwards: VNC (5902→5900) + Vortek GPU bridge
+                "-netdev", "user,id=net0,hostfwd=tcp::5902-:5900,hostfwd=tcp:127.0.0.1:${VORTEK_TCP_PORT + 1}-:$VORTEK_TCP_PORT",
                 "-device", "e1000,netdev=net0",
                 // Rootfs disk
                 "-drive", "file=$rootfsPath,format=raw,if=virtio",
