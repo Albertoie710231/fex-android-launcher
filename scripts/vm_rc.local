@@ -1,0 +1,26 @@
+#!/bin/bash
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# Network (QEMU slirp)
+ip link set enp0s1 up
+ip addr add 10.0.2.15/24 dev enp0s1
+ip route add default via 10.0.2.2
+rm -f /etc/resolv.conf
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+# Permissions
+mkdir -p /run/user/1000
+chown steam:steam /run/user/1000
+chmod 700 /run/user/1000
+chmod 1777 /tmp
+
+# Display
+Xvfb :0 -screen 0 1280x720x24 >/dev/null 2>&1 &
+
+# VNC server
+x11vnc -display :0 -nopw -forever -shared -rfbport 5900 >/dev/null 2>&1 &
+
+# Start Steam as steam user
+su steam -c "DISPLAY=:0 HOME=/home/steam XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=disabled STEAM_RUNTIME=0 LD_LIBRARY_PATH=/home/steam/.local/share/Steam/ubuntu12_32:/home/steam/.local/share/Steam/ubuntu12_32/steam-runtime/i386/lib/i386-linux-gnu:/home/steam/.local/share/Steam/ubuntu12_32/steam-runtime/i386/usr/lib/i386-linux-gnu /home/steam/.local/share/Steam/ubuntu12_32/steam -no-cef-sandbox -noreactlogin -nobootstrapupdate -skipinitialbootstrap" >/dev/null 2>&1 &
+
+exit 0
