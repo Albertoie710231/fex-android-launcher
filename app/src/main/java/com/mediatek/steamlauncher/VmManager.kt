@@ -93,7 +93,7 @@ class VmManager(private val context: Context) {
                 "-machine", "q35",
                 "-accel", "tcg,thread=multi",
                 "-cpu", "qemu64",
-                "-m", "4096",
+                "-m", "8192",
                 "-smp", "8",
                 "-nographic",
                 "-nodefaults",
