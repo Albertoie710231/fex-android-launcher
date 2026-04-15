@@ -768,7 +768,12 @@ DXVKEOF
             echo "$steamAppId" > "$exeDir/steam_appid.txt" 2>/dev/null
 
             cd "$exeDir"
-            ln -sf / "$exeDir/unix" 2>/dev/null
+            # The game builds asset paths like "unix/home/user/.../file.tbb"
+            # from GetModuleFileName (which returns "unix\home\..."). When the
+            # game fopens those relative to CWD, the kernel follows this
+            # symlink. Pointing it at "/" lands on Android root (escapes FEX
+            # overlay). Point it at the host rootfs so paths resolve correctly.
+            ln -sf "$fexRootfsDir" "$exeDir/unix" 2>/dev/null
 
             echo "=== PE IMPORTS ==="
             objdump -p "$exePath" 2>/dev/null | grep "DLL Name" | head -30 || echo "(objdump not available)"
@@ -923,6 +928,18 @@ REGEOF
                 cp "/opt/stubs/steam_api64.dll" "$exeDir/steam_api64.dll"
                 echo "Replaced game's steam_api64.dll with stub"
             fi
+
+            # Game-specific native stubs in the exe dir.
+            # Real Galaxy64.dll blocks on GOG Galaxy IPC that doesn't exist here,
+            # holding the main thread before the render loop ever starts.
+            # GFSDK_SSAO needs CheckFeatureSupport paths DXVK doesn't implement identically.
+            for stub in Galaxy64.dll GFSDK_SSAO_D3D11.win64.dll; do
+                if [ -f "/opt/stubs/${'$'}stub" ] && [ -f "$exeDir/${'$'}stub" ]; then
+                    [ ! -f "$exeDir/${'$'}{stub}.orig" ] && cp "$exeDir/${'$'}stub" "$exeDir/${'$'}{stub}.orig"
+                    cp "/opt/stubs/${'$'}stub" "$exeDir/${'$'}stub"
+                    echo "Replaced game's ${'$'}stub with stub"
+                fi
+            done
 
             # Create steam_appid.txt in game dir (some DRM checks this)
             echo "${'$'}SteamAppId" > "$exeDir/steam_appid.txt"
@@ -1116,6 +1133,9 @@ REGEOF
             export HEADLESS_LAYER=1
             export DISABLE_HOST_HEADLESS=1
             export HEADLESS_DUMP_FRAMES=$dumpFrames
+            # Wait this long after the layer activates before starting to
+            # capture — lets the game load past the all-black phase.
+            export HEADLESS_DUMP_DELAY=60
 
             # DLL overrides (same as normal launch)
             export WINEDLLOVERRIDES="d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3dcompiler_47=n;d3dcompiler_43=n;wined3d=d;mscoree=d;mshtml=d;steam_api64=n;steam_api=n;openvr_api_dxvk=d;d3d12=d;d3d12core=d;quartz=d;wmvcore=d;xaudio2_7=n;xaudio2_6=d;xaudio2_5=d;xaudio2_4=d;xaudio2_3=d;xaudio2_2=d;xaudio2_1=d;xaudio2_0=d;xaudio2_8=d;xaudio2_9=d;x3daudio1_7=d;x3daudio1_0=d;mfplat=d;mfreadwrite=d;mf=d;mfplay=d"
@@ -1125,7 +1145,8 @@ REGEOF
             export XDG_RUNTIME_DIR=/tmp
             export TMPDIR=/tmp
 
-            # Fix Z: drive
+            # Fix Z: drive — point to "/" so Wine's reverse mapping recognizes
+            # /home/user/... paths (the FEX-overlay view) as Z:\home\user\...
             if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
                 rm -f "${'$'}WINEPREFIX/dosdevices/z:"
                 ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
@@ -1195,6 +1216,12 @@ DXVKEOF
             cd "$exeDir"
             export DXVK_CONFIG_FILE="$exeDir/dxvk.conf"
             echo "1351630" > "$exeDir/steam_appid.txt" 2>/dev/null
+
+            # The game builds asset paths like "unix/home/user/.../file.tbb"
+            # from GetModuleFileName. When fopen-ed those relative to CWD, the
+            # kernel follows this "unix" symlink. Point it at the host rootfs
+            # so the resolved paths land inside the FEX overlay.
+            ln -sf "$fexRootfsDir" "$exeDir/unix" 2>/dev/null
 
             # Launch Wine — redirect debug spew to file, show only important lines on terminal
             wine64 "$exePath" > /tmp/wine_debug.log 2>&1 &
@@ -1392,7 +1419,9 @@ DXVKEOF
             wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXRandr /t REG_SZ /d N /f 2>/dev/null
             wine64 reg add 'HKCU\Software\Wine\X11 Driver' /v UseXVidMode /t REG_SZ /d N /f 2>/dev/null
 
-            # Fix Z: drive to point to host rootfs (kernel resolves symlinks via real FS)
+            # Fix Z: drive — point to "/" (FEX overlay root) so Wine's reverse
+            # mapping recognizes /home/user/... as Z:\home\user\... instead of
+            # falling back to the buggy unix-bridge "unix\home\..." path form.
             if [ -d "${'$'}WINEPREFIX/dosdevices" ]; then
                 rm -f "${'$'}WINEPREFIX/dosdevices/z:"
                 ln -sf "$fexRootfsDir" "${'$'}WINEPREFIX/dosdevices/z:"
