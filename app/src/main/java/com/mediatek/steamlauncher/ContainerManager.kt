@@ -103,6 +103,27 @@ class ContainerManager(private val context: Context) {
 
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
 
+        // Wine preloader fix: the Ubuntu 22.04 rootfs ships
+        //   /usr/lib64/ld-linux-x86-64.so.2 -> /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+        // as an ABSOLUTE symlink. FEX's overlay can't follow absolute symlinks reliably
+        // (see MEMORY: "Rootfs symlinks must be RELATIVE"), so Wine's preloader fails
+        // with `/lib64/ld-linux-x86-64.so.2: could not open` and wineboot never runs.
+        // Fix: replace the symlink with a real file copy. Idempotent — safe to re-run.
+        try {
+            val realLd = File(fexRootfsDir, "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+            val ldDst = File(fexRootfsDir, "usr/lib64/ld-linux-x86-64.so.2")
+            if (realLd.exists() && (!ldDst.exists() || java.nio.file.Files.isSymbolicLink(ldDst.toPath()))) {
+                ldDst.parentFile?.mkdirs()
+                if (ldDst.exists() || java.nio.file.Files.isSymbolicLink(ldDst.toPath())) ldDst.delete()
+                realLd.copyTo(ldDst, overwrite = true)
+                ldDst.setExecutable(true)
+                ldDst.setReadable(true, false)
+                Log.i(TAG, "Replaced ld-linux-x86-64.so.2 absolute symlink with real copy (Wine preloader fix)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to fix ld-linux-x86-64.so.2 symlink: ${e.message}")
+        }
+
         // 1. Update Config.json — ThunkHostLibs points to fexDir (not nativeLibDir)
         //    so both 64-bit and _32 directories are accessible
         val configDir = File(fexHomeDir, ".fex-emu")
