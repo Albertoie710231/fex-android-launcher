@@ -631,11 +631,13 @@ static size_t g_pending_cap = 0;
 static size_t g_pending_total = 0;
 static size_t g_pending_sent = 0;
 
-/* Dump mode: write first N presented frames as PPM files to /tmp/ */
-static int g_dump_max_frames = 0;   /* 0=disabled, >0=dump first N frames */
-static int g_dump_frame_count = 0;  /* frames dumped so far */
-static int g_dump_mode = 0;         /* 1=active (skip TCP) */
-static FILE* g_dump_summary = NULL; /* /tmp/frame_summary.txt */
+/* Dump mode: write N presented frames as PPM files to /tmp/ after a delay. */
+static int g_dump_max_frames = 0;     /* 0=disabled, >0=dump N frames */
+static int g_dump_frame_count = 0;    /* frames dumped so far */
+static int g_dump_mode = 0;           /* 1=active (skip TCP) */
+static uint64_t g_dump_start_ns = 0;  /* when dump mode became active */
+static int g_dump_delay_sec = 60;     /* wait this long after activation before capturing */
+static FILE* g_dump_summary = NULL;   /* /tmp/frame_summary.txt */
 
 static uint64_t get_time_ns(void) {
     struct timespec ts;
@@ -952,6 +954,24 @@ static void headless_GetPhysicalDeviceFeatures(
     }
 }
 
+/* sType values for pNext feature structs — DXVK 2.7.x adapter-selection hard-requires */
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT 1000102000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT 1000287002
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT 1000028000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR 1000545000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT 1000190002
+
+/* pNext chain walker: find a struct by sType in the chain starting at pFeatures */
+static void* find_pnext_for_spoof(VkPhysicalDeviceFeatures2* pFeatures, uint32_t sType) {
+    typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } Base;
+    Base* n = (Base*)(*(void**)((uint8_t*)pFeatures + 8)); /* pFeatures->pNext */
+    while (n) {
+        if (n->sType == sType) return n;
+        n = (Base*)n->pNext;
+    }
+    return NULL;
+}
+
 static void headless_GetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice,
     VkPhysicalDeviceFeatures2* pFeatures)
@@ -968,6 +988,69 @@ static void headless_GetPhysicalDeviceFeatures2(
             pFeatures->features.textureCompressionETC2,
             pFeatures->features.textureCompressionASTC_LDR);
         layer_marker(buf);
+
+        /* Walk pNext chain and spoof the extension features DXVK needs.
+         * All of these have layout: sType(4)+pad(4)+pNext(8)+VkBool32 feat(4) [+ more] */
+
+        /* VK_EXT_depth_clip_enable: depthClipEnable at offset 16 */
+        {
+            void* n = find_pnext_for_spoof(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT);
+            if (n) {
+                uint32_t* f = (uint32_t*)((uint8_t*)n + 16);
+                if (!*f) { *f = 1; layer_marker("Spoofed depthClipEnable=1"); }
+            }
+        }
+
+        /* VK_EXT_custom_border_color: customBorderColors + customBorderColorWithoutFormatFeature */
+        {
+            void* n = find_pnext_for_spoof(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
+            if (n) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                if (!*f1) { *f1 = 1; layer_marker("Spoofed customBorderColors=1"); }
+                if (!*f2) { *f2 = 1; layer_marker("Spoofed customBorderColorWithoutFormatFeature=1"); }
+            }
+        }
+
+        /* VK_EXT_transform_feedback: transformFeedback + geometryStreams */
+        {
+            void* n = find_pnext_for_spoof(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT);
+            if (n) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                if (!*f1) { *f1 = 1; layer_marker("Spoofed transformFeedback=1"); }
+                if (!*f2) { *f2 = 1; layer_marker("Spoofed geometryStreams=1"); }
+            }
+        }
+
+        /* VK_KHR_maintenance6: maintenance6 at offset 16 */
+        {
+            void* n = find_pnext_for_spoof(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR);
+            if (n) {
+                uint32_t* f = (uint32_t*)((uint8_t*)n + 16);
+                if (!*f) { *f = 1; layer_marker("Spoofed maintenance6=1"); }
+            }
+        }
+
+        /* VK_EXT_vertex_attribute_divisor:
+         *   vertexAttributeInstanceRateDivisor       at offset 16
+         *   vertexAttributeInstanceRateZeroDivisor   at offset 20
+         * Per MEDIATEK-DIRVERS-TEST memory: this is what made Ys IX's instanced
+         * draws actually reach the backbuffer. Without it DXVK silently skips them. */
+        {
+            void* n = find_pnext_for_spoof(pFeatures,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
+            if (n) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                if (!*f1) { *f1 = 1; layer_marker("Spoofed vertexAttributeInstanceRateDivisor=1"); }
+                if (!*f2) { *f2 = 1; layer_marker("Spoofed vertexAttributeInstanceRateZeroDivisor=1"); }
+            }
+        }
     }
 }
 
@@ -1881,14 +1964,24 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
             if (g_dump_max_frames > 0) {
                 g_dump_mode = 1;
                 g_dump_frame_count = 0;
+                g_dump_start_ns = get_time_ns();
+                /* Optional delay override via HEADLESS_DUMP_DELAY (seconds) */
+                const char *delay_env = getenv("HEADLESS_DUMP_DELAY");
+                if (delay_env) {
+                    int _v = 0; const char* _p = delay_env;
+                    while (*_p >= '0' && *_p <= '9') { _v = _v * 10 + (*_p - '0'); _p++; }
+                    if (_v > 0) g_dump_delay_sec = _v;
+                }
                 if (!g_dump_summary) {
                     g_dump_summary = fopen("/tmp/frame_summary.txt", "w");
                     if (g_dump_summary) {
-                        fprintf(g_dump_summary, "=== DUMP MODE (lazy init): capturing %d frames ===\n", g_dump_max_frames);
+                        fprintf(g_dump_summary, "=== DUMP MODE (lazy init): capturing %d frames after %ds delay ===\n",
+                                g_dump_max_frames, g_dump_delay_sec);
                         fflush(g_dump_summary);
                     }
                 }
-                LOG("DUMP MODE enabled (lazy init in QueuePresent): %d frames\n", g_dump_max_frames);
+                LOG("DUMP MODE enabled (lazy init in QueuePresent): %d frames after %ds delay\n",
+                    g_dump_max_frames, g_dump_delay_sec);
             }
         }
     }
@@ -1923,6 +2016,12 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                                     uint32_t, const VkImageMemoryBarrier*);
             typedef void (*PFN_CITB)(VkCommandBuffer, VkImage, int, VkBuffer,
                                      uint32_t, const VkBufferImageCopy*);
+            /* DIAGNOSTIC: GREEN clear injected before CopyImageToBuffer to prove
+             * whether the capture pipeline itself works. If buffer reads green after,
+             * pipeline is fine and DXVK's rendering is the problem. If still black,
+             * the capture/staging memory path is broken. */
+            typedef void (*PFN_CCI)(VkCommandBuffer, VkImage, int,
+                                    const void*, uint32_t, const void*);
             typedef VkResult (*PFN_QS)(VkQueue, uint32_t, const VkSubmitInfo*, uint64_t);
             typedef VkResult (*PFN_QWI)(VkQueue);
             typedef VkResult (*PFN_MM)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkFlags, void**);
@@ -1933,6 +2032,7 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
             PFN_ECB fn_ecb = (PFN_ECB)next_device_proc_for(sc->device, "vkEndCommandBuffer");
             PFN_CPB fn_cpb = (PFN_CPB)next_device_proc_for(sc->device, "vkCmdPipelineBarrier");
             PFN_CITB fn_citb = (PFN_CITB)next_device_proc_for(sc->device, "vkCmdCopyImageToBuffer");
+            PFN_CCI fn_cci = (PFN_CCI)next_device_proc_for(sc->device, "vkCmdClearColorImage");
             PFN_QS fn_qs = (PFN_QS)next_device_proc_for(sc->device, "vkQueueSubmit");
             PFN_QWI fn_qwi = (PFN_QWI)next_device_proc_for(sc->device, "vkQueueWaitIdle");
             PFN_MM fn_map = (PFN_MM)next_device_proc_for(sc->device, "vkMapMemory");
@@ -1950,11 +2050,14 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                 VkResult bcb_res = fn_bcb(sc->copy_cmd, &bi);
                 LOG("[COPY] BeginCB=%d\n", bcb_res);
 
-                /* Barrier: PRESENT_SRC → TRANSFER_SRC */
+                /* Barrier: PRESENT_SRC → TRANSFER_SRC
+                 * Use ALL_COMMANDS + MEMORY_WRITE to flush ALL prior writes from
+                 * DXVK's earlier submissions, regardless of which pipeline stages
+                 * they used. Narrower masks were causing Mali to deliver zeros. */
                 {
                     VkImageMemoryBarrier imb = {0};
                     imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                    imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    imb.srcAccessMask = 0x10000 /* VK_ACCESS_MEMORY_WRITE_BIT */;
                     imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
                     imb.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
                     imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1965,7 +2068,7 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                     imb.subresourceRange.levelCount = 1;
                     imb.subresourceRange.layerCount = 1;
                     fn_cpb(sc->copy_cmd,
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           0x00010000 /* VK_PIPELINE_STAGE_ALL_COMMANDS_BIT */,
                            VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, NULL, 0, NULL, 1, &imb);
                 }
@@ -2067,8 +2170,14 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                         }
 
                         if (g_dump_mode) {
-                            /* Dump mode: write PPM files, skip TCP */
-                            if (g_dump_frame_count < g_dump_max_frames) {
+                            /* Dump mode: write PPM files, skip TCP.
+                             * Wait g_dump_delay_sec after activation before
+                             * capturing — the game may take a while to leave
+                             * the loading/black phase and reach real content. */
+                            uint64_t now_ns = get_time_ns();
+                            uint64_t elapsed_s = (now_ns - g_dump_start_ns) / 1000000000ULL;
+                            if (g_dump_frame_count < g_dump_max_frames &&
+                                elapsed_s >= (uint64_t)g_dump_delay_sec) {
                                 dump_frame_ppm(g_dump_frame_count, sc->width, sc->height, mapped);
                             }
                         } else {
@@ -2245,10 +2354,21 @@ static VkResult headless_EnumerateDeviceExtensionProperties(
     };
     static const int num_filter = sizeof(filter_exts) / sizeof(filter_exts[0]);
 
-    /* Only inject VK_KHR_swapchain — the layer actually implements this.
-     * All other extensions must come from the real GPU/ICD. */
+    /* Inject VK_KHR_swapchain (layer implements this) plus the feature extensions
+     * DXVK 2.7.x hard-requires for adapter selection. These were spoofed in the
+     * pre-20f09c4 headless layer and got removed with "NO SPOOFING" philosophy
+     * that doesn't work for DXVK 2.7.x. Matching spoofing is done in
+     * headless_GetPhysicalDeviceFeatures2 below. Ys IX hits each of these in turn:
+     *   - depthClipEnable → "Skipping: required feature 'depthClipEnable'"
+     *   - maintenance6 → "Skipping: required feature 'maintenance6'"
+     *   - plus customBorderColors, transformFeedback for D3D11 rasterizer/xform feedback.
+     */
     static const struct { const char* name; uint32_t specVersion; } inject_exts[] = {
         { "VK_KHR_swapchain", 70 },
+        { "VK_EXT_depth_clip_enable", 1 },
+        { "VK_EXT_custom_border_color", 12 },
+        { "VK_EXT_transform_feedback", 1 },
+        { "VK_KHR_maintenance6", 1 },
     };
     static const int num_inject = sizeof(inject_exts) / sizeof(inject_exts[0]);
 
@@ -2633,11 +2753,73 @@ static VkResult headless_CreateDevice(
     modified.enabledExtensionCount = fc;
     modified.ppEnabledExtensionNames = filtered;
 
+    /* Strip spoofed features from pCreateInfo->pNext chain so the real driver
+     * doesn't reject enabled features for extensions it doesn't actually have.
+     * We save the values and restore afterwards so the caller's struct is intact. */
+    uint32_t save_dce = 0, save_cbc1 = 0, save_cbc2 = 0;
+    uint32_t save_tfb1 = 0, save_tfb2 = 0, save_m6 = 0;
+    uint32_t save_vad1 = 0, save_vad2 = 0;
+    {
+        typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } Base;
+        Base* n = (Base*)(*(void**)((uint8_t*)pCreateInfo + 8));
+        while (n) {
+            if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT) {
+                uint32_t* f = (uint32_t*)((uint8_t*)n + 16);
+                save_dce = *f; if (*f) { *f = 0; layer_marker("CD: stripped depthClipEnable"); }
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                save_cbc1 = *f1; save_cbc2 = *f2;
+                if (*f1) { *f1 = 0; layer_marker("CD: stripped customBorderColors"); }
+                if (*f2) { *f2 = 0; layer_marker("CD: stripped customBorderColorsWithoutFmt"); }
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                save_tfb1 = *f1; save_tfb2 = *f2;
+                if (*f1) { *f1 = 0; layer_marker("CD: stripped transformFeedback"); }
+                if (*f2) { *f2 = 0; layer_marker("CD: stripped geometryStreams"); }
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR) {
+                uint32_t* f = (uint32_t*)((uint8_t*)n + 16);
+                save_m6 = *f; if (*f) { *f = 0; layer_marker("CD: stripped maintenance6"); }
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT) {
+                uint32_t* f1 = (uint32_t*)((uint8_t*)n + 16);
+                uint32_t* f2 = (uint32_t*)((uint8_t*)n + 20);
+                save_vad1 = *f1; save_vad2 = *f2;
+                if (*f1) { *f1 = 0; layer_marker("CD: stripped vertexAttribInstanceRateDivisor"); }
+                if (*f2) { *f2 = 0; layer_marker("CD: stripped vertexAttribInstanceRateZeroDivisor"); }
+            }
+            n = (Base*)n->pNext;
+        }
+    }
+
     snprintf(buf, sizeof(buf), "CD_CALLING_NEXT dev_exts=%u", fc);
     layer_marker(buf);
 
     VkResult result = next_create(physicalDevice, &modified, pAllocator, pDevice);
     free(filtered);
+
+    /* Restore saved feature values so the caller sees unchanged input */
+    {
+        typedef struct { uint32_t sType; uint32_t _pad; void* pNext; } Base;
+        Base* n = (Base*)(*(void**)((uint8_t*)pCreateInfo + 8));
+        while (n) {
+            if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT) {
+                *(uint32_t*)((uint8_t*)n + 16) = save_dce;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT) {
+                *(uint32_t*)((uint8_t*)n + 16) = save_cbc1;
+                *(uint32_t*)((uint8_t*)n + 20) = save_cbc2;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
+                *(uint32_t*)((uint8_t*)n + 16) = save_tfb1;
+                *(uint32_t*)((uint8_t*)n + 20) = save_tfb2;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR) {
+                *(uint32_t*)((uint8_t*)n + 16) = save_m6;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT) {
+                *(uint32_t*)((uint8_t*)n + 16) = save_vad1;
+                *(uint32_t*)((uint8_t*)n + 20) = save_vad2;
+            }
+            n = (Base*)n->pNext;
+        }
+    }
 
     snprintf(buf, sizeof(buf), "CD_RETURNED result=%d", result);
     layer_marker(buf);
@@ -3087,12 +3269,21 @@ static void layer_init(void) {
         if (g_dump_max_frames > 0) {
             g_dump_mode = 1;
             g_dump_frame_count = 0;
+            g_dump_start_ns = get_time_ns();
+            const char *delay_env = getenv("HEADLESS_DUMP_DELAY");
+            if (delay_env) {
+                int _v = 0; const char* _p = delay_env;
+                while (*_p >= '0' && *_p <= '9') { _v = _v * 10 + (*_p - '0'); _p++; }
+                if (_v > 0) g_dump_delay_sec = _v;
+            }
             g_dump_summary = fopen("/tmp/frame_summary.txt", "w");
             if (g_dump_summary) {
-                fprintf(g_dump_summary, "=== DUMP MODE: capturing %d frames ===\n", g_dump_max_frames);
+                fprintf(g_dump_summary, "=== DUMP MODE: capturing %d frames after %ds delay ===\n",
+                        g_dump_max_frames, g_dump_delay_sec);
                 fflush(g_dump_summary);
             }
-            LOG("DUMP MODE enabled: will capture %d frames to /tmp/frame_NNNN.ppm\n", g_dump_max_frames);
+            LOG("DUMP MODE enabled: will capture %d frames to /tmp/frame_NNNN.ppm after %ds delay\n",
+                g_dump_max_frames, g_dump_delay_sec);
         }
     }
 }
