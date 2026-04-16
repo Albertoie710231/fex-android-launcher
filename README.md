@@ -49,7 +49,8 @@ host loader filters out at compile time.
 - **Wine/Proton-GE 10-30** -- boots with 15+ processes, services running
 - **Wine Vulkan test** -- all 7 stages pass (including multi-threaded ACB)
 - **DXVK initialization** -- device creation, pipeline compilation, 55k+ queue submits
-- **Game rendering on-screen** -- Ys IX menu at **60 FPS** (with TSO disabled)
+- **Ys IX main menu rendering** -- shaders + game data tables + geometry all load; menu
+  text visible; untextured white geometry (see "Games Tested" below for limits)
 - **Frame capture pipeline** -- headless layer -> shared memory -> FrameShmReader -> SurfaceView
 - **X11 windowing** -- libXlorie handles text overlays, 2D UI, input
 - **Steam login & DRM** -- Steam client authenticates, DRM passes (RE4 Denuvo verified)
@@ -62,9 +63,9 @@ host loader filters out at compile time.
 
 | Game | Status | Notes |
 |------|--------|-------|
-| **Ys IX** | Renders at 60 FPS | Menu renders on-screen, exploded vertices issue under investigation |
-| **RE4 Remake** (DX12) | Full Steam launch pipeline works | DRM authenticates via running Steam client. Game exits in ~1s (reaper tracking) |
-| **Sekiro** | Full Steam launch pipeline works | Game checks for Steam client IPC independently of steam_api64.dll. Shows "Steam Error" MessageBox on device |
+| **Ys IX** | Main menu renders (2026-04-15) | Menu text + background geometry visible; textures (.itp) still fail so shapes render white; Falcom logo video skipped (Wine mfplat lacks WebM/VP8/VP9 codec). First working rendering in this project; see `.claude/projects/-home-alberto-Documentos-fex-android-launcher/memory/project_current_state_20260415.md` for the exact unblockers. |
+| **RE4 Remake** (DX12) | Steam launch pipeline wired up | Previously verified on MEDIATEK-DIRVERS-TEST (same pipeline); not re-validated on this project |
+| **Sekiro** | Steam launch pipeline wired up | Game does its own Steam client IPC check, so `steam_api64.dll` stub isn't enough by itself |
 
 ## Components
 
@@ -251,6 +252,10 @@ FEXServer must be running (launch app first). See `gotchas.md` for the full temp
 | Symlinks in steamapps don't work | Move game files directly into debian-installation path |
 | Steam needs OpenGL for UI | Force llvmpipe via LIBGL_ALWAYS_SOFTWARE=1 |
 | VK_ERROR_INCOMPATIBLE_DRIVER (-9) | Add vortek_host_icd.json (real path) to VK_ICD_FILENAMES |
+| Ys IX "Hanabi shader failed" / "mapwarp.tbb not found" — the game builds `unix/home/user/...` asset paths from `GetModuleFileName`, treats them as CWD-relative, and fopens them through a `unix` symlink in the game dir | Point the `unix` symlink at the absolute host rootfs path (`$fexRootfsDir`), not `/`. Pointing at `/` makes the kernel follow the symlink outside the FEX overlay to the literal Android root. Done at game launch in `ProtonManager.kt`. |
+| Ys IX black swapchain (DXVK renders only empty begin/end passes) | Spoof `vertexAttributeInstanceRateDivisor` + `vertexAttributeInstanceRateZeroDivisor` in `headless_GetPhysicalDeviceFeatures2`, declare `VK_EXT_vertex_attribute_divisor` in the layer JSON, strip both before `CreateDevice`. Without this DXVK 2.7.x silently drops instanced draws. |
+| BC texture uploads producing black/garbage pixels | Remove the BC→R8G8B8A8 substitution in `fex_thunk_icd.c:trace_CreateImage`. Vortek handles BCn natively; substituting created an RGBA image that then received BC-sized byte uploads. |
+| Dump-mode PPM capture always showing black | `HEADLESS_DUMP_DELAY` env var (default 60s) in the headless layer gates captures until the game leaves the loading phase. Set by `ProtonManager.getDumpModeLaunchCommand`. |
 
 ## First Run Setup
 
