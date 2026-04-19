@@ -99,7 +99,8 @@ add_library(platform_wsi INTERFACE)
 if(WIN32)
     target_compile_definitions(platform_wsi INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 elseif(ANDROID)
-    message(FATAL_ERROR "Android build not supported!")
+    # Patched: allow building the Khronos loader against Bionic via NDK.
+    # WSI support is disabled (we use VK_EXT_headless_surface via a custom layer).
 elseif(APPLE)
     target_compile_definitions(platform_wsi INTERFACE VK_USE_PLATFORM_METAL_EXT)
     if (IOS)
