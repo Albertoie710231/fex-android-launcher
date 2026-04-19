@@ -36,6 +36,11 @@ class NativeWinePipeline(private val context: Context) {
     private val dataDir: String
         get() = context.filesDir.absolutePath
 
+    /** App cache dir — TerminalActivity.startVortekRenderer creates the Vortek
+     *  Unix socket under $cacheDir/tmp/vortek.sock. */
+    private val cacheDir: String
+        get() = context.cacheDir.absolutePath
+
     private val winePath: String
         get() = "$nativeLibDir/$WINE_LIB"
 
@@ -396,6 +401,12 @@ class NativeWinePipeline(private val context: Context) {
             // to nativeLibDir so PROT_EXEC is allowed.
             put("VK_ICD_FILENAMES", "$dataDir/proton11/vk/vortek_icd.json")
             put("VK_LAYER_PATH", "$dataDir/proton11/vk")
+            // Point the Vortek client at our VortekRenderer server socket.
+            // TerminalActivity.startVortekRenderer() creates this in cache/tmp/
+            // and symlinks cache/tmp/.vortek/V0 -> vortek.sock. Without this,
+            // the client falls back to the upstream-baked /data/data/com.winlator
+            // path which does not exist here.
+            put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
             putAll(extraEnv)
         }
         val argv = mutableListOf(winePath)
