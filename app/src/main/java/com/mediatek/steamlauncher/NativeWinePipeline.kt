@@ -186,6 +186,52 @@ class NativeWinePipeline(private val context: Context) {
                 )
             }
             File("$dataDir/tmp").mkdirs()
+            // Pre-create the drive_c skeleton. Wine's wineboot expects
+            // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
+            // exist the dosdevices/c: symlink (../drive_c) dangles and
+            // SetCurrentDirectoryW fails with ENOENT (error 2).
+            val driveC = File("$dataDir/proton11/prefix/.wine/drive_c")
+            driveC.mkdirs()
+            File(driveC, "windows").mkdirs()
+            val system32 = File(driveC, "windows/system32")
+            system32.mkdirs()
+            File(driveC, "users").mkdirs()
+
+            // Symlink a few core wine builtin exes into drive_c/windows/system32.
+            // Wine's ShellExecuteEx resolves argv[1] by looking in system32
+            // first; without cmd.exe/notepad.exe here ShellExecute returns
+            // "File not found" even though the builtins live under
+            // lib/wine/aarch64-windows/.
+            val wineBuiltinDir = "$dataDir/proton11/lib/wine/aarch64-windows"
+            val builtinExes = listOf(
+                "cmd.exe", "notepad.exe", "wineboot.exe", "winemenubuilder.exe",
+                "reg.exe", "rpcss.exe", "services.exe", "svchost.exe",
+                "wineconsole.exe", "explorer.exe",
+            )
+            for (exe in builtinExes) {
+                val src = File(wineBuiltinDir, exe)
+                val dst = File(system32, exe)
+                if (!src.exists()) continue
+                if (dst.exists() || java.nio.file.Files.isSymbolicLink(dst.toPath())) continue
+                try {
+                    java.nio.file.Files.createSymbolicLink(
+                        dst.toPath(),
+                        java.nio.file.Paths.get(src.absolutePath),
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "symlink $exe to system32 failed: ${e.message}")
+                }
+            }
+            // Dosdevices: refresh Z: to point at the Android root — baked
+            // value pointed at /data/data/app.gamenative/files/imagefs/
+            val zDev = File("$dataDir/proton11/prefix/.wine/dosdevices/z:")
+            if (java.nio.file.Files.isSymbolicLink(zDev.toPath())) {
+                val target = java.nio.file.Files.readSymbolicLink(zDev.toPath()).toString()
+                if (target.contains("app.gamenative")) {
+                    zDev.delete()
+                    java.nio.file.Files.createSymbolicLink(zDev.toPath(), java.nio.file.Paths.get("/"))
+                }
+            }
             true
         } catch (t: Throwable) {
             Log.e(TAG, "ensureImageFsMirror failed", t)
@@ -261,6 +307,71 @@ class NativeWinePipeline(private val context: Context) {
     }
 
     /**
+     * Run an arbitrary wine argv with the path-redirect shim. Returns when
+     * wine exits or timeout expires.
+     */
+    fun wineRun(args: List<String>, timeoutMs: Long = 30000): Result {
+        if (!wineBinaryExists()) {
+            return Result(-1, "", "wine binary missing: $winePath")
+        }
+        if (!File(redirectLib).exists()) {
+            return Result(-1, "", "redirect shim missing: $redirectLib")
+        }
+        if (!refreshBinSymlinks()) {
+            return Result(-1, "", "failed to refresh bin symlinks")
+        }
+        if (!ensureImageFsMirror()) {
+            return Result(-1, "", "failed to build imagefs mirror")
+        }
+        val env = buildEnv().toMutableMap().apply {
+            put("LD_PRELOAD", redirectLib)
+            put("REDIRECT_FROM", BAKED_ROOT)
+            put("REDIRECT_TO", imageFsMirror)
+            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+            put("WINEBOOTSTRAPMODE", "1")
+            put("WINEDEBUG", "-all")
+        }
+        val argv = mutableListOf(winePath)
+        argv.addAll(args)
+        Log.i(TAG, "wineRun: ${argv.joinToString(" ")}")
+        val pb = ProcessBuilder(argv)
+            .directory(File(dataDir))
+            .redirectErrorStream(false)
+        pb.environment().clear()
+        pb.environment().putAll(env)
+        return try {
+            val proc = pb.start()
+            val outBuf = StringBuilder()
+            val errBuf = StringBuilder()
+            val o = Thread {
+                try {
+                    val r = proc.inputStream.bufferedReader()
+                    while (true) {
+                        val l = r.readLine() ?: break
+                        synchronized(outBuf) { outBuf.append(l).append('\n') }
+                    }
+                } catch (_: Throwable) {}
+            }.apply { start() }
+            val e = Thread {
+                try {
+                    val r = proc.errorStream.bufferedReader()
+                    while (true) {
+                        val l = r.readLine() ?: break
+                        synchronized(errBuf) { errBuf.append(l).append('\n') }
+                    }
+                } catch (_: Throwable) {}
+            }.apply { start() }
+            val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val code = if (finished) proc.exitValue() else { proc.destroyForcibly(); -99 }
+            o.join(500); e.join(500)
+            Result(code, synchronized(outBuf) { outBuf.toString() }, synchronized(errBuf) { errBuf.toString() })
+        } catch (t: Throwable) {
+            Log.e(TAG, "wineRun failed", t)
+            Result(-2, "", t.stackTraceToString())
+        }
+    }
+
+    /**
      * Run `wine wineboot --init` with the path-redirect shim. Creates/updates
      * the wine prefix under files/proton11/prefix/.wine. First time takes a
      * few seconds (registry init, fake Windows tree, etc.). Wineserver will
@@ -287,7 +398,15 @@ class NativeWinePipeline(private val context: Context) {
             put("REDIRECT_TO", imageFsMirror)
             put("REDIRECT_DEBUG", "1")
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
-            put("WINEDEBUG", "+loaddll,+module,+process")
+            // Quiet trace, keep errors + warns; +pid to distinguish parent/child
+            put("WINEDEBUG", "err+all,warn+loader,fixme-all,trace-all,+pid,+tid")
+            // Keep is_prefix_bootstrap=TRUE through the whole wine run so child
+            // processes (start.exe, explorer.exe) can resolve kernel32.dll via
+            // find_builtin_without_file (WINEDLLDIR*). Without this, wine
+            // sets WINEBOOTSTRAPMODE=1 only during its internal run_wineboot,
+            // then restores to whatever we passed in. If we pass "1",
+            // restore leaves it as "1" and is_prefix_bootstrap stays TRUE.
+            put("WINEBOOTSTRAPMODE", "1")
         }
         Log.i(TAG, "Running $winePath wineboot --init")
 

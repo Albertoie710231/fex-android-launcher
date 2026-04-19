@@ -336,6 +336,22 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
+        // Quick prefix sanity: run a real Windows cmd.exe inside our native
+        // wine. If the prefix is functional this prints a version banner.
+        findViewById<Button>(R.id.btnWineCmdNative).setOnClickListener {
+            appendOutput("=== wine cmd /c ver (native) ===\n")
+            val pipeline = NativeWinePipeline(this)
+            scope.launch {
+                val result = pipeline.wineRun(listOf("cmd", "/c", "ver"), timeoutMs = 20000)
+                handler.post {
+                    appendOutput("exit=${result.exitCode}\n")
+                    if (result.stdout.isNotEmpty()) appendOutput("stdout:\n${result.stdout}")
+                    if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)
