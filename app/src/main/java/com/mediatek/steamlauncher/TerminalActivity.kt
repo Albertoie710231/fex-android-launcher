@@ -282,6 +282,27 @@ class TerminalActivity : AppCompatActivity() {
             executeCommand(protonManager.getWineBootCommand())
         }
 
+        // GameNative-style native Bionic Wine: run wine --version directly,
+        // no FEX, no proot. Proves the Bionic Wine launch path works from
+        // our app process before we scaffold wineserver/notepad/DXVK.
+        findViewById<Button>(R.id.btnWineNativeVersion).setOnClickListener {
+            appendOutput("=== Native Bionic Wine — wine --version ===\n")
+            val pipeline = NativeWinePipeline(this)
+            if (!pipeline.wineBinaryExists()) {
+                appendOutput("[ERROR: libwine_native.so not found in nativeLibraryDir]\n")
+                return@setOnClickListener
+            }
+            scope.launch {
+                val result = pipeline.wineVersion()
+                handler.post {
+                    appendOutput("exit=${result.exitCode}\n")
+                    if (result.stdout.isNotEmpty()) appendOutput("stdout: ${result.stdout}")
+                    if (result.stderr.isNotEmpty()) appendOutput("stderr: ${result.stderr}")
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)

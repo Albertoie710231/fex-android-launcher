@@ -211,6 +211,15 @@
                 android:layout_marginStart="4dp" />
 
             <Button
+                android:id="@+id/btnWineNativeVersion"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="WineN --ver"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
                 android:id="@+id/btnNotepad"
                 android:layout_width="wrap_content"
                 android:layout_height="36dp"
