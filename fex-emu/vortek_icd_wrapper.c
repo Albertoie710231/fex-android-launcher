@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -56,16 +57,27 @@ static void ensure_init(void) {
     }
     log_msg("loaded libvulkan_vortek.so");
 
-    /* Call vortekInitOnce to establish the socket connection to VortekRenderer */
-    void (*initFn)(void) = (void (*)(void))dlsym(vortek_lib, "vortekInitOnce");
-    if (initFn) {
-        log_msg("calling vortekInitOnce...");
-        initFn();
-        log_msg("vortekInitOnce done");
-    } else {
-        log_msg("WARNING: vortekInitOnce not found!");
+    /* Call vortekInitOnce to establish the socket connection to VortekRenderer.
+     * Upstream signature is `bool vortekInitOnce(void)` — return value tells us
+     * whether the socket actually connected. Earlier versions of this wrapper
+     * ignored it, which made "done" fire even when connect() had failed. */
+    bool (*initFn)(void) = (bool (*)(void))dlsym(vortek_lib, "vortekInitOnce");
+    if (!initFn) {
+        log_msg("WARNING: vortekInitOnce symbol not found — ICD unusable");
+        return;
     }
-
+    log_msg("calling vortekInitOnce...");
+    bool connected = initFn();
+    if (!connected) {
+        const char *path = getenv("VORTEK_SERVER_PATH");
+        char buf[600];
+        snprintf(buf, sizeof(buf),
+                 "vortekInitOnce returned FALSE — socket connect failed (VORTEK_SERVER_PATH=%s); ICD will report NULL for all Vulkan entrypoints",
+                 path ? path : "(unset, falling back to upstream default)");
+        log_msg(buf);
+        return;
+    }
+    log_msg("vortekInitOnce connected to VortekRenderer");
     init_ok = 1;
 }
 
