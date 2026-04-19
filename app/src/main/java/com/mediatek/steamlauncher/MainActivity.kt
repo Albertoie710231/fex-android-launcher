@@ -56,6 +56,85 @@ class MainActivity : AppCompatActivity() {
 
         setupUI()
         checkPermissions()
+        runNativeWineProbe()
+    }
+
+    private fun runNativeWineProbe() {
+        Thread {
+            val tag = "NativeWineProbe"
+            try {
+                val nativeDir = applicationInfo.nativeLibraryDir
+                val data = "${applicationInfo.dataDir}/files/proton11"
+                val wineSo = "$nativeDir/libwine_native.so"
+                if (!java.io.File(wineSo).exists()) {
+                    Log.w(tag, "wine .so not present at $wineSo — skipping")
+                    return@Thread
+                }
+
+                // Build Wine's expected bin/ tree as symlinks pointing at nativeLibDir .so files
+                val binDir = java.io.File("$data/bin")
+                binDir.mkdirs()
+                java.io.File("$data/tmp").mkdirs()
+                java.io.File("$data/prefix/.wine").mkdirs()
+
+                val symlinks = mapOf(
+                    "wine" to "$nativeDir/libwine_native.so",
+                    "wine64" to "$nativeDir/libwine_native.so",
+                    "wine-preloader" to "$nativeDir/libwine_preloader.so",
+                    "wine64-preloader" to "$nativeDir/libwine_preloader.so",
+                    "wineserver" to "$nativeDir/libwineserver_native.so"
+                )
+                for ((linkName, target) in symlinks) {
+                    val link = java.io.File(binDir, linkName)
+                    if (link.exists() || java.nio.file.Files.isSymbolicLink(link.toPath())) link.delete()
+                    try {
+                        java.nio.file.Files.createSymbolicLink(link.toPath(), java.nio.file.Paths.get(target))
+                    } catch (e: Exception) { Log.w(tag, "symlink $linkName failed: ${e.message}") }
+                }
+
+                val wineCmd = "$data/bin/wine"
+                Log.i(tag, "Probe 1: $wineCmd --version via symlink")
+                val p1 = ProcessBuilder(wineCmd, "--version").apply {
+                    redirectErrorStream(true)
+                    environment().apply {
+                        put("WINELOADER", "$data/bin/wine")
+                        put("WINESERVER", "$data/bin/wineserver")
+                        put("WINEPREFIX", "$data/prefix/.wine")
+                        put("WINEDLLPATH", "$data/lib/wine")
+                        put("TMPDIR", "$data/tmp")
+                        put("XDG_RUNTIME_DIR", "$data/tmp")
+                        put("HOME", "$data/prefix")
+                    }
+                }.start()
+                val o1 = p1.inputStream.bufferedReader().readText()
+                Log.i(tag, "P1 exit=${p1.waitFor()}")
+                o1.lines().forEach { if (it.isNotBlank()) Log.i(tag, "v: $it") }
+
+                Log.i(tag, "Probe 2: wineboot --init (cwd=$data/share)")
+                val p2 = ProcessBuilder(wineCmd, "wineboot", "--init").apply {
+                    directory(java.io.File("$data/share"))
+                    redirectErrorStream(true)
+                    environment().apply {
+                        put("WINELOADER", "$data/bin/wine")
+                        put("WINESERVER", "$data/bin/wineserver")
+                        put("WINEPREFIX", "$data/prefix/.wine")
+                        put("WINEDLLPATH", "$data/lib/wine")
+                        put("WINEDATADIR", "$data/share/wine")
+                        put("WINEBINDIR", "$data/bin")
+                        put("TMPDIR", "$data/tmp")
+                        put("XDG_RUNTIME_DIR", "$data/tmp")
+                        put("HOME", "$data/prefix")
+                        put("PATH", "$data/bin:/system/bin")
+                    }
+                }.start()
+                val o2 = p2.inputStream.bufferedReader().readText()
+                val exit2 = p2.waitFor()
+                Log.i(tag, "P2 wineboot exit=$exit2")
+                o2.lines().take(30).forEach { if (it.isNotBlank()) Log.i(tag, "wb: $it") }
+            } catch (e: Exception) {
+                Log.e(tag, "failed", e)
+            }
+        }.start()
     }
 
     private fun setupUI() {
