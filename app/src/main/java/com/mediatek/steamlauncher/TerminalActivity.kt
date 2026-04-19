@@ -320,6 +320,22 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
+        // Native wineboot: create/update the Wine prefix.
+        // wineserver auto-starts as a child, both go through the redirect shim.
+        findViewById<Button>(R.id.btnWineBootNative).setOnClickListener {
+            appendOutput("=== wine wineboot --init (native) ===\n")
+            val pipeline = NativeWinePipeline(this)
+            scope.launch {
+                val result = pipeline.wineBootInit()
+                handler.post {
+                    appendOutput("exit=${result.exitCode}\n")
+                    if (result.stdout.isNotEmpty()) appendOutput("stdout:\n${result.stdout}")
+                    if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)

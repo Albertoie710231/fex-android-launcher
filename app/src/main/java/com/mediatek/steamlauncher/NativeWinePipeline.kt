@@ -86,6 +86,47 @@ class NativeWinePipeline(private val context: Context) {
     }
 
     /**
+     * Refresh the bin/ symlinks (wine, wine64, wine-preloader, wineserver)
+     * to point at the CURRENT nativeLibDir. After every APK reinstall the
+     * nativeLibDir's random hash changes and any stale symlinks cause
+     * "wine: could not exec the wine loader" on execve.
+     */
+    fun refreshBinSymlinks(): Boolean {
+        return try {
+            val binDir = File("$dataDir/proton11/bin")
+            binDir.mkdirs()
+            val targets = mapOf(
+                "wine" to "$nativeLibDir/$WINE_LIB",
+                "wine64" to "$nativeLibDir/$WINE_LIB",
+                "wine-preloader" to "$nativeLibDir/libwine_preloader.so",
+                "wine64-preloader" to "$nativeLibDir/libwine_preloader.so",
+                "wineserver" to "$nativeLibDir/$WINESERVER_LIB",
+                // Wine's preloader (loader/preloader.c map_so_lib) resolves
+                // the loader ELF by its .so filename against the bin dir
+                // (../../bin/libwine_native.so from lib/wine/...). Provide
+                // those names as symlinks too so the open() succeeds.
+                WINE_LIB to "$nativeLibDir/$WINE_LIB",
+                "libwine_preloader.so" to "$nativeLibDir/libwine_preloader.so",
+                WINESERVER_LIB to "$nativeLibDir/$WINESERVER_LIB",
+            )
+            for ((link, target) in targets) {
+                val linkFile = File(binDir, link)
+                if (linkFile.exists() || java.nio.file.Files.isSymbolicLink(linkFile.toPath())) {
+                    linkFile.delete()
+                }
+                java.nio.file.Files.createSymbolicLink(
+                    linkFile.toPath(),
+                    java.nio.file.Paths.get(target),
+                )
+            }
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "refreshBinSymlinks failed", t)
+            false
+        }
+    }
+
+    /**
      * Create the directory layout the baked wineserver expects, using
      * symlinks into our real proton11 tree so no file is duplicated.
      *
@@ -167,6 +208,9 @@ class NativeWinePipeline(private val context: Context) {
         if (!File(redirectLib).exists()) {
             return Result(-1, "", "redirect shim missing: $redirectLib")
         }
+        if (!refreshBinSymlinks()) {
+            return Result(-1, "", "failed to refresh bin symlinks")
+        }
         if (!ensureImageFsMirror()) {
             return Result(-1, "", "failed to build imagefs mirror")
         }
@@ -212,6 +256,79 @@ class NativeWinePipeline(private val context: Context) {
             }
         } catch (t: Throwable) {
             Log.e(TAG, "wineserver smoke failed", t)
+            Result(-2, "", t.stackTraceToString())
+        }
+    }
+
+    /**
+     * Run `wine wineboot --init` with the path-redirect shim. Creates/updates
+     * the wine prefix under files/proton11/prefix/.wine. First time takes a
+     * few seconds (registry init, fake Windows tree, etc.). Wineserver will
+     * auto-start as a child, so the shim must be set up for both wine and
+     * wineserver — same env vars applied.
+     */
+    fun wineBootInit(timeoutMs: Long = 30000): Result {
+        if (!wineBinaryExists()) {
+            return Result(-1, "", "wine binary missing: $winePath")
+        }
+        if (!File(redirectLib).exists()) {
+            return Result(-1, "", "redirect shim missing: $redirectLib")
+        }
+        if (!refreshBinSymlinks()) {
+            return Result(-1, "", "failed to refresh bin symlinks")
+        }
+        if (!ensureImageFsMirror()) {
+            return Result(-1, "", "failed to build imagefs mirror")
+        }
+
+        val env = buildEnv().toMutableMap().apply {
+            put("LD_PRELOAD", redirectLib)
+            put("REDIRECT_FROM", BAKED_ROOT)
+            put("REDIRECT_TO", imageFsMirror)
+            put("REDIRECT_DEBUG", "1")
+            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+            put("WINEDEBUG", "+loaddll,+module,+process")
+        }
+        Log.i(TAG, "Running $winePath wineboot --init")
+
+        val pb = ProcessBuilder(winePath, "wineboot", "--init")
+            .directory(File(dataDir))
+            .redirectErrorStream(false)
+        pb.environment().clear()
+        pb.environment().putAll(env)
+
+        return try {
+            val proc = pb.start()
+            val outBuf = StringBuilder()
+            val errBuf = StringBuilder()
+            val out = Thread {
+                try {
+                    val r = proc.inputStream.bufferedReader()
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        synchronized(outBuf) { outBuf.append(line).append('\n') }
+                    }
+                } catch (_: Throwable) {}
+            }.apply { start() }
+            val err = Thread {
+                try {
+                    val r = proc.errorStream.bufferedReader()
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        synchronized(errBuf) { errBuf.append(line).append('\n') }
+                    }
+                } catch (_: Throwable) {}
+            }.apply { start() }
+
+            val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val code = if (finished) proc.exitValue() else { proc.destroyForcibly(); -99 }
+            out.join(500)
+            err.join(500)
+            val s = synchronized(outBuf) { outBuf.toString() }
+            val e = synchronized(errBuf) { errBuf.toString() }
+            Result(code, if (finished) s else "$s[TIMED OUT after ${timeoutMs}ms]\n", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "wineboot failed", t)
             Result(-2, "", t.stackTraceToString())
         }
     }
