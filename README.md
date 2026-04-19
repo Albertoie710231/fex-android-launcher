@@ -1,8 +1,20 @@
 # Steam Launcher for Android (MediaTek)
 
-Run Windows/Steam games on Android via x86-64 emulation with GPU-accelerated Vulkan.
+Experimental Android app for running Windows / Steam games on a MediaTek
+tablet. Two architectures live in the tree, at different stages of work:
 
-## Architecture
+1. **x86-64 everything via FEX-Emu** (branch `main`). Mature but blocked
+   at Ys IX menu geometry corruption — see "State" below.
+2. **Native ARM64 Bionic Wine + FEX WoW64** (branch
+   `feat/native-arm64-pipeline`, WIP). Sidesteps the FEX Vulkan thunks
+   suspected of causing the vertex corruption. Early stages — wine runs
+   console PE binaries, GUI path starts but nothing renders yet.
+
+Neither architecture currently runs a real game correctly. This README
+describes what is observed on-device, not what the pipeline is supposed
+to eventually deliver.
+
+## x86-64 Architecture (main)
 
 ```
 Android App (Kotlin)
@@ -41,31 +53,88 @@ Vulkan thunks are **disabled** for Wine (`"Vulkan": 0` in thunks.json). This for
 overlay). The x86-64 loader supports `VK_KHR_xlib_surface` (compiled-in), which the ARM64
 host loader filters out at compile time.
 
-## What Works
+## State (2026-04-19)
 
-- **Full x86-64 emulation** via FEX-Emu (FEX-2601, Ubuntu 22.04 rootfs)
-- **Vulkan GPU passthrough** -- vkcube at 118 FPS via FEX thunks -> Vortek -> Mali
-- **32-bit Vulkan** -- verified via test_vulkan32 (4 extensions)
-- **Wine/Proton-GE 10-30** -- boots with 15+ processes, services running
-- **Wine Vulkan test** -- all 7 stages pass (including multi-threaded ACB)
-- **DXVK initialization** -- device creation, pipeline compilation, 55k+ queue submits
-- **Ys IX main menu rendering** -- shaders + game data tables + geometry all load; menu
-  text visible; untextured white geometry (see "Games Tested" below for limits)
-- **Frame capture pipeline** -- headless layer -> shared memory -> FrameShmReader -> SurfaceView
-- **X11 windowing** -- libXlorie handles text overlays, 2D UI, input
-- **Steam login & DRM** -- Steam client authenticates, DRM passes (RE4 Denuvo verified)
-- **Steam rungameid pipeline** -- full launch pipeline works for RE4 and Sekiro
-- **JavaSteam depot downloader** -- native ARM64 228980 pre-download (no FEX needed)
-- **dpkg/apt** inside rootfs (overlay filesystem + linkat fallback)
-- **Interactive terminal** with Display/Terminal toggle
+This section describes what is actually verified on-device at the tip of
+this branch. Nothing below is extrapolated from "the pipeline is wired up" —
+if it's listed under Working it means I saw it work on the tablet; if it's
+under Broken I saw it fail.
 
-## Games Tested
+### x86-64 FEX pipeline (`main`)
 
-| Game | Status | Notes |
-|------|--------|-------|
-| **Ys IX** | Main menu renders (2026-04-15) | Menu text + background geometry visible; textures (.itp) still fail so shapes render white; Falcom logo video skipped (Wine mfplat lacks WebM/VP8/VP9 codec). First working rendering in this project; see `.claude/projects/-home-alberto-Documentos-fex-android-launcher/memory/project_current_state_20260415.md` for the exact unblockers. |
-| **RE4 Remake** (DX12) | Steam launch pipeline wired up | Previously verified on MEDIATEK-DIRVERS-TEST (same pipeline); not re-validated on this project |
-| **Sekiro** | Steam launch pipeline wired up | Game does its own Steam client IPC check, so `steam_api64.dll` stub isn't enough by itself |
+**Working:**
+- x86-64 emulation via FEX-Emu inside Ubuntu 22.04 rootfs overlay.
+- Vulkan GPU passthrough for simple clients — `vkcube` runs at ~118 FPS via
+  FEX thunks → Vortek → Mali.
+- Wine / Proton-GE process startup, service tree, DXVK device creation.
+- Native ARM64 X11 server (libXlorie) for window management / 2D.
+- Frame capture layer → shared memory → `FrameShmReader` → `SurfaceView`.
+- JavaSteam native ARM64 depot downloader for Steam AppID 228980.
+
+**Partially working:**
+- **Ys IX (2026-04-16 frame capture)**:
+  - NIS America intro logo: renders correctly at ~58 FPS.
+  - Menu text ("Load and continue a saved game."): renders correctly.
+  - Vortek / FPS overlay: renders correctly.
+  - **Menu background geometry**: **exploded vertices** — triangles blown
+    to massive size, no recognizable layout. Colors are correct (suggests
+    data reaches the GPU with right stride) but positions are wrong.
+    Not "the menu renders"; the menu is corrupted.
+  - Textures mostly fail (BC7 uploads producing solid colors). See
+    `.claude/projects/-home-alberto-Documentos-fex-android-launcher/memory/project_current_state_20260415.md`
+    for the vertex-debug session writeup.
+  - Game crashes 59–77 seconds after ICD init.
+- **Steam client**: logs in; UI boots. Launching a game via rungameid
+  reaches `CreatingProcess`.
+
+**Not working / not validated on this project's device:**
+- **RE4 Remake**: the earlier commit `25899cd` claimed DRM verification,
+  but the game does not actually run on this device under the current
+  pipeline. That commit message was an overclaim inherited from
+  MEDIATEK-DIRVERS-TEST and has been misleading debug effort since.
+- **Sekiro**: the launch pipeline scaffolding exists, but a full
+  playthrough has not been demonstrated; `steam_api64.dll` stub alone is
+  not enough because Sekiro does its own Steam client IPC check.
+- Any game past Ys IX's broken main menu.
+
+### Native ARM64 Wine pipeline (`feat/native-arm64-pipeline`, WIP)
+
+Pivot away from the x86-64-everything architecture toward GameNative's
+model: native ARM64 Bionic Wine + DXVK ARM64 PE + FEX only for the game
+binary via WoW64. Goal is to skip the FEX Vulkan thunks entirely (where
+current Ys IX vertex corruption originates).
+
+**Verified on-device at HEAD of the branch:**
+- Pepelespooder's Bionic ARM64 `wine --version` returns `wine-10.0`.
+- `wineserver` starts past its baked `/data/data/app.gamenative/…` NLS
+  path via an `LD_PRELOAD` path-rewrite shim (`fex-emu/path_redirect.c`).
+- PE DLLs (ntdll.dll, kernel32.dll, etc.) load with `PROT_EXEC` — the
+  shim intercepts `mmap(fd, PROT_READ|WRITE, MAP_PRIVATE)` on PE files
+  (detected by MZ magic) and returns `EPERM`, triggering Wine's own
+  pread-into-anonymous-memory fallback so `mprotect(PROT_EXEC)` later
+  succeeds via `execmem` (anonymous) instead of `execmod` (file-backed,
+  blocked by Android's SELinux policy on `app_data_file`).
+- `wine cmd /c ver` prints `Microsoft Windows 10.0.19043`, exit 0.
+- `wine wineboot --init` populates the prefix (user.reg, drive_c tree,
+  .update-timestamp). Exit 1 with only FreeType and /etc/machine-id
+  warnings left; exit code is not yet checked to be "completion vs.
+  partial".
+- With `HKCU\Software\Wine\Drivers\Graphics=null` set, `wine notepad.exe`
+  stays alive in an idle message pump for 6 s without the
+  `nodrv_CreateWindow` error. This only proves the null driver code path
+  runs; it does NOT prove the GUI is functional.
+
+**Known-broken on the branch:**
+- `libvulkan.so.1` does not load (`err:vulkan:vulkan_init_once Failed to
+  load libvulkan.so.1`) despite the symlink in `proton11/lib/`. Until
+  this is fixed nothing that uses Vulkan — including DXVK — can work.
+- OLE / COM subsystem: `actxprxy.dll`, `uiautomationcore.dll`,
+  `IUIAutomation` all fail to init during any GUI PE startup. Likely
+  benign for most games but unverified.
+- No game has been attempted on the native branch yet. No DXVK, no x86-64
+  game binary under WoW64, no rendering.
+- FreeType is not shipped, so anything that renders TrueType will fail
+  or render blank.
 
 ## Components
 
@@ -252,10 +321,10 @@ FEXServer must be running (launch app first). See `gotchas.md` for the full temp
 | Symlinks in steamapps don't work | Move game files directly into debian-installation path |
 | Steam needs OpenGL for UI | Force llvmpipe via LIBGL_ALWAYS_SOFTWARE=1 |
 | VK_ERROR_INCOMPATIBLE_DRIVER (-9) | Add vortek_host_icd.json (real path) to VK_ICD_FILENAMES |
-| Ys IX "Hanabi shader failed" / "mapwarp.tbb not found" — the game builds `unix/home/user/...` asset paths from `GetModuleFileName`, treats them as CWD-relative, and fopens them through a `unix` symlink in the game dir | Point the `unix` symlink at the absolute host rootfs path (`$fexRootfsDir`), not `/`. Pointing at `/` makes the kernel follow the symlink outside the FEX overlay to the literal Android root. Done at game launch in `ProtonManager.kt`. |
-| Ys IX black swapchain (DXVK renders only empty begin/end passes) | Spoof `vertexAttributeInstanceRateDivisor` + `vertexAttributeInstanceRateZeroDivisor` in `headless_GetPhysicalDeviceFeatures2`, declare `VK_EXT_vertex_attribute_divisor` in the layer JSON, strip both before `CreateDevice`. Without this DXVK 2.7.x silently drops instanced draws. |
-| BC texture uploads producing black/garbage pixels | Remove the BC→R8G8B8A8 substitution in `fex_thunk_icd.c:trace_CreateImage`. Vortek handles BCn natively; substituting created an RGBA image that then received BC-sized byte uploads. |
-| Dump-mode PPM capture always showing black | `HEADLESS_DUMP_DELAY` env var (default 60s) in the headless layer gates captures until the game leaves the loading phase. Set by `ProtonManager.getDumpModeLaunchCommand`. |
+| Ys IX "Hanabi shader failed" / "mapwarp.tbb not found" — the game builds `unix/home/user/...` asset paths from `GetModuleFileName`, treats them as CWD-relative, and fopens them through a `unix` symlink in the game dir | Point the `unix` symlink at the absolute host rootfs path (`$fexRootfsDir`), not `/`. Done at game launch in `ProtonManager.kt`. Game no longer fails on asset lookup; menu text becomes visible. Geometry still exploded, see "State" above. |
+| Ys IX black swapchain (DXVK renders only empty begin/end passes) | Spoof `vertexAttributeInstanceRateDivisor` + `vertexAttributeInstanceRateZeroDivisor` in `headless_GetPhysicalDeviceFeatures2`, declare `VK_EXT_vertex_attribute_divisor` in the layer JSON, strip both before `CreateDevice`. Swapchain goes from all-black to receiving draw calls. Draw output is still wrong (exploded vertices). |
+| BC texture uploads producing black/garbage pixels | Removed the BC→R8G8B8A8 substitution in `fex_thunk_icd.c:trace_CreateImage`. Vortek handles BCn natively; substituting created an RGBA image that then received BC-sized byte uploads. Textures still largely fail but via a different code path; see vertex-debug memory. |
+| Dump-mode PPM capture always showing black | `HEADLESS_DUMP_DELAY` env var (default 60s) in the headless layer gates captures until the game leaves the loading phase. Set by `ProtonManager.getDumpModeLaunchCommand`. Fixes diagnostic tooling, not the underlying rendering issue. |
 
 ## First Run Setup
 
