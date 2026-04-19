@@ -19,6 +19,15 @@ class NativeWinePipeline(private val context: Context) {
     companion object {
         private const val TAG = "NativeWinePipeline"
         private const val WINE_LIB = "libwine_native.so"
+        private const val WINESERVER_LIB = "libwineserver_native.so"
+        private const val REDIRECT_LIB = "libpathredirect.so"
+
+        /** Prefix baked into Pepelespooder's wineserver binary. Strings pulled
+         *  confirm paths like:
+         *    /data/data/app.gamenative/files/imagefs/usr/lib
+         *    /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/...
+         *  All share this common root. */
+        private const val BAKED_ROOT = "/data/data/app.gamenative/files/imagefs"
     }
 
     private val nativeLibDir: String
@@ -29,6 +38,16 @@ class NativeWinePipeline(private val context: Context) {
 
     private val winePath: String
         get() = "$nativeLibDir/$WINE_LIB"
+
+    private val wineServerPath: String
+        get() = "$nativeLibDir/$WINESERVER_LIB"
+
+    private val redirectLib: String
+        get() = "$nativeLibDir/$REDIRECT_LIB"
+
+    /** Target of the path redirect — where the baked paths should resolve to. */
+    private val imageFsMirror: String
+        get() = "$dataDir/proton11/imagefs"
 
     data class Result(val exitCode: Int, val stdout: String, val stderr: String) {
         override fun toString() = "exit=$exitCode\n--- stdout ---\n$stdout--- stderr ---\n$stderr"
@@ -62,6 +81,137 @@ class NativeWinePipeline(private val context: Context) {
             Result(code, out, err)
         } catch (t: Throwable) {
             Log.e(TAG, "wine --version failed", t)
+            Result(-2, "", t.stackTraceToString())
+        }
+    }
+
+    /**
+     * Create the directory layout the baked wineserver expects, using
+     * symlinks into our real proton11 tree so no file is duplicated.
+     *
+     * After this runs, these paths resolve (via the LD_PRELOAD redirect):
+     *   /data/data/app.gamenative/files/imagefs/usr/lib
+     *     → proton11/imagefs/usr → proton11/lib  (contains aarch64-unix, etc.)
+     *   /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/share/wine/nls
+     *     → proton11/imagefs/opt/proton-10.0.99-arm64ec/share → proton11/share
+     *   /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/bin
+     *     → proton11/imagefs/opt/proton-10.0.99-arm64ec/bin → proton11/bin
+     */
+    fun ensureImageFsMirror(): Boolean {
+        return try {
+            val mirror = File(imageFsMirror)
+            val proton11 = File("$dataDir/proton11")
+            if (!proton11.exists()) {
+                Log.e(TAG, "proton11 tree not staged at ${proton11.path}")
+                return false
+            }
+            // /imagefs/usr → ../lib  (wineserver expects /imagefs/usr/lib)
+            val usrDir = File(mirror, "usr")
+            if (!usrDir.exists()) {
+                File(mirror, "usr").parentFile?.mkdirs()
+                // Need imagefs/usr/lib to point at proton11/lib.
+                // Easier: make imagefs/usr a directory, imagefs/usr/lib a symlink.
+                usrDir.mkdirs()
+                val usrLib = File(usrDir, "lib")
+                if (!usrLib.exists() && !java.nio.file.Files.isSymbolicLink(usrLib.toPath())) {
+                    java.nio.file.Files.createSymbolicLink(
+                        usrLib.toPath(),
+                        java.nio.file.Paths.get("$dataDir/proton11/lib"),
+                    )
+                }
+            }
+            // /imagefs/opt/proton-10.0.99-arm64ec/{share,bin}
+            val protonRoot = File(mirror, "opt/proton-10.0.99-arm64ec")
+            protonRoot.mkdirs()
+            val shareLink = File(protonRoot, "share")
+            if (!shareLink.exists() && !java.nio.file.Files.isSymbolicLink(shareLink.toPath())) {
+                java.nio.file.Files.createSymbolicLink(
+                    shareLink.toPath(),
+                    java.nio.file.Paths.get("$dataDir/proton11/share"),
+                )
+            }
+            val binLink = File(protonRoot, "bin")
+            if (!binLink.exists() && !java.nio.file.Files.isSymbolicLink(binLink.toPath())) {
+                java.nio.file.Files.createSymbolicLink(
+                    binLink.toPath(),
+                    java.nio.file.Paths.get("$dataDir/proton11/bin"),
+                )
+            }
+            val libLink = File(protonRoot, "lib")
+            if (!libLink.exists() && !java.nio.file.Files.isSymbolicLink(libLink.toPath())) {
+                java.nio.file.Files.createSymbolicLink(
+                    libLink.toPath(),
+                    java.nio.file.Paths.get("$dataDir/proton11/lib"),
+                )
+            }
+            File("$dataDir/tmp").mkdirs()
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureImageFsMirror failed", t)
+            false
+        }
+    }
+
+    /**
+     * Launch wineserver in foreground (`-f`) with the path-redirect shim
+     * preloaded, wait a short time, and report whether it stayed alive.
+     *
+     * Pass criterion: process still running after the timeout, or exited with
+     * 0. Failure signature we expect if the redirect does NOT work:
+     * "wineserver: failed to load l_intl.nls" on stderr followed by exit.
+     */
+    fun wineServerSmoke(timeoutMs: Long = 2500): Result {
+        if (!File(wineServerPath).exists()) {
+            return Result(-1, "", "wineserver binary missing: $wineServerPath")
+        }
+        if (!File(redirectLib).exists()) {
+            return Result(-1, "", "redirect shim missing: $redirectLib")
+        }
+        if (!ensureImageFsMirror()) {
+            return Result(-1, "", "failed to build imagefs mirror")
+        }
+
+        val env = buildEnv().toMutableMap().apply {
+            put("LD_PRELOAD", redirectLib)
+            put("REDIRECT_FROM", BAKED_ROOT)
+            put("REDIRECT_TO", imageFsMirror)
+            put("REDIRECT_DEBUG", "1")
+            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+        }
+        Log.i(TAG, "Launching wineserver smoke: $wineServerPath -f")
+
+        val pb = ProcessBuilder(wineServerPath, "-f", "-d1")
+            .directory(File(dataDir))
+            .redirectErrorStream(false)
+        pb.environment().clear()
+        pb.environment().putAll(env)
+
+        return try {
+            val proc = pb.start()
+            val stdoutReader = Thread {
+                try { proc.inputStream.bufferedReader().readText() } catch (_: Throwable) {}
+            }.apply { start() }
+            val errBuf = StringBuilder()
+            val stderrReader = Thread {
+                try {
+                    val r = proc.errorStream.bufferedReader()
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        synchronized(errBuf) { errBuf.append(line).append('\n') }
+                    }
+                } catch (_: Throwable) {}
+            }.apply { start() }
+
+            val alive = !proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val err = synchronized(errBuf) { errBuf.toString() }
+            if (alive) {
+                proc.destroyForcibly()
+                Result(0, "wineserver still alive after ${timeoutMs}ms (good)", err)
+            } else {
+                Result(proc.exitValue(), "wineserver exited early", err)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "wineserver smoke failed", t)
             Result(-2, "", t.stackTraceToString())
         }
     }
