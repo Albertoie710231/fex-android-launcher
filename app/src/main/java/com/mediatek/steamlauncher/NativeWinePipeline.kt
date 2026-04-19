@@ -95,35 +95,38 @@ class NativeWinePipeline(private val context: Context) {
         return try {
             val binDir = File("$dataDir/proton11/bin")
             binDir.mkdirs()
-            val targets = mapOf(
+            val binTargets = mapOf(
                 "wine" to "$nativeLibDir/$WINE_LIB",
                 "wine64" to "$nativeLibDir/$WINE_LIB",
                 "wine-preloader" to "$nativeLibDir/libwine_preloader.so",
                 "wine64-preloader" to "$nativeLibDir/libwine_preloader.so",
                 "wineserver" to "$nativeLibDir/$WINESERVER_LIB",
-                // Wine's preloader (loader/preloader.c map_so_lib) resolves
-                // the loader ELF by its .so filename against the bin dir
-                // (../../bin/libwine_native.so from lib/wine/...). Provide
-                // those names as symlinks too so the open() succeeds.
                 WINE_LIB to "$nativeLibDir/$WINE_LIB",
                 "libwine_preloader.so" to "$nativeLibDir/libwine_preloader.so",
                 WINESERVER_LIB to "$nativeLibDir/$WINESERVER_LIB",
             )
-            for ((link, target) in targets) {
-                val linkFile = File(binDir, link)
-                if (linkFile.exists() || java.nio.file.Files.isSymbolicLink(linkFile.toPath())) {
-                    linkFile.delete()
-                }
-                java.nio.file.Files.createSymbolicLink(
-                    linkFile.toPath(),
-                    java.nio.file.Paths.get(target),
-                )
+            for ((link, target) in binTargets) {
+                recreateSymlink(File(binDir, link), target)
             }
+            // Vulkan loader: wine does dlopen("libvulkan.so.1"). Symlink the
+            // current-install libvulkan_loader.so in proton11/lib/ so
+            // LD_LIBRARY_PATH picks it up. Stale across APK reinstalls if
+            // not refreshed each launch.
+            val libDir = File("$dataDir/proton11/lib")
+            libDir.mkdirs()
+            recreateSymlink(File(libDir, "libvulkan.so.1"), "$nativeLibDir/libvulkan_loader.so")
             true
         } catch (t: Throwable) {
             Log.e(TAG, "refreshBinSymlinks failed", t)
             false
         }
+    }
+
+    private fun recreateSymlink(link: File, target: String) {
+        if (link.exists() || java.nio.file.Files.isSymbolicLink(link.toPath())) {
+            link.delete()
+        }
+        java.nio.file.Files.createSymbolicLink(link.toPath(), java.nio.file.Paths.get(target))
     }
 
     /**
@@ -231,21 +234,6 @@ class NativeWinePipeline(private val context: Context) {
                     zDev.delete()
                     java.nio.file.Files.createSymbolicLink(zDev.toPath(), java.nio.file.Paths.get("/"))
                 }
-            }
-
-            // libvulkan.so.1 for wine: wine's Vulkan init does
-            // dlopen("libvulkan.so.1") (Linux-style versioned SONAME).
-            // Android ships /system/lib64/libvulkan.so (unversioned).
-            // Symlink our libvulkan_loader.so in proton11/lib/ so
-            // LD_LIBRARY_PATH picks it up.
-            val vkLib = File("$dataDir/proton11/lib")
-            vkLib.mkdirs()
-            val vkSo1 = File(vkLib, "libvulkan.so.1")
-            if (!vkSo1.exists() && !java.nio.file.Files.isSymbolicLink(vkSo1.toPath())) {
-                java.nio.file.Files.createSymbolicLink(
-                    vkSo1.toPath(),
-                    java.nio.file.Paths.get("$nativeLibDir/libvulkan_loader.so"),
-                )
             }
 
             // Vulkan ICD + layer config pointing at our native ARM64 libs.

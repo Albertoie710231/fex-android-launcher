@@ -378,7 +378,8 @@ class TerminalActivity : AppCompatActivity() {
                     args = listOf("notepad.exe"),
                     timeoutMs = 6000,
                     extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,trace-all,+loaddll",
+                        "WINEDEBUG" to "err+all,fixme-all,trace-all,+loaddll,+vulkan",
+                        "VK_LOADER_DEBUG" to "all",
                     ),
                 )
                 handler.post {
@@ -386,7 +387,7 @@ class TerminalActivity : AppCompatActivity() {
                     if (result.stdout.isNotEmpty()) appendOutput("stdout:\n${result.stdout}")
                     if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
                     if (result.exitCode == -99) {
-                        appendOutput("[notepad alive past 6s timeout — null driver accepted window]\n")
+                        appendOutput("[notepad process still running at 6s timeout; GUI state not verified]\n")
                     }
                     appendOutput("===========================================\n")
                 }
