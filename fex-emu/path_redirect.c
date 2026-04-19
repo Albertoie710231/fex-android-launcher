@@ -23,10 +23,12 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -193,4 +195,56 @@ DIR *opendir(const char *name) {
     static DIR *(*real)(const char *) = NULL;
     if (!real) real = dlsym(RTLD_NEXT, "opendir");
     return real(maybe_rewrite(name));
+}
+
+/* -------- mmap: force PE DLL/EXE file-backed mmaps to fail so Wine takes its
+ * pread-into-anon fallback. Otherwise mmap(PROT_READ|WRITE) on a .dll in
+ * app_data_file context succeeds but the later mprotect(PROT_EXEC) is denied
+ * by SELinux's `execmod` rule. Making wine read into anon memory instead
+ * sidesteps this — mprotect(PROT_EXEC) on anon memory uses `execmem` which
+ * is allowed for untrusted_app. */
+
+static int fd_is_pe(int fd) {
+    if (fd < 0) return 0;
+    char linkpath[64];
+    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+    char target[PATH_MAX];
+    ssize_t n = readlink(linkpath, target, sizeof(target) - 1);
+    if (n <= 0) return 0;
+    target[n] = 0;
+    /* Case-insensitive suffix check. PE loader hits files ending .dll or .exe. */
+    if (n < 4) return 0;
+    const char *ext = target + n - 4;
+    if ((ext[0] == '.' || ext[0] == '\0') &&
+        ((ext[1] == 'd' || ext[1] == 'D') && (ext[2] == 'l' || ext[2] == 'L') && (ext[3] == 'l' || ext[3] == 'L'))) return 1;
+    if ((ext[0] == '.') &&
+        ((ext[1] == 'e' || ext[1] == 'E') && (ext[2] == 'x' || ext[2] == 'X') && (ext[3] == 'e' || ext[3] == 'E'))) return 1;
+    return 0;
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    static void *(*real)(void *, size_t, int, int, int, off_t) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "mmap");
+    if (fd >= 0 && (flags & MAP_PRIVATE) && !(flags & MAP_ANONYMOUS)) {
+        if (fd_is_pe(fd)) {
+            if (g_debug) fprintf(stderr, "[redirect] mmap fd=%d on PE file, forcing EPERM\n", fd);
+            errno = EPERM;
+            return MAP_FAILED;
+        }
+    }
+    return real(addr, length, prot, flags, fd, offset);
+}
+
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    static void *(*real)(void *, size_t, int, int, int, off_t) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "mmap64");
+    if (!real) real = dlsym(RTLD_NEXT, "mmap");
+    if (fd >= 0 && (flags & MAP_PRIVATE) && !(flags & MAP_ANONYMOUS)) {
+        if (fd_is_pe(fd)) {
+            if (g_debug) fprintf(stderr, "[redirect] mmap64 fd=%d on PE file, forcing EPERM\n", fd);
+            errno = EPERM;
+            return MAP_FAILED;
+        }
+    }
+    return real(addr, length, prot, flags, fd, offset);
 }
