@@ -242,12 +242,19 @@ class NativeWinePipeline(private val context: Context) {
             // nativeLibDir (app_native_lib SELinux context — exec OK).
             val vkConfigDir = File("$dataDir/proton11/vk")
             vkConfigDir.mkdirs()
+            // Point at the ICD WRAPPER, not the raw Vortek client. The wrapper
+            // (libvortek_icd_wrapper.so) implements vk_icdGetInstanceProcAddr
+            // and calls vortekInitOnce() on the real libvulkan_vortek.so before
+            // the loader asks for vkCreateInstance. The raw client returns NULL
+            // from its own vk_icdGetInstanceProcAddr because Vortek was
+            // originally designed to be loaded directly by Winlator, not by a
+            // Khronos ICD loader.
             File(vkConfigDir, "vortek_icd.json").writeText(
                 """
                 {
                     "file_format_version": "1.0.0",
                     "ICD": {
-                        "library_path": "$nativeLibDir/libvulkan_vortek.so",
+                        "library_path": "$nativeLibDir/libvortek_icd_wrapper.so",
                         "api_version": "1.3.128"
                     }
                 }
