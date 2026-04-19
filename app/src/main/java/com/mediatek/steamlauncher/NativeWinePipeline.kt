@@ -267,7 +267,7 @@ class NativeWinePipeline(private val context: Context) {
      * auto-start as a child, so the shim must be set up for both wine and
      * wineserver — same env vars applied.
      */
-    fun wineBootInit(timeoutMs: Long = 30000): Result {
+    fun wineBootInit(timeoutMs: Long = 180000): Result {
         if (!wineBinaryExists()) {
             return Result(-1, "", "wine binary missing: $winePath")
         }
