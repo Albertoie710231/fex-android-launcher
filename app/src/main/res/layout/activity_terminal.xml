@@ -256,6 +256,15 @@
                 android:layout_marginStart="4dp" />
 
             <Button
+                android:id="@+id/btnYsIXNative"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="YsIX N"
+                android:textSize="11sp"
+                android:padding="8dp"
+                android:layout_marginStart="4dp" />
+
+            <Button
                 android:id="@+id/btnNotepad"
                 android:layout_width="wrap_content"
                 android:layout_height="36dp"

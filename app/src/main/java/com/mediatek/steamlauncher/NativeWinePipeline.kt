@@ -396,16 +396,20 @@ class NativeWinePipeline(private val context: Context) {
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
             put("WINEBOOTSTRAPMODE", "1")
             put("WINEDEBUG", "-all")
-            // Native Vulkan stack: our Vortek ICD + headless surface layer.
-            // Wine/DXVK read these to find drivers and layers; paths resolve
-            // to nativeLibDir so PROT_EXEC is allowed.
-            put("VK_ICD_FILENAMES", "$dataDir/proton11/vk/vortek_icd.json")
-            put("VK_LAYER_PATH", "$dataDir/proton11/vk")
-            // Point the Vortek client at our VortekRenderer server socket.
-            // TerminalActivity.startVortekRenderer() creates this in cache/tmp/
-            // and symlinks cache/tmp/.vortek/V0 -> vortek.sock. Without this,
-            // the client falls back to the upstream-baked /data/data/com.winlator
-            // path which does not exist here.
+            // Bionic Vulkan stack from GameNative's imagefs_bionic (extracted
+            // to $dataDir/imagefs_bionic). libvulkan.so.1 is the Bionic-built
+            // Khronos loader; libvulkan_wrapper.so is the ICD that forwards
+            // Vulkan calls over a unix socket to VortekRenderer (which uses
+            // Android's native Vulkan -> Mali HAL). This is the path
+            // GameNative uses for Bionic-wine on Mali.
+            // wrapper_icd.aarch64.json (GameNative's default) is Adreno-only
+            // via adrenotools. On Mali it returns no physical devices. Switch
+            // to the Vortek ICD which talks to VortekRenderer over the socket.
+            put("VK_ICD_FILENAMES",
+                "$dataDir/imagefs_bionic/usr/share/vulkan/icd.d/vortek_icd.aarch64.json")
+            put("VK_LAYER_PATH",
+                "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d:" +
+                "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d")
             put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
             putAll(extraEnv)
         }
@@ -538,7 +542,15 @@ class NativeWinePipeline(private val context: Context) {
      */
     private fun buildEnv(): Map<String, String> {
         val wineTree = "$dataDir/proton11"
+        // Prepend GameNative imagefs_bionic lib dir so dlopen("libvulkan.so.1")
+        // resolves to the Bionic Khronos loader, and libvulkan_wrapper.so +
+        // its deps (libadrenotools, libandroid-sysvshm, libxcb, libdrm, ...)
+        // resolve to their Bionic-built copies. Must come BEFORE nativeLibDir
+        // so our glibc libvortek_icd_wrapper.so / libvulkan_vortek.so (still
+        // in jniLibs for the FEX pipeline) don't shadow the wrapper.
+        val imageFsLib = "$dataDir/imagefs_bionic/usr/lib"
         val ldPath = listOf(
+            imageFsLib,
             nativeLibDir,
             "$wineTree/lib/wine/aarch64-unix",
             "$wineTree/lib",

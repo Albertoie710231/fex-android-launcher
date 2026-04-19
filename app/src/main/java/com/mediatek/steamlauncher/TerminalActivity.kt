@@ -394,6 +394,40 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
+        // Launch Ys IX through the NATIVE Bionic wine pipeline (not FEX).
+        // Wine's Z: is mapped to "/" so the Windows path below points at the
+        // game files under the app's private dir. x86-64 PE execution on
+        // ARM64 wine requires libwow64fex.dll (present in Pepelespooder's
+        // aarch64-windows tree). This is the first end-to-end test of the
+        // native pipeline with a real game binary.
+        findViewById<Button>(R.id.btnYsIXNative).setOnClickListener {
+            appendOutput("=== wine ys9.exe (native Bionic) ===\n")
+            val pipeline = NativeWinePipeline(this)
+            val gameWindowsPath =
+                "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
+            scope.launch {
+                val r = pipeline.wineRun(
+                    args = listOf(gameWindowsPath),
+                    timeoutMs = 120_000,
+                    extraEnv = mapOf(
+                        "WINEDEBUG" to "err+all,fixme-all,+loaddll",
+                        // Force native (DXVK from system32) instead of wine's
+                        // built-in wined3d, so D3D11 → Vulkan path is used.
+                        "WINEDLLOVERRIDES" to "d3d11,d3d10core,d3d9,d3d8,dxgi=n",
+                    ),
+                )
+                handler.post {
+                    appendOutput("ys9 exit=${r.exitCode}\n")
+                    if (r.stdout.isNotEmpty()) appendOutput("stdout:\n${r.stdout}")
+                    if (r.stderr.isNotEmpty()) appendOutput("stderr:\n${r.stderr}")
+                    if (r.exitCode == -99) {
+                        appendOutput("[ys9 process still running at 120s timeout]\n")
+                    }
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)
