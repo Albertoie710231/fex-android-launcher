@@ -352,40 +352,41 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
-        // First GUI test: native wine + X11 + notepad.exe.
-        // Starts libXlorie X11 server on display :0 (abstract socket
-        // @/tmp/.X11-unix/X0) if not already running, then runs notepad
-        // with DISPLAY=:0. Notepad stays alive as long as its window is
-        // open; we use a short timeout and report whether it was still
-        // running when killed (= success signal).
+        // Native wine + null graphics driver test. Skips X11 entirely —
+        // wine's null_user_driver provides fake CreateWindow. For actual
+        // rendering, DXVK → Vulkan → VK_LAYER_HEADLESS_surface → TCP →
+        // FrameSocketServer → SurfaceView (same pipeline the FEX x86 side
+        // uses; see display_architecture.md in MEDIATEK-DIRVERS-TEST memory).
+        // First click: writes HKCU\Software\Wine\Drivers\Graphics=null,
+        // then launches notepad. If notepad stays alive past timeout, the
+        // null driver accepted the CreateWindow call.
         findViewById<Button>(R.id.btnWineNotepadNative).setOnClickListener {
-            appendOutput("=== wine notepad.exe (native, X11) ===\n")
-            if (x11Server?.isRunning() != true) {
-                appendOutput("[starting X11 server...]\n")
-                x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started :0]\n") } }
-                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
-                    start()
-                }
-            }
+            appendOutput("=== wine notepad.exe (native, null driver) ===\n")
             val pipeline = NativeWinePipeline(this)
             scope.launch {
-                // Give X11 a moment to come up on first run.
-                Thread.sleep(1000)
+                handler.post { appendOutput("[configuring HKCU\\Software\\Wine\\Drivers\\Graphics=null...]\n") }
+                val reg = pipeline.wineRun(
+                    args = listOf(
+                        "reg", "add",
+                        "HKCU\\Software\\Wine\\Drivers",
+                        "/v", "Graphics", "/d", "null", "/f",
+                    ),
+                    timeoutMs = 15000,
+                )
+                handler.post { appendOutput("reg exit=${reg.exitCode} ${reg.stdout}${reg.stderr}\n") }
                 val result = pipeline.wineRun(
                     args = listOf("notepad.exe"),
                     timeoutMs = 6000,
                     extraEnv = mapOf(
-                        "DISPLAY" to ":0",
-                        "WINEDEBUG" to "err+all,fixme-all,trace-all",
+                        "WINEDEBUG" to "err+all,fixme-all,trace-all,+loaddll",
                     ),
                 )
                 handler.post {
-                    appendOutput("exit=${result.exitCode}\n")
+                    appendOutput("notepad exit=${result.exitCode}\n")
                     if (result.stdout.isNotEmpty()) appendOutput("stdout:\n${result.stdout}")
                     if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
                     if (result.exitCode == -99) {
-                        appendOutput("[notepad kept running past timeout — window likely rendered]\n")
+                        appendOutput("[notepad alive past 6s timeout — null driver accepted window]\n")
                     }
                     appendOutput("===========================================\n")
                 }

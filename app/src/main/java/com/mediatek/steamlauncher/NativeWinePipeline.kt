@@ -232,6 +232,71 @@ class NativeWinePipeline(private val context: Context) {
                     java.nio.file.Files.createSymbolicLink(zDev.toPath(), java.nio.file.Paths.get("/"))
                 }
             }
+
+            // libvulkan.so.1 for wine: wine's Vulkan init does
+            // dlopen("libvulkan.so.1") (Linux-style versioned SONAME).
+            // Android ships /system/lib64/libvulkan.so (unversioned).
+            // Symlink our libvulkan_loader.so in proton11/lib/ so
+            // LD_LIBRARY_PATH picks it up.
+            val vkLib = File("$dataDir/proton11/lib")
+            vkLib.mkdirs()
+            val vkSo1 = File(vkLib, "libvulkan.so.1")
+            if (!vkSo1.exists() && !java.nio.file.Files.isSymbolicLink(vkSo1.toPath())) {
+                java.nio.file.Files.createSymbolicLink(
+                    vkSo1.toPath(),
+                    java.nio.file.Paths.get("$nativeLibDir/libvulkan_loader.so"),
+                )
+            }
+
+            // Vulkan ICD + layer config pointing at our native ARM64 libs.
+            // Wine's Vulkan loader reads VK_ICD_FILENAMES and VK_LAYER_PATH
+            // to find driver + layers. The paths here point directly at
+            // nativeLibDir (app_native_lib SELinux context — exec OK).
+            val vkConfigDir = File("$dataDir/proton11/vk")
+            vkConfigDir.mkdirs()
+            File(vkConfigDir, "vortek_icd.json").writeText(
+                """
+                {
+                    "file_format_version": "1.0.0",
+                    "ICD": {
+                        "library_path": "$nativeLibDir/libvulkan_vortek.so",
+                        "api_version": "1.3.128"
+                    }
+                }
+                """.trimIndent()
+            )
+            File(vkConfigDir, "VK_LAYER_HEADLESS_surface.json").writeText(
+                """
+                {
+                    "file_format_version": "1.0.0",
+                    "layer": {
+                        "name": "VK_LAYER_HEADLESS_surface",
+                        "type": "GLOBAL",
+                        "library_path": "$nativeLibDir/libvulkan_headless_layer.so",
+                        "api_version": "1.3.0",
+                        "implementation_version": "1",
+                        "description": "Headless surface bridge for DXVK on native ARM64 wine",
+                        "instance_extensions": [
+                            { "name": "VK_KHR_surface", "spec_version": "25" },
+                            { "name": "VK_KHR_xcb_surface", "spec_version": "6" },
+                            { "name": "VK_KHR_xlib_surface", "spec_version": "6" },
+                            { "name": "VK_EXT_headless_surface", "spec_version": "1" }
+                        ],
+                        "device_extensions": [
+                            { "name": "VK_KHR_swapchain", "spec_version": "70" },
+                            { "name": "VK_EXT_depth_clip_enable", "spec_version": "1" },
+                            { "name": "VK_EXT_custom_border_color", "spec_version": "12" },
+                            { "name": "VK_EXT_transform_feedback", "spec_version": "1" },
+                            { "name": "VK_KHR_maintenance6", "spec_version": "1" },
+                            { "name": "VK_EXT_vertex_attribute_divisor", "spec_version": "3" }
+                        ],
+                        "disable_environment": { "DISABLE_HEADLESS_LAYER": "1" },
+                        "enable_environment": { "ENABLE_HEADLESS_LAYER": "1" }
+                    }
+                }
+                """.trimIndent()
+            )
+
             true
         } catch (t: Throwable) {
             Log.e(TAG, "ensureImageFsMirror failed", t)
@@ -331,6 +396,11 @@ class NativeWinePipeline(private val context: Context) {
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
             put("WINEBOOTSTRAPMODE", "1")
             put("WINEDEBUG", "-all")
+            // Native Vulkan stack: our Vortek ICD + headless surface layer.
+            // Wine/DXVK read these to find drivers and layers; paths resolve
+            // to nativeLibDir so PROT_EXEC is allowed.
+            put("VK_ICD_FILENAMES", "$dataDir/proton11/vk/vortek_icd.json")
+            put("VK_LAYER_PATH", "$dataDir/proton11/vk")
             putAll(extraEnv)
         }
         val argv = mutableListOf(winePath)
