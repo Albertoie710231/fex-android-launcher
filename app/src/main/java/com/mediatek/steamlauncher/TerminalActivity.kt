@@ -303,6 +303,23 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
+        // Native wineserver smoke test with LD_PRELOAD path-redirect shim.
+        // Proves the baked /data/data/app.gamenative/... paths in Pepelespooder's
+        // wineserver binary can be rewritten to our app dir without recompiling Wine.
+        findViewById<Button>(R.id.btnWineServerSmoke).setOnClickListener {
+            appendOutput("=== wineserver smoke (redirect shim) ===\n")
+            val pipeline = NativeWinePipeline(this)
+            scope.launch {
+                val result = pipeline.wineServerSmoke()
+                handler.post {
+                    appendOutput("exit=${result.exitCode}\n")
+                    if (result.stdout.isNotEmpty()) appendOutput("stdout: ${result.stdout}\n")
+                    if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)
