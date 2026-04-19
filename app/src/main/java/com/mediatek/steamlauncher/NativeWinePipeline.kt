@@ -308,9 +308,10 @@ class NativeWinePipeline(private val context: Context) {
 
     /**
      * Run an arbitrary wine argv with the path-redirect shim. Returns when
-     * wine exits or timeout expires.
+     * wine exits or timeout expires. Extra env entries override the defaults
+     * (used to set DISPLAY for GUI apps, WINEDEBUG channels, etc.).
      */
-    fun wineRun(args: List<String>, timeoutMs: Long = 30000): Result {
+    fun wineRun(args: List<String>, timeoutMs: Long = 30000, extraEnv: Map<String, String> = emptyMap()): Result {
         if (!wineBinaryExists()) {
             return Result(-1, "", "wine binary missing: $winePath")
         }
@@ -330,6 +331,7 @@ class NativeWinePipeline(private val context: Context) {
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
             put("WINEBOOTSTRAPMODE", "1")
             put("WINEDEBUG", "-all")
+            putAll(extraEnv)
         }
         val argv = mutableListOf(winePath)
         argv.addAll(args)

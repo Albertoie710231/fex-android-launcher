@@ -204,22 +204,14 @@ DIR *opendir(const char *name) {
  * sidesteps this — mprotect(PROT_EXEC) on anon memory uses `execmem` which
  * is allowed for untrusted_app. */
 
+/* Detect PE files by the MZ magic (0x4D 0x5A) at offset 0. Matches .dll,
+ * .exe, .drv, .cpl, .ocx, and anything else wine loads as a PE image,
+ * regardless of filename. pread() doesn't disturb the fd's file position. */
 static int fd_is_pe(int fd) {
     if (fd < 0) return 0;
-    char linkpath[64];
-    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
-    char target[PATH_MAX];
-    ssize_t n = readlink(linkpath, target, sizeof(target) - 1);
-    if (n <= 0) return 0;
-    target[n] = 0;
-    /* Case-insensitive suffix check. PE loader hits files ending .dll or .exe. */
-    if (n < 4) return 0;
-    const char *ext = target + n - 4;
-    if ((ext[0] == '.' || ext[0] == '\0') &&
-        ((ext[1] == 'd' || ext[1] == 'D') && (ext[2] == 'l' || ext[2] == 'L') && (ext[3] == 'l' || ext[3] == 'L'))) return 1;
-    if ((ext[0] == '.') &&
-        ((ext[1] == 'e' || ext[1] == 'E') && (ext[2] == 'x' || ext[2] == 'X') && (ext[3] == 'e' || ext[3] == 'E'))) return 1;
-    return 0;
+    unsigned char magic[2];
+    if (pread(fd, magic, 2, 0) != 2) return 0;
+    return magic[0] == 'M' && magic[1] == 'Z';
 }
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
