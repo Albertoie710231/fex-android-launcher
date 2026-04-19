@@ -352,6 +352,46 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
 
+        // First GUI test: native wine + X11 + notepad.exe.
+        // Starts libXlorie X11 server on display :0 (abstract socket
+        // @/tmp/.X11-unix/X0) if not already running, then runs notepad
+        // with DISPLAY=:0. Notepad stays alive as long as its window is
+        // open; we use a short timeout and report whether it was still
+        // running when killed (= success signal).
+        findViewById<Button>(R.id.btnWineNotepadNative).setOnClickListener {
+            appendOutput("=== wine notepad.exe (native, X11) ===\n")
+            if (x11Server?.isRunning() != true) {
+                appendOutput("[starting X11 server...]\n")
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started :0]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
+            val pipeline = NativeWinePipeline(this)
+            scope.launch {
+                // Give X11 a moment to come up on first run.
+                Thread.sleep(1000)
+                val result = pipeline.wineRun(
+                    args = listOf("notepad.exe"),
+                    timeoutMs = 6000,
+                    extraEnv = mapOf(
+                        "DISPLAY" to ":0",
+                        "WINEDEBUG" to "err+all,fixme-all,trace-all",
+                    ),
+                )
+                handler.post {
+                    appendOutput("exit=${result.exitCode}\n")
+                    if (result.stdout.isNotEmpty()) appendOutput("stdout:\n${result.stdout}")
+                    if (result.stderr.isNotEmpty()) appendOutput("stderr:\n${result.stderr}")
+                    if (result.exitCode == -99) {
+                        appendOutput("[notepad kept running past timeout — window likely rendered]\n")
+                    }
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
             // Start X11 if needed (notepad needs X11 for its window)
