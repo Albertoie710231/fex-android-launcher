@@ -114,11 +114,118 @@ def patch(in_path, out_path):
                 break
             for step2 in range(1, 10):
                 ins3 = struct.unpack_from('<I', data, foff + 4 * step + 4 * step2)[0]
-                if ins3 == (0xD63F0000 | (rt << 5)):
-                    blr_off = foff + 4 * step + 4 * step2
-                    struct.pack_into('<I', data, blr_off, 0xD503201F)  # NOP
+                # BLR Rt = 0xD63F0000 | Rt<<5; BR Rt (tail-call) = 0xD61F0000 | Rt<<5
+                if ins3 == (0xD63F0000 | (rt << 5)) or ins3 == (0xD61F0000 | (rt << 5)):
+                    call_off = foff + 4 * step + 4 * step2
+                    # BLR -> NOP. BR (tail) -> RET so caller returns normally.
+                    repl = 0xD503201F if ins3 == (0xD63F0000 | (rt << 5)) else 0xD65F03C0
+                    struct.pack_into('<I', data, call_off, repl)
                     hits += 1
+                    # If a BRK #1 (poison) immediately follows a BLR _assert,
+                    # NOP it too — execution resumes past the "unreachable" mark.
+                    nxt = struct.unpack_from('<I', data, call_off + 4)[0]
+                    if ins3 == (0xD63F0000 | (rt << 5)) and nxt == 0xD4200020:
+                        struct.pack_into('<I', data, call_off + 4, 0xD503201F)
                     break
+                # Bail if rt is overwritten before the call. ADRP/ADR/LDR/MOV
+                # etc. all write Rd at bits 4-0; that's a conservative test
+                # for most register-clobbering instructions in this region.
+                if (ins3 & 0x1f) == rt:
+                    break
+            break
+
+    # Pass 2: pointer-table indirect _assert calls. Pepelespooder's winevulkan
+    # puts a pointer to a wrapper that calls _assert into a pointer table
+    # (typically around .rdata/.data). Callers load from the pointer table,
+    # then BLR into the wrapper; the wrapper then tail-calls _assert. The
+    # caller sequence we want to disarm:
+    #   adrp xR, <ptr_table_page>
+    #   ldr  xR, [xR, #off]         ; loads wrapper pointer
+    #   blr  xR
+    #   brk  #1
+    # We detect by finding BLR/BRK pairs whose preceding load reads from a
+    # location whose STATIC file content is a pointer into .text. The file
+    # contents of the IAT at rest are import-name-hint RVAs, so they match
+    # the <= 0x80000000 range too; we additionally require the load address
+    # to be OUTSIDE the IAT range (distinct from pass 1 above).
+    txt_start_runtime = image_base + txt_vaddr
+    txt_end_runtime = txt_start_runtime + txt_vsize
+
+    def read_u64(rva):
+        off = rva_to_off(rva)
+        if off is None: return None
+        return struct.unpack_from('<Q', data, off)[0]
+
+    # Scan BLR followed by BRK in .text
+    for off in range(0, txt_vsize - 8, 4):
+        foff = txt_raddr + off
+        blr = struct.unpack_from('<I', data, foff)[0]
+        if (blr & 0xFFFFFC1F) != 0xD63F0000: continue  # not BLR xR
+        brk = struct.unpack_from('<I', data, foff + 4)[0]
+        if brk != 0xD4200020: continue  # not BRK #1
+        rn = (blr >> 5) & 0x1f
+        # Walk back looking for adrp+ldr that set xRn
+        for back in range(1, 10):
+            loff = foff - 4 * back
+            if loff < txt_raddr: break
+            ldr_ins = struct.unpack_from('<I', data, loff)[0]
+            if ((ldr_ins >> 22) & 0x3ff) != 0x3e5: continue
+            imm12 = (ldr_ins >> 10) & 0xfff
+            ldr_rn = (ldr_ins >> 5) & 0x1f
+            ldr_rt = ldr_ins & 0x1f
+            if ldr_rt != rn: continue
+            # Find adrp before LDR setting ldr_rn
+            for back2 in range(1, 5):
+                aoff = loff - 4 * back2
+                if aoff < txt_raddr: break
+                adrp_ins = struct.unpack_from('<I', data, aoff)[0]
+                if ((adrp_ins >> 24) & 0x9F) != 0x90: continue
+                adrp_rd = adrp_ins & 0x1f
+                if adrp_rd != ldr_rn: continue
+                immlo = (adrp_ins >> 29) & 3
+                immhi = (adrp_ins >> 5) & 0x7ffff
+                imm = (immhi << 2) | immlo
+                if imm & 0x100000: imm |= ~((1 << 21) - 1)
+                apc = image_base + txt_vaddr + (aoff - txt_raddr)
+                target_page = (apc & ~0xfff) + (imm << 12)
+                # Skip IAT pass-1 already handled
+                if target_page == iat_page and (imm12 << 3) == iat_off_in_page: break
+                # Read pointer at target_page+off
+                ptr_rva = (target_page - image_base) + (imm12 << 3)
+                ptr_val = read_u64(ptr_rva)
+                if ptr_val is None: break
+                if not (txt_start_runtime <= ptr_val < txt_end_runtime): break
+                # Inspect the code at ptr_val — does it look like an _assert thunk?
+                # (contains adrp to iat_page + ldr from iat_off)
+                code_off = rva_to_off(ptr_val - image_base)
+                if code_off is None: break
+                found_assert = False
+                for k in range(0, 24, 4):
+                    if code_off + k + 4 > len(data): break
+                    ci = struct.unpack_from('<I', data, code_off + k)[0]
+                    if ((ci >> 24) & 0x9F) != 0x90: continue
+                    ci_rd = ci & 0x1f
+                    ci_immlo = (ci >> 29) & 3
+                    ci_immhi = (ci >> 5) & 0x7ffff
+                    ci_imm = (ci_immhi << 2) | ci_immlo
+                    if ci_imm & 0x100000: ci_imm |= ~((1 << 21) - 1)
+                    ci_pc = ptr_val + k
+                    ci_target = (ci_pc & ~0xfff) + (ci_imm << 12)
+                    if ci_target != iat_page: continue
+                    # Check next insn for LDR from iat_off
+                    if code_off + k + 4 + 4 > len(data): continue
+                    ni = struct.unpack_from('<I', data, code_off + k + 4)[0]
+                    if ((ni >> 22) & 0x3ff) != 0x3e5: continue
+                    ni_imm12 = (ni >> 10) & 0xfff
+                    ni_rn = (ni >> 5) & 0x1f
+                    if ni_rn == ci_rd and (ni_imm12 << 3) == iat_off_in_page:
+                        found_assert = True
+                        break
+                if found_assert:
+                    struct.pack_into('<I', data, foff, 0xD503201F)  # NOP BLR
+                    struct.pack_into('<I', data, foff + 4, 0xD503201F)  # NOP BRK
+                    hits += 1
+                break
             break
 
     with open(out_path, 'wb') as f:
