@@ -414,6 +414,13 @@ class TerminalActivity : AppCompatActivity() {
             val gameWindowsPath =
                 "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
             scope.launch {
+                // Back to direct `wine <game>` launch. The `wine explorer
+                // /desktop=...` wrapper GameNative uses didn't help here —
+                // Pepelespooder's explorer.exe hits the same page fault as
+                // services.exe (write to 0xffffffff...+0x28), so wrapping
+                // via it just moves the crash earlier. Need to fix the
+                // wine-internal crash before the desktop-wrapper trick
+                // can pay off.
                 val r = pipeline.wineRun(
                     args = listOf(gameWindowsPath),
                     timeoutMs = 300_000,
