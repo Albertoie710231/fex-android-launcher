@@ -459,24 +459,58 @@ class NativeWinePipeline(private val context: Context) {
                 "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d:" +
                 "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d")
             put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
-            // GameNative env vars for wrapper+DXVK mode (from XServerScreen.kt
-            // and DXVKHelper.setEnvVars).
+            // Exact env set GameNative uses for a working Ys IX run on this
+            // Mali tablet (captured from /proc/<ys9-pid>/environ — see
+            // reference_gamenative_working_env_2026_04_19.md).
+            // WRAPPER_EMULATE_BCN=3 is the leading suspect for unblocking
+            // DXVK's FL11_0 textureCompressionBC check; the other WRAPPER_*
+            // values round out wrapper-side behavior; Mesa/Zink/TU tune the
+            // GL-on-Vulkan path zink uses; WINEESYNC + WINEPRELOADRESERVE
+            // are wine-side correctness.
             put("GALLIUM_DRIVER", "zink")
             put("LIBGL_KOPPER_DISABLE", "true")
-            put("WRAPPER_VK_VERSION", "1.3.128")
-            put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
-            put("DXVK_LOG_LEVEL", "debug")
-            // Mali: per BionicProgramLauncherComponent
-            put("BOX64_MMAP32", "0")
-            // Enable the BCn decompression implicit layer (libbcn_layer.so
-            // from GameNative extra_libs). Mali has ASTC/ETC but no BC
-            // texture formats natively, so DXVK's FL11_0 check fails on
-            // textureCompressionBC. The layer emulates BC via compute
-            // shaders and spoofs the feature as supported.
+            put("WRAPPER_VK_VERSION", "1.3.0")           // GN uses .0, not .128
+            put("WRAPPER_EMULATE_BCN", "3")              // leading FL11_0 fix candidate
+            put("WRAPPER_USE_BCN_CACHE", "0")
+            put("WRAPPER_MAX_IMAGE_COUNT", "0")
+            put("WRAPPER_RESOURCE_TYPE", "auto")
+            put("WRAPPER_DISABLE_PRESENT_WAIT", "0")
+            put("WRAPPER_EXTENSION_BLACKLIST", "")
             put("ENABLE_BCN_COMPUTE", "1")
-            // Bionic Khronos loader discovers implicit layers via XDG paths,
-            // not via VK_LAYER_PATH. Point it at imagefs_bionic/usr/share
-            // where libbcn_layer.json lives.
+            put("ENABLE_UTIL_LAYER", "1")
+            put("BCN_COMPUTE_AUTO", "1")
+            // Custom implicit Vulkan layer that forces dualSrcBlend,
+            // logicOp, shaderStorageImageExtendedFormats to VK_TRUE in
+            // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as
+            // FALSE which blocks DXVK's FL11_0 check.
+            put("SPOOF_FEATURES", "1")
+            put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
+            put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
+            put("BOX64_MMAP32", "0")
+            // Mesa/Zink
+            put("MESA_DEBUG", "silent")
+            put("mesa_glthread", "true")
+            put("MESA_NO_ERROR", "1")
+            put("MESA_VK_WSI_PRESENT_MODE", "mailbox")
+            put("ZINK_DEBUG", "compact")
+            put("ZINK_DESCRIPTORS", "lazy")
+            put("TU_DEBUG", "noconform")
+            // Wine tuning
+            put("WINEESYNC", "1")
+            put("WINEPRELOADRESERVE", "140000000-140936000")
+            put("WINE_X11FORCEGLX", "1")
+            put("WINE_GST_NO_GL", "1")
+            put("WINE_DISABLE_FULLSCREEN_HACK", "1")
+            put("WINE_NEW_NDIS", "1")
+            put("WINE_NO_DUPLICATE_EXPLORER", "1")
+            put("HODLL", "libwow64fex.dll")
+            // FEX tuning (from fexcore_env_vars.json defaults)
+            put("FEX_TSOENABLED", "1")
+            put("FEX_HALFBARRIERTSOENABLED", "1")
+            put("FEX_MULTIBLOCK", "1")
+            put("FEX_X87REDUCEDPRECISION", "1")
+            // XDG so the Bionic Khronos loader picks up implicit layers in
+            // imagefs_bionic/usr/share/vulkan/implicit_layer.d/.
             put("XDG_DATA_DIRS", "$dataDir/imagefs_bionic/usr/share")
             put("XDG_CONFIG_DIRS", "$dataDir/imagefs_bionic/etc/xdg")
             putAll(extraEnv)

@@ -418,18 +418,17 @@ class TerminalActivity : AppCompatActivity() {
                     args = listOf(gameWindowsPath),
                     timeoutMs = 300_000,
                     extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,+loaddll",
+                        "WINEDEBUG" to "err+all,fixme-all,+loaddll,+vulkan,+x11drv,warn+vulkan",
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=",
+                        "DISPLAY" to ":0",
                     ),
-                    // Pepelespooder wine 10 with null graphics driver +
-                    // headless Vulkan. Got DXVK 1.10.3-async to successfully
-                    // enumerate the Mali-G720 adapter (Vulkan 1.3.128, 14.9 GB
-                    // heap). Blocker there is D3D_FEATURE_LEVEL_11_0 not
-                    // supported (Mali missing dualSrcBlend or similar). Wine 9
-                    // via proton-9 is a regression — hits an earlier Vulkan
-                    // graphics-driver init failure due to X11/wrapper
-                    // surface-protocol mismatch we didn't solve this session.
+                    // Back on Pepelespooder wine 10. Binary-patching its
+                    // winevulkan.dll to NOP out the _assert calls so we can
+                    // proceed past vkCreateDevice success. Proton 9 failed
+                    // at init_vulkan (graphics driver loading) — wine 9's
+                    // different vulkan init path doesn't work with our
+                    // wrapper_icd setup yet.
                     useProton9 = false,
                 )
                 handler.post {
