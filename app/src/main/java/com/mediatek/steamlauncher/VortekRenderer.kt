@@ -86,11 +86,14 @@ object VortekRenderer {
             val nativeLibDir = context.applicationInfo.nativeLibraryDir
             val options = VortekRendererComponent.Options()
 
-            // Set path to Android's Vulkan driver - REQUIRED for libvortekrenderer.so
-            // to find the real Vulkan driver. Use the actual Mali driver, not the loader.
-            // The hook_impl will intercept vulkan.mali.so and use this path instead.
-            options.libvulkanPath = "/vendor/lib64/hw/vulkan.mali.so"
-            Log.i(TAG, "Using libvulkan path: ${options.libvulkanPath}")
+            // GameNative leaves libvulkanPath null by default (only sets it
+            // when the user picks an adrenotools driver). With null, the
+            // server falls back to Android's standard /system/lib64/libvulkan.so
+            // which goes through the Vulkan loader → Mali HAL. Passing the HAL
+            // path directly (our previous value) was breaking device
+            // enumeration for the Vortek RPC — DXVK saw "No adapters found".
+            options.libvulkanPath = null
+            Log.i(TAG, "libvulkanPath: null (defer to Android default libvulkan.so)")
 
             component = VortekRendererComponent(socketPath, nativeLibDir, options)
             component?.start()

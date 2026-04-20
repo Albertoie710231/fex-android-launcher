@@ -402,19 +402,35 @@ class TerminalActivity : AppCompatActivity() {
         // native pipeline with a real game binary.
         findViewById<Button>(R.id.btnYsIXNative).setOnClickListener {
             appendOutput("=== wine ys9.exe (native Bionic) ===\n")
+            // proton-9's wine needs winex11.drv → needs an X server.
+            if (x11Server?.isRunning() != true) {
+                x11Server = X11Server(this).apply {
+                    onServerStarted = { handler.post { appendOutput("[X11 started for YsIX]\n") } }
+                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
+                    start()
+                }
+            }
             val pipeline = NativeWinePipeline(this)
             val gameWindowsPath =
                 "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
             scope.launch {
                 val r = pipeline.wineRun(
                     args = listOf(gameWindowsPath),
-                    timeoutMs = 120_000,
+                    timeoutMs = 300_000,
                     extraEnv = mapOf(
                         "WINEDEBUG" to "err+all,fixme-all,+loaddll",
-                        // Force native (DXVK from system32) instead of wine's
-                        // built-in wined3d, so D3D11 → Vulkan path is used.
-                        "WINEDLLOVERRIDES" to "d3d11,d3d10core,d3d9,d3d8,dxgi=n",
+                        "WINEDLLOVERRIDES" to
+                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=",
                     ),
+                    // Pepelespooder wine 10 with null graphics driver +
+                    // headless Vulkan. Got DXVK 1.10.3-async to successfully
+                    // enumerate the Mali-G720 adapter (Vulkan 1.3.128, 14.9 GB
+                    // heap). Blocker there is D3D_FEATURE_LEVEL_11_0 not
+                    // supported (Mali missing dualSrcBlend or similar). Wine 9
+                    // via proton-9 is a regression — hits an earlier Vulkan
+                    // graphics-driver init failure due to X11/wrapper
+                    // surface-protocol mismatch we didn't solve this session.
+                    useProton9 = false,
                 )
                 handler.post {
                     appendOutput("ys9 exit=${r.exitCode}\n")

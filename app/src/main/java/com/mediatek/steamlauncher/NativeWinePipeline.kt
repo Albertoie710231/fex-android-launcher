@@ -28,6 +28,10 @@ class NativeWinePipeline(private val context: Context) {
          *    /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/...
          *  All share this common root. */
         private const val BAKED_ROOT = "/data/data/app.gamenative/files/imagefs"
+
+        /** Baked prefix inside GameNative's proton-9.0-arm64ec wineserver ELF.
+         *  Used when useProton9 = true. */
+        private const val BAKED_ROOT_P9 = "/data/data/com.winlator.cmod/files/imagefs"
     }
 
     private val nativeLibDir: String
@@ -120,6 +124,23 @@ class NativeWinePipeline(private val context: Context) {
             val libDir = File("$dataDir/proton11/lib")
             libDir.mkdirs()
             recreateSymlink(File(libDir, "libvulkan.so.1"), "$nativeLibDir/libvulkan_loader.so")
+
+            // Proton-9.0-arm64ec bin symlinks for untrusted_app exec path.
+            // The ELFs live in nativeLibDir (exec-allowed); the symlinks in
+            // proton9/bin/ let wine self-find its wine-preloader sibling.
+            val p9BinDir = File("$dataDir/proton9/bin")
+            if (p9BinDir.exists()) {
+                val p9Targets = mapOf(
+                    "wine" to "$nativeLibDir/libwine_proton9_native.so",
+                    "wine64" to "$nativeLibDir/libwine_proton9_native.so",
+                    "wine-preloader" to "$nativeLibDir/libwine_proton9_preloader.so",
+                    "wine64-preloader" to "$nativeLibDir/libwine_proton9_preloader.so",
+                    "wineserver" to "$nativeLibDir/libwineserver_proton9_native.so",
+                )
+                for ((link, target) in p9Targets) {
+                    recreateSymlink(File(p9BinDir, link), target)
+                }
+            }
             true
         } catch (t: Throwable) {
             Log.e(TAG, "refreshBinSymlinks failed", t)
@@ -376,9 +397,25 @@ class NativeWinePipeline(private val context: Context) {
      * wine exits or timeout expires. Extra env entries override the defaults
      * (used to set DISPLAY for GUI apps, WINEDEBUG channels, etc.).
      */
-    fun wineRun(args: List<String>, timeoutMs: Long = 30000, extraEnv: Map<String, String> = emptyMap()): Result {
-        if (!wineBinaryExists()) {
-            return Result(-1, "", "wine binary missing: $winePath")
+    /** useProton9 = true runs GameNative's downloaded proton-9.0-arm64ec
+     *  ELF binary from files/proton9/bin/ instead of Pepelespooder's
+     *  libwine_native.so. Needed for ARM64EC x86-64 Windows games whose
+     *  DirectX feature level negotiation behaves differently between
+     *  wine 9 and wine 10. */
+    fun wineRun(
+        args: List<String>,
+        timeoutMs: Long = 30000,
+        extraEnv: Map<String, String> = emptyMap(),
+        useProton9: Boolean = false,
+    ): Result {
+        val wineBinary = if (useProton9) "$dataDir/proton9/bin/wine" else winePath
+        val wineTreeDir = if (useProton9) "$dataDir/proton9" else "$dataDir/proton11"
+        // Check the real ELF in nativeLibDir — proton9/bin/wine is a symlink
+        // that refreshBinSymlinks creates below.
+        val wineExecCheck =
+            if (useProton9) "$nativeLibDir/libwine_proton9_native.so" else wineBinary
+        if (!File(wineExecCheck).exists()) {
+            return Result(-1, "", "wine binary missing: $wineExecCheck")
         }
         if (!File(redirectLib).exists()) {
             return Result(-1, "", "redirect shim missing: $redirectLib")
@@ -389,10 +426,20 @@ class NativeWinePipeline(private val context: Context) {
         if (!ensureImageFsMirror()) {
             return Result(-1, "", "failed to build imagefs mirror")
         }
-        val env = buildEnv().toMutableMap().apply {
+        val env = buildEnv(useProton9).toMutableMap().apply {
             put("LD_PRELOAD", redirectLib)
-            put("REDIRECT_FROM", BAKED_ROOT)
-            put("REDIRECT_TO", imageFsMirror)
+            put("REDIRECT_FROM", if (useProton9) BAKED_ROOT_P9 else BAKED_ROOT)
+            // proton-9 was built expecting GameNative-style imagefs layout
+            // (/usr/lib, /opt/wine/...). Our $dataDir/imagefs_bionic IS that
+            // layout (from GameNative's imagefs_bionic.txz). For Pepelespooder
+            // keep the old proton11/imagefs mirror that was shaped for its
+            // different baked paths.
+            put("REDIRECT_TO",
+                if (useProton9) "$dataDir/imagefs_bionic" else imageFsMirror)
+            // Keep using proton11/prefix/.wine (has DXVK DLLs + FEX DLLs
+            // in drive_c/windows/system32 already). wine 9/10 share prefix
+            // format in most respects; if incompatibilities show up we'll
+            // stand up a separate prefix.
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
             put("WINEBOOTSTRAPMODE", "1")
             put("WINEDEBUG", "-all")
@@ -402,18 +449,28 @@ class NativeWinePipeline(private val context: Context) {
             // Vulkan calls over a unix socket to VortekRenderer (which uses
             // Android's native Vulkan -> Mali HAL). This is the path
             // GameNative uses for Bionic-wine on Mali.
-            // wrapper_icd.aarch64.json (GameNative's default) is Adreno-only
-            // via adrenotools. On Mali it returns no physical devices. Switch
-            // to the Vortek ICD which talks to VortekRenderer over the socket.
+            // Mirror GameNative's working Wrapper+System path for Mali: the
+            // wrapper ICD uses adrenotools to load Android's system libvulkan.so
+            // (routes to Mali HAL). Vortek socket path is unused in this mode
+            // but keep VORTEK_SERVER_PATH set harmlessly.
             put("VK_ICD_FILENAMES",
-                "$dataDir/imagefs_bionic/usr/share/vulkan/icd.d/vortek_icd.aarch64.json")
+                "$dataDir/imagefs_bionic/usr/share/vulkan/icd.d/wrapper_icd.aarch64.json")
             put("VK_LAYER_PATH",
                 "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d:" +
                 "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d")
             put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
+            // GameNative env vars for wrapper+DXVK mode (from XServerScreen.kt
+            // and DXVKHelper.setEnvVars).
+            put("GALLIUM_DRIVER", "zink")
+            put("LIBGL_KOPPER_DISABLE", "true")
+            put("WRAPPER_VK_VERSION", "1.3.128")
+            put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
+            put("DXVK_LOG_LEVEL", "debug")
+            // Mali: per BionicProgramLauncherComponent
+            put("BOX64_MMAP32", "0")
             putAll(extraEnv)
         }
-        val argv = mutableListOf(winePath)
+        val argv = mutableListOf(wineBinary)
         argv.addAll(args)
         Log.i(TAG, "wineRun: ${argv.joinToString(" ")}")
         val pb = ProcessBuilder(argv)
@@ -540,8 +597,8 @@ class NativeWinePipeline(private val context: Context) {
      * from jniLibs). `wine --version` does not exercise the hooks, so this is
      * enough for the first iteration.
      */
-    private fun buildEnv(): Map<String, String> {
-        val wineTree = "$dataDir/proton11"
+    private fun buildEnv(useProton9: Boolean = false): Map<String, String> {
+        val wineTree = if (useProton9) "$dataDir/proton9" else "$dataDir/proton11"
         // Prepend GameNative imagefs_bionic lib dir so dlopen("libvulkan.so.1")
         // resolves to the Bionic Khronos loader, and libvulkan_wrapper.so +
         // its deps (libadrenotools, libandroid-sysvshm, libxcb, libdrm, ...)
