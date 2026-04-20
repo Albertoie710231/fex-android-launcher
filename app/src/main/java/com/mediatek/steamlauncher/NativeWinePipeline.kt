@@ -436,12 +436,22 @@ class NativeWinePipeline(private val context: Context) {
             // different baked paths.
             put("REDIRECT_TO",
                 if (useProton9) "$dataDir/imagefs_bionic" else imageFsMirror)
+            // GameNative's shim libraries (libevshim.so, libandroid-sysvshm.so)
+            // have paths under /data/data/com.winlator.cmod/... baked in (the
+            // original Winlator package name). Redirect that namespace too so
+            // evshim can find gamepad.mem etc. under our imagefs_bionic mirror.
+            put("REDIRECT_FROM2", "/data/data/com.winlator.cmod/files/imagefs")
+            put("REDIRECT_TO2", "$dataDir/imagefs_bionic")
+            put("REDIRECT_DEBUG", "1")
             // Keep using proton11/prefix/.wine (has DXVK DLLs + FEX DLLs
             // in drive_c/windows/system32 already). wine 9/10 share prefix
             // format in most respects; if incompatibilities show up we'll
             // stand up a separate prefix.
             put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
-            put("WINEBOOTSTRAPMODE", "1")
+            // NOTE: previously set WINEBOOTSTRAPMODE=1 here. Removed because
+            // GameNative does not set it, and leaving it seems to put wine
+            // services.exe into a partial-init state where it page-faults
+            // and explorer then can't start.
             put("WINEDEBUG", "-all")
             // Bionic Vulkan stack from GameNative's imagefs_bionic (extracted
             // to $dataDir/imagefs_bionic). libvulkan.so.1 is the Bionic-built
@@ -514,12 +524,16 @@ class NativeWinePipeline(private val context: Context) {
             put("XDG_DATA_DIRS", "$dataDir/imagefs_bionic/usr/share")
             put("XDG_CONFIG_DIRS", "$dataDir/imagefs_bionic/etc/xdg")
 
-            // NOTE: Additional GameNative env (HOME=imagefs/home/xuser, USER,
-            // SDL_*, EVSHIM_*, ANDROID_SYSVSHM_SERVER, DXVK_ASYNC,
-            // DXVK_CONFIG_FILE, FEX_MEMCPYSETTSOENABLED, etc.) is not yet set
-            // here. Adding all of them regressed the pipeline (wine hit the
-            // _wassert assertion after vkCreateDevice success; empty stdout).
-            // Re-add selectively once we identify which specific var is safe.
+            // NOTE: Full GameNative env (HOME/USER/TMPDIR/PATH/
+            // ANDROID_SYSVSHM_SERVER/FONTCONFIG_PATH/EVSHIM_*/LD_PRELOAD
+            // chain, etc.) NOT set here. Each time we've added the full
+            // set, libevshim.so (in the LD_PRELOAD chain) has tried to
+            // open a hardcoded /data/data/com.winlator.cmod/...gamepad.mem
+            // via dlsym-of-libc (bypassing our LD_PRELOAD hook), failed,
+            // and the run has either hung or regressed. Until we have a
+            // way to redirect libevshim's dlsym-resolved open(), leave
+            // those env vars off and use only the single-lib LD_PRELOAD
+            // redirect shim we control.
 
             putAll(extraEnv)
         }

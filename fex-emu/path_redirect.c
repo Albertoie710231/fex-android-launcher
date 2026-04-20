@@ -33,39 +33,59 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static const char *g_from = NULL;
-static size_t g_from_len = 0;
-static const char *g_to = NULL;
-static size_t g_to_len = 0;
+/* Support up to N prefix rules. Required for our setup because Pepelespooder's
+ * wine has baked-in paths under /data/data/app.gamenative/..., while GameNative
+ * shim libs (libevshim.so, libandroid-sysvshm.so) have baked-in paths under
+ * /data/data/com.winlator.cmod/... . Both need to resolve to our app's private
+ * data dir. REDIRECT_FROM/TO is rule 1; REDIRECT_FROM2/TO2 is rule 2. */
+#define MAX_RULES 4
+struct rule { const char *from; size_t from_len; const char *to; size_t to_len; };
+static struct rule g_rules[MAX_RULES];
+static int g_rule_count = 0;
 static int g_debug = 0;
+
+static void add_rule(const char *from_var, const char *to_var) {
+    if (g_rule_count >= MAX_RULES) return;
+    const char *f = getenv(from_var);
+    const char *t = getenv(to_var);
+    if (!f || !t) return;
+    g_rules[g_rule_count].from = f;
+    g_rules[g_rule_count].from_len = strlen(f);
+    g_rules[g_rule_count].to = t;
+    g_rules[g_rule_count].to_len = strlen(t);
+    g_rule_count++;
+}
 
 __attribute__((constructor))
 static void init(void) {
-    g_from = getenv("REDIRECT_FROM");
-    g_to = getenv("REDIRECT_TO");
     g_debug = getenv("REDIRECT_DEBUG") != NULL;
-    if (g_from) g_from_len = strlen(g_from);
-    if (g_to) g_to_len = strlen(g_to);
+    add_rule("REDIRECT_FROM", "REDIRECT_TO");
+    add_rule("REDIRECT_FROM2", "REDIRECT_TO2");
+    add_rule("REDIRECT_FROM3", "REDIRECT_TO3");
+    add_rule("REDIRECT_FROM4", "REDIRECT_TO4");
     if (g_debug) {
-        fprintf(stderr, "[redirect] init: FROM=%s TO=%s\n",
-                g_from ? g_from : "(null)", g_to ? g_to : "(null)");
+        fprintf(stderr, "[redirect] init: %d rules\n", g_rule_count);
+        for (int i = 0; i < g_rule_count; i++)
+            fprintf(stderr, "  [%d] %s -> %s\n", i, g_rules[i].from, g_rules[i].to);
     }
 }
 
 /* Returns a buffer owned by the caller (static TLS) if the path needed
- * rewriting, else the original pointer. */
+ * rewriting, else the original pointer. First matching rule wins. */
 static const char *maybe_rewrite(const char *path) {
     static __thread char buf[4096];
-    if (!path || !g_from || !g_to) return path;
-    if (strncmp(path, g_from, g_from_len) != 0) return path;
-    size_t rest_len = strlen(path + g_from_len);
-    if (g_to_len + rest_len + 1 > sizeof(buf)) return path;
-    memcpy(buf, g_to, g_to_len);
-    memcpy(buf + g_to_len, path + g_from_len, rest_len + 1);
-    if (g_debug) {
-        fprintf(stderr, "[redirect] %s -> %s\n", path, buf);
+    if (!path) return path;
+    for (int i = 0; i < g_rule_count; i++) {
+        struct rule *r = &g_rules[i];
+        if (strncmp(path, r->from, r->from_len) != 0) continue;
+        size_t rest_len = strlen(path + r->from_len);
+        if (r->to_len + rest_len + 1 > sizeof(buf)) return path;
+        memcpy(buf, r->to, r->to_len);
+        memcpy(buf + r->to_len, path + r->from_len, rest_len + 1);
+        if (g_debug) fprintf(stderr, "[redirect] %s -> %s\n", path, buf);
+        return buf;
     }
-    return buf;
+    return path;
 }
 
 /* -------- open family -------- */
@@ -196,6 +216,17 @@ DIR *opendir(const char *name) {
     if (!real) real = dlsym(RTLD_NEXT, "opendir");
     return real(maybe_rewrite(name));
 }
+
+/* NOTE: attempted to hook dlsym() to redirect libevshim's
+ * dlsym(libc_handle, "open") to our open. But returning NULL for
+ * non-intercepted symbols (when __loader_dlsym wasn't available)
+ * caused an infinite loop — libevshim retries on NULL. Reverted.
+ *
+ * TODO: fix this via a different mechanism — either use Android's
+ * __libc_dlsym, bind directly to libdl's dlsym entry, or preload a
+ * custom libc stub that wraps open itself. For now, leave dlsym
+ * unhooked; libevshim will keep failing to open gamepad.mem but the
+ * process won't hang. */
 
 /* -------- mmap: force PE DLL/EXE file-backed mmaps to fail so Wine takes its
  * pread-into-anon fallback. Otherwise mmap(PROT_READ|WRITE) on a .dll in
