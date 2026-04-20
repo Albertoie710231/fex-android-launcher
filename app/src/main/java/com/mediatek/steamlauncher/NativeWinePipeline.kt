@@ -513,6 +513,14 @@ class NativeWinePipeline(private val context: Context) {
             // imagefs_bionic/usr/share/vulkan/implicit_layer.d/.
             put("XDG_DATA_DIRS", "$dataDir/imagefs_bionic/usr/share")
             put("XDG_CONFIG_DIRS", "$dataDir/imagefs_bionic/etc/xdg")
+
+            // NOTE: Additional GameNative env (HOME=imagefs/home/xuser, USER,
+            // SDL_*, EVSHIM_*, ANDROID_SYSVSHM_SERVER, DXVK_ASYNC,
+            // DXVK_CONFIG_FILE, FEX_MEMCPYSETTSOENABLED, etc.) is not yet set
+            // here. Adding all of them regressed the pipeline (wine hit the
+            // _wassert assertion after vkCreateDevice success; empty stdout).
+            // Re-add selectively once we identify which specific var is safe.
+
             putAll(extraEnv)
         }
         val argv = mutableListOf(wineBinary)
