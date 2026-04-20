@@ -468,6 +468,17 @@ class NativeWinePipeline(private val context: Context) {
             put("DXVK_LOG_LEVEL", "debug")
             // Mali: per BionicProgramLauncherComponent
             put("BOX64_MMAP32", "0")
+            // Enable the BCn decompression implicit layer (libbcn_layer.so
+            // from GameNative extra_libs). Mali has ASTC/ETC but no BC
+            // texture formats natively, so DXVK's FL11_0 check fails on
+            // textureCompressionBC. The layer emulates BC via compute
+            // shaders and spoofs the feature as supported.
+            put("ENABLE_BCN_COMPUTE", "1")
+            // Bionic Khronos loader discovers implicit layers via XDG paths,
+            // not via VK_LAYER_PATH. Point it at imagefs_bionic/usr/share
+            // where libbcn_layer.json lives.
+            put("XDG_DATA_DIRS", "$dataDir/imagefs_bionic/usr/share")
+            put("XDG_CONFIG_DIRS", "$dataDir/imagefs_bionic/etc/xdg")
             putAll(extraEnv)
         }
         val argv = mutableListOf(wineBinary)
