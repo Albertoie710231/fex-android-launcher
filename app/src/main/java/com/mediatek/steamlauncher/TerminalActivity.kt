@@ -410,22 +410,23 @@ class TerminalActivity : AppCompatActivity() {
                     start()
                 }
             }
+            // Game runs headless for now (renders to DXVK offscreen + X11
+            // but no Android surface is attached). LorieView caused ANR
+            // when previously added to TerminalActivity; plumbing display
+            // via GameActivity (which has LorieView) is a next step.
             val pipeline = NativeWinePipeline(this)
             val gameWindowsPath =
                 "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
             scope.launch {
-                // Back to direct `wine <game>` launch. The `wine explorer
-                // /desktop=...` wrapper GameNative uses didn't help here —
-                // Pepelespooder's explorer.exe hits the same page fault as
-                // services.exe (write to 0xffffffff...+0x28), so wrapping
-                // via it just moves the crash earlier. Need to fix the
-                // wine-internal crash before the desktop-wrapper trick
-                // can pay off.
+                // Explorer /desktop wrapper: tells wine to spawn explorer
+                // AS the desktop host (owns winex11.drv + a root window) and
+                // then run ys9.exe inside that desktop. Previously this hit
+                // the services/explorer DebugInfo crash; now patched.
                 val r = pipeline.wineRun(
-                    args = listOf(gameWindowsPath),
+                    args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
                     timeoutMs = 300_000,
                     extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll",
+                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=",
                         "DISPLAY" to ":0",
