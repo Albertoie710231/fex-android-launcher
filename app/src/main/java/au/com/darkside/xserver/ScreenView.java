@@ -156,6 +156,75 @@ public class ScreenView extends View {
     private int screenWidth()  { return _headlessWidth  > 0 ? _headlessWidth  : getWidth();  }
     private int screenHeight() { return _headlessHeight > 0 ? _headlessHeight : getHeight(); }
 
+    /**
+     * Auto-WM focus policy: move input focus to the given window without
+     * going through a client's explicit SetInputFocus request. Called from
+     * Window.map() when a non-override-redirect window becomes viewable.
+     * Without this, wine clients never get FocusIn for their top-level
+     * windows (no WM runs alongside this server to reassign focus on map),
+     * and wine's message pump never dispatches WM_ACTIVATEAPP → games block
+     * forever on activation events.
+     *
+     * Matches the core logic of processSetInputFocusRequest but triggered
+     * server-side so wine/X11 don't have to ask.
+     */
+    public void autoFocusOnMap(Window w) {
+        if (w == null || _rootWindow == null) return;
+
+        // Pick the "outer wine hwnd window" to focus, not w itself.
+        //
+        // Wine creates each top-level as an outer "whole" X11 window with
+        // an inner "client" X11 window as its child. Wine subscribes to
+        // FocusChangeMask only on the outer window. Darkside's
+        // focusInOutNotify, for a focus change between an ancestor and an
+        // inferior descendant, emits FocusIn ONLY on the endpoint — the
+        // intermediate "outer" window never receives FocusIn with that
+        // code path. So if we focus w (the inner client), wine's outer
+        // hwnd never hears about it.
+        //
+        // Walk up stopping at the child of a window that is either the
+        // root OR already mapped+visible. That lands on the outer wine
+        // hwnd window regardless of how many explorer wrapper levels
+        // sit above it.
+        // Focus the mapped window's direct parent when the parent is NOT
+        // the root — that parent is the outer wine "whole" window that
+        // holds the hwnd registration, while w itself is the "client"
+        // sub-window wine doesn't subscribe to focus events on. When the
+        // parent IS the root (e.g. the explorer virtual-root window
+        // itself being mapped), focus w directly.
+        Window target = w;
+        if (w.getParent() != null && w.getParent() != _rootWindow) {
+            target = w.getParent();
+        }
+
+        if (target == _focusWindow) return;
+
+        // Force-mark target as mapped so focusInNotify delivers the event.
+        // Wine's explorer-desktop path never XMapWindows the outer "whole"
+        // window explicitly, but it IS logically mapped (the inner client
+        // is mapped inside it). Without this, focusInNotify's !_isMapped
+        // early-return drops the FocusIn wine's hwnd subscriber is
+        // waiting on.
+        target.markMappedForFocus();
+        // Also mark every ancestor up to root — some focus-notify paths
+        // require ancestors to be mapped too.
+        for (Window p = target.getParent(); p != null && p != _rootWindow; p = p.getParent()) {
+            p.markMappedForFocus();
+        }
+
+        int now = _xServer.getTimestamp();
+        Window pw = _rootWindow.windowAtPoint(_motionX, _motionY);
+        try {
+            Window.focusInOutNotify(_focusWindow, target, pw, _rootWindow,
+                    _grabKeyboardWindow == null ? 0 : 3);
+        } catch (Throwable t) {
+            // best-effort; any handler failure shouldn't unmap the window
+        }
+        _focusWindow = target;
+        _focusRevertTo = 2;
+        _focusLastChangeTime = now;
+    }
+
     private Window _sharedClipboardWindow = null;
     private Property _sharedClipboardProperty = null;
     private Property _sharedClipboardPrimaryProperty = null;
