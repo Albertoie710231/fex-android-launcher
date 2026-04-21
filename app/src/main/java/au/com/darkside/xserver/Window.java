@@ -45,6 +45,18 @@ public class Window extends Resource {
     private final Set<PassiveButtonGrab> _passiveButtonGrabs;
     private final Set<PassiveKeyGrab> _passiveKeyGrabs;
     private boolean _isMapped = false;
+
+    /**
+     * Headless-server-only: mark this window as mapped without sending
+     * MapRequest/MapNotify side effects. ScreenView's auto-focus policy
+     * needs to focus intermediate "wine outer whole window" ancestors
+     * that wine creates but never XMapWindow's; focusInNotify bails on
+     * unmapped windows and wine's hwnd-tracking subscriber would never
+     * hear the event.
+     */
+    public void markMappedForFocus() {
+        _isMapped = true;
+    }
     private boolean _exposed = false;
     private int _visibility = NotViewable;
     private Bitmap _backgroundBitmap = null;
@@ -1677,6 +1689,21 @@ public class Window extends Resource {
                 }
             }
             _exposed = true;
+        }
+
+        // Auto-WM focus policy for wine on this server. A normal Window
+        // Manager would observe the MapRequest/MapNotify and call
+        // XSetInputFocus on the newly-visible top-level — that's how games
+        // get WM_ACTIVATEAPP and kick their message pumps. Without a WM in
+        // the pipeline (Darkside runs standalone; wine's explorer /desktop=
+        // wrapper doesn't reassign focus to its children either), wine
+        // would otherwise never dispatch activation events and the game
+        // deadlocks on the first present. We only auto-focus "real"
+        // top-level windows — skip override-redirect (menus/tooltips) and
+        // skip the root window itself. We let clients override via an
+        // explicit SetInputFocus request afterwards.
+        if (!_overrideRedirect && _parent != null && _screen != null) {
+            _screen.autoFocusOnMap(this);
         }
     }
 
