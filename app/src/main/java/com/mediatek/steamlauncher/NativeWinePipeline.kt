@@ -286,10 +286,19 @@ class NativeWinePipeline(private val context: Context) {
                 }
                 """.trimIndent()
             )
-            File(vkConfigDir, "VK_LAYER_HEADLESS_surface.json").writeText(
+            // The Bionic Vulkan loader only discovers IMPLICIT layers via
+            // XDG_DATA_DIRS/vulkan/implicit_layer.d/*.json (VK_LAYER_PATH
+            // only covers explicit layers). Write our manifest into the
+            // imagefs_bionic implicit_layer.d dir alongside MangoHud,
+            // libbcn_layer, feature_spoof, etc.
+            val implicitLayerDir = File(
+                "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d"
+            )
+            implicitLayerDir.mkdirs()
+            File(implicitLayerDir, "VK_LAYER_HEADLESS_surface.json").writeText(
                 """
                 {
-                    "file_format_version": "1.0.0",
+                    "file_format_version": "1.2.0",
                     "layer": {
                         "name": "VK_LAYER_HEADLESS_surface",
                         "type": "GLOBAL",
@@ -297,22 +306,8 @@ class NativeWinePipeline(private val context: Context) {
                         "api_version": "1.3.0",
                         "implementation_version": "1",
                         "description": "Headless surface bridge for DXVK on native ARM64 wine",
-                        "instance_extensions": [
-                            { "name": "VK_KHR_surface", "spec_version": "25" },
-                            { "name": "VK_KHR_xcb_surface", "spec_version": "6" },
-                            { "name": "VK_KHR_xlib_surface", "spec_version": "6" },
-                            { "name": "VK_EXT_headless_surface", "spec_version": "1" }
-                        ],
-                        "device_extensions": [
-                            { "name": "VK_KHR_swapchain", "spec_version": "70" },
-                            { "name": "VK_EXT_depth_clip_enable", "spec_version": "1" },
-                            { "name": "VK_EXT_custom_border_color", "spec_version": "12" },
-                            { "name": "VK_EXT_transform_feedback", "spec_version": "1" },
-                            { "name": "VK_KHR_maintenance6", "spec_version": "1" },
-                            { "name": "VK_EXT_vertex_attribute_divisor", "spec_version": "3" }
-                        ],
-                        "disable_environment": { "DISABLE_HEADLESS_LAYER": "1" },
-                        "enable_environment": { "ENABLE_HEADLESS_LAYER": "1" }
+                        "enable_environment": { "ENABLE_HEADLESS_LAYER": "1" },
+                        "disable_environment": { "DISABLE_HEADLESS_LAYER": "1" }
                     }
                 }
                 """.trimIndent()
@@ -468,6 +463,12 @@ class NativeWinePipeline(private val context: Context) {
             put("VK_LAYER_PATH",
                 "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d:" +
                 "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d")
+            // VK_LAYER_HEADLESS_surface manifest is written into
+            // imagefs_bionic/usr/share/vulkan/implicit_layer.d (see
+            // ensureImageFsMirror) so the Bionic Vulkan loader picks it up
+            // via XDG_DATA_DIRS. It intercepts DXVK's vkQueuePresentKHR and
+            // streams frames to FrameSocketServer on TCP 19850.
+            put("ENABLE_HEADLESS_LAYER", "1")
             put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
             // Exact env set GameNative uses for a working Ys IX run on this
             // Mali tablet (captured from /proc/<ys9-pid>/environ — see

@@ -410,10 +410,12 @@ class TerminalActivity : AppCompatActivity() {
                     start()
                 }
             }
-            // Game runs headless for now (renders to DXVK offscreen + X11
-            // but no Android surface is attached). LorieView caused ANR
-            // when previously added to TerminalActivity; plumbing display
-            // via GameActivity (which has LorieView) is a next step.
+            // Toggle display mode so `vulkanSurface` is visible and
+            // frameSocketServer binds it as its output. DXVK's presents
+            // are captured by VK_LAYER_HEADLESS_surface, streamed over
+            // TCP 19850 to FrameSocketServer, which renders via
+            // lockHardwareCanvas to vulkanSurface.
+            if (!isDisplayMode) toggleDisplayMode()
             val pipeline = NativeWinePipeline(this)
             val gameWindowsPath =
                 "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
