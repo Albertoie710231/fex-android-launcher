@@ -496,6 +496,17 @@ class NativeWinePipeline(private val context: Context) {
             put("SPOOF_FEATURES", "1")
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
+            // Write DXVK log to its own file so we can reconstruct its
+            // sequence without wine-server traces interleaving char-by-char.
+            put("DXVK_LOG_PATH", "$dataDir/dxvk_ys9.log")
+            // Disable DXVK's OpenVR/OpenXR extension providers. On this
+            // pipeline they fail "Failed to locate module" (no openvr_api
+            // / openxr_loader on device) and, right after enumeration,
+            // a function-pointer call in their integration path sends rip
+            // into unmapped FEX-cache memory (DEP exec violation at
+            // 0x6FCE... with no loaded module).
+            put("DXVK_CONFIG",
+                "dxvk.enableOpenVR=False;dxvk.enableOpenXR=False")
             put("BOX64_MMAP32", "0")
             // Mesa/Zink
             put("MESA_DEBUG", "silent")
