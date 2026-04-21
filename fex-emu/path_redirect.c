@@ -56,6 +56,40 @@ static void add_rule(const char *from_var, const char *to_var) {
     g_rule_count++;
 }
 
+/* When CRASH_DUMP_MAPS is set, a background thread re-dumps /proc/self/maps
+ * to the configured file every 500ms. Wine's SEH hijacks the signal handlers
+ * we'd normally install, so a polling thread is the simplest reliable way
+ * to capture the ASLR-randomized .so bases at or near fault time. */
+#include <pthread.h>
+#include <unistd.h>
+static char g_maps_out_path[512];
+
+static void *maps_poller(void *arg) {
+    (void)arg;
+    for (;;) {
+        int dst = open(g_maps_out_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (dst >= 0) {
+            int src = open("/proc/self/maps", O_RDONLY);
+            if (src >= 0) {
+                char buf[4096];
+                ssize_t n;
+                while ((n = read(src, buf, sizeof(buf))) > 0) {
+                    ssize_t off = 0;
+                    while (off < n) {
+                        ssize_t w = write(dst, buf + off, n - off);
+                        if (w <= 0) break;
+                        off += w;
+                    }
+                }
+                close(src);
+            }
+            close(dst);
+        }
+        usleep(500000);
+    }
+    return NULL;
+}
+
 __attribute__((constructor))
 static void init(void) {
     g_debug = getenv("REDIRECT_DEBUG") != NULL;
@@ -67,6 +101,16 @@ static void init(void) {
         fprintf(stderr, "[redirect] init: %d rules\n", g_rule_count);
         for (int i = 0; i < g_rule_count; i++)
             fprintf(stderr, "  [%d] %s -> %s\n", i, g_rules[i].from, g_rules[i].to);
+    }
+    const char *p = getenv("CRASH_DUMP_MAPS");
+    if (p && *p) {
+        /* Each forked wine process loads us — tag the dump per-pid so they
+         * don't race-truncate a shared file. */
+        snprintf(g_maps_out_path, sizeof(g_maps_out_path), "%s.%d", p, (int)getpid());
+        pthread_t tid;
+        pthread_create(&tid, NULL, maps_poller, NULL);
+        pthread_detach(tid);
+        if (g_debug) fprintf(stderr, "[redirect] maps poller armed -> %s\n", g_maps_out_path);
     }
 }
 

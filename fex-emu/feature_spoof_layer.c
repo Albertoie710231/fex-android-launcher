@@ -166,6 +166,12 @@ typedef struct VkDeviceCreateInfo {
 
 typedef VkResult (*PFN_vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*);
 static PFN_vkCreateDevice next_CreateDevice = NULL;
+/* Captured during FeatSpoof_CreateDevice so FeatSpoof_GetDeviceProcAddr can
+ * forward. Single-device simplification: overwritten if multiple devices are
+ * created, but DXVK only creates one here. Without this, BCnLayer (which
+ * sits above us) queries device funcs through us, gets NULL, then calls
+ * through NULL → DEP fault in BCnLayer_CreateDevice. */
+static PFN_vkVoidFunction (*next_GetDeviceProcAddr)(VkDevice, const char*) = NULL;
 
 typedef struct VkLayerDeviceLink_ {
     struct VkLayerDeviceLink_ *pNext;
@@ -395,6 +401,7 @@ VkResult FeatSpoof_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *p
         return (VkResult)-3;
     }
     PFN_vkVoidFunction (*gipa)(VkInstance, const char*) = ci->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    next_GetDeviceProcAddr = ci->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     ((VkLayerDeviceCreateInfo*)ci)->u.pLayerInfo = ci->u.pLayerInfo->pNext;
 
     PFN_vkCreateDevice createNext = (PFN_vkCreateDevice)gipa(NULL, "vkCreateDevice");
@@ -553,10 +560,11 @@ PFN_vkVoidFunction FeatSpoof_GetInstanceProcAddr(VkInstance instance, const char
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction FeatSpoof_GetDeviceProcAddr(VkDevice device, const char *pName) {
-    /* Device-level funcs we don't override — pass straight through via
-     * whatever getter was chained for this device. We don't have a
-     * dedicated next_GetDeviceProcAddr for simplicity — return NULL so the
-     * loader skips this layer at the device level. */
-    (void)device; (void)pName;
+    /* We don't intercept any device-level functions — forward to the next
+     * layer's GetDeviceProcAddr. Returning NULL here was wrong: the loader
+     * doesn't "skip" a non-intercepting layer, it propagates the NULL up.
+     * Layers above us (BCnLayer in our stack) call through the returned
+     * pointer, and NULL → DEP fault in BCnLayer_CreateDevice. */
+    if (next_GetDeviceProcAddr) return next_GetDeviceProcAddr(device, pName);
     return NULL;
 }

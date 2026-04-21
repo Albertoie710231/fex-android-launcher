@@ -121,11 +121,19 @@ def patch(in_path, out_path):
                     repl = 0xD503201F if ins3 == (0xD63F0000 | (rt << 5)) else 0xD65F03C0
                     struct.pack_into('<I', data, call_off, repl)
                     hits += 1
-                    # If a BRK #1 (poison) immediately follows a BLR _assert,
-                    # NOP it too — execution resumes past the "unreachable" mark.
-                    nxt = struct.unpack_from('<I', data, call_off + 4)[0]
-                    if ins3 == (0xD63F0000 | (rt << 5)) and nxt == 0xD4200020:
-                        struct.pack_into('<I', data, call_off + 4, 0xD503201F)
+                    # After BLR to _assert, the compiler emits unreachable
+                    # poison — BRK #1 and/or UDF #imm16. Clang-cl on ARM64
+                    # Windows emits both: first `brk #1` (0xD4200020), then
+                    # `udf #imm` (top 16 bits = 0, low 16 bits = imm). NOP
+                    # every poison slot until we hit a real instruction.
+                    if ins3 == (0xD63F0000 | (rt << 5)):
+                        for k in range(1, 4):
+                            nxt = struct.unpack_from('<I', data, call_off + 4 * k)[0]
+                            is_brk = nxt == 0xD4200020
+                            is_udf = (nxt & 0xFFFF0000) == 0x00000000 and nxt != 0
+                            if not (is_brk or is_udf):
+                                break
+                            struct.pack_into('<I', data, call_off + 4 * k, 0xD503201F)
                     break
                 # Bail if rt is overwritten before the call. ADRP/ADR/LDR/MOV
                 # etc. all write Rd at bits 4-0; that's a conservative test
@@ -223,14 +231,40 @@ def patch(in_path, out_path):
                         break
                 if found_assert:
                     struct.pack_into('<I', data, foff, 0xD503201F)  # NOP BLR
-                    struct.pack_into('<I', data, foff + 4, 0xD503201F)  # NOP BRK
+                    # NOP the poison chain (BRK #1 / UDF #imm) following the BLR.
+                    for k in range(1, 4):
+                        nxt = struct.unpack_from('<I', data, foff + 4 * k)[0]
+                        is_brk = nxt == 0xD4200020
+                        is_udf = (nxt & 0xFFFF0000) == 0x00000000 and nxt != 0
+                        if not (is_brk or is_udf):
+                            break
+                        struct.pack_into('<I', data, foff + 4 * k, 0xD503201F)
                     hits += 1
                 break
             break
 
+    # Pass 3: sweep up orphan poison. Earlier versions of this script only
+    # NOPed BRK #1 after the BLR; UDF #imm poison was left in place. When
+    # re-running on an already-patched binary, BLR sites are now NOPs, so
+    # we look for any `UDF #imm` (top 16 bits zero) preceded by two NOPs.
+    # That pattern is distinctive — no legitimate code path runs into UDF
+    # through NOPs.
+    nop_sweep = 0
+    for off in range(8, txt_vsize - 4, 4):
+        foff = txt_raddr + off
+        w = struct.unpack_from('<I', data, foff)[0]
+        is_udf = (w & 0xFFFF0000) == 0x00000000 and w != 0
+        if not is_udf:
+            continue
+        prev1 = struct.unpack_from('<I', data, foff - 4)[0]
+        prev2 = struct.unpack_from('<I', data, foff - 8)[0]
+        if prev1 == 0xD503201F and prev2 == 0xD503201F:
+            struct.pack_into('<I', data, foff, 0xD503201F)
+            nop_sweep += 1
+
     with open(out_path, 'wb') as f:
         f.write(data)
-    print(f'patched {hits} BLR(s) -> NOP, wrote {out_path}')
+    print(f'patched {hits} BLR(s) -> NOP, sweep NOPed {nop_sweep} orphan UDF(s), wrote {out_path}')
 
 
 if __name__ == '__main__':

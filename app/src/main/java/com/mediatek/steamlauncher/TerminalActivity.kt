@@ -425,25 +425,33 @@ class TerminalActivity : AppCompatActivity() {
                     args = listOf(gameWindowsPath),
                     timeoutMs = 300_000,
                     extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,+loaddll,+vulkan,+x11drv,warn+vulkan",
+                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll",
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=",
                         "DISPLAY" to ":0",
                     ),
-                    // Back on Pepelespooder wine 10. Binary-patching its
-                    // winevulkan.dll to NOP out the _assert calls so we can
-                    // proceed past vkCreateDevice success. Proton 9 failed
-                    // at init_vulkan (graphics driver loading) — wine 9's
-                    // different vulkan init path doesn't work with our
-                    // wrapper_icd setup yet.
+                    // Wine 10 with binary patches (services/explorer
+                    // DebugInfo write NOPed via patch_wine_debuginfo_spare.py,
+                    // winevulkan _assert BLR NOPed via patch_winevulkan_assert.py
+                    // — NOT the UDF sweep). libfeatspoof.so GetDeviceProcAddr
+                    // now forwards to next layer (was returning NULL, which
+                    // caused libbcn_layer above us to crash with pc=0).
+                    // End result: DXVK completes D3D11CoreCreateDevice at
+                    // FEATURE_LEVEL_11_0 (Mali-G720) with zero wine
+                    // exceptions. Game fails at CreateSwapChain — no
+                    // graphics-driver window; same blocker as proton-9 path.
                     useProton9 = false,
                 )
+                try {
+                    java.io.File(filesDir, "ys9_stdout.log").writeText(r.stdout)
+                    java.io.File(filesDir, "ys9_stderr.log").writeText(r.stderr)
+                } catch (_: Throwable) {}
                 handler.post {
                     appendOutput("ys9 exit=${r.exitCode}\n")
-                    if (r.stdout.isNotEmpty()) appendOutput("stdout:\n${r.stdout}")
-                    if (r.stderr.isNotEmpty()) appendOutput("stderr:\n${r.stderr}")
+                    appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
+                    appendOutput("full logs: files/ys9_stdout.log, files/ys9_stderr.log\n")
                     if (r.exitCode == -99) {
-                        appendOutput("[ys9 process still running at 120s timeout]\n")
+                        appendOutput("[ys9 process still running at timeout]\n")
                     }
                     appendOutput("===========================================\n")
                 }
