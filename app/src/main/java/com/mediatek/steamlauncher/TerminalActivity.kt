@@ -420,29 +420,44 @@ class TerminalActivity : AppCompatActivity() {
             val gameWindowsPath =
                 "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
             scope.launch {
-                // Explorer /desktop wrapper: tells wine to spawn explorer
-                // AS the desktop host (owns winex11.drv + a root window) and
-                // then run ys9.exe inside that desktop. Previously this hit
-                // the services/explorer DebugInfo crash; now patched.
+                // Explorer /desktop wrapper is REQUIRED. Without it wine has
+                // no graphics driver registered for window creation (directly
+                // launching ys9.exe fails with `nodrv_CreateWindow "The
+                // explorer process failed to start."` → `!Err! CreateSwapChain
+                // Error.`). Our headless Vulkan layer doesn't replace
+                // winex11.drv's CreateWindow path — only the Vulkan surface.
                 val r = pipeline.wineRun(
                     args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
                     timeoutMs = 300_000,
                     extraEnv = mapOf(
                         "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
+                        // Stubs from the old FEX pipeline's /opt/stubs/ dir,
+                        // deployed into game-dir + prefix system32. Each "=n"
+                        // picks up the stub instead of wine's builtin or the
+                        // publisher's real DLL:
+                        //   - xaudio2_7: wine builtin NULL-derefs when ALSA has
+                        //     no backend; stub returns S_OK for every call.
+                        //   - Galaxy64: GOG Galaxy IPC blocks main thread before
+                        //     the render loop starts (explicit comment in
+                        //     ProtonManager.kt line 933). THIS was the post-
+                        //     audio blocker.
+                        //   - steam_api64: real DLL blocks on Steam runtime.
+                        //   - GFSDK_SSAO: NVIDIA GameWorks SSAO hits paths DXVK
+                        //     doesn't implement identically.
                         "WINEDLLOVERRIDES" to
-                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=",
+                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
+                            "xaudio2_7=n;xapofx1_5=n;" +
+                            "Galaxy64=n;steam_api64=n;" +
+                            "GFSDK_SSAO_D3D11=n",
                         "DISPLAY" to ":0",
                     ),
-                    // Wine 10 with binary patches (services/explorer
-                    // DebugInfo write NOPed via patch_wine_debuginfo_spare.py,
-                    // winevulkan _assert BLR NOPed via patch_winevulkan_assert.py
-                    // — NOT the UDF sweep). libfeatspoof.so GetDeviceProcAddr
-                    // now forwards to next layer (was returning NULL, which
-                    // caused libbcn_layer above us to crash with pc=0).
-                    // End result: DXVK completes D3D11CoreCreateDevice at
-                    // FEATURE_LEVEL_11_0 (Mali-G720) with zero wine
-                    // exceptions. Game fails at CreateSwapChain — no
-                    // graphics-driver window; same blocker as proton-9 path.
+                    // Back on wine-10 (proton-10.0.99-arm64ec in proton11/).
+                    // Proton 9 with the xapofx1_5 stub gets past audio init
+                    // (CSound threads spawn) but deadlocks EARLIER than
+                    // wine-10 — stuck at vkAcquireNextImageKHR with 0
+                    // presents, while wine-10 gets to 1 present (black
+                    // frame reaches Java). wine-10 is strictly better
+                    // progress until we figure out either deadlock.
                     useProton9 = false,
                 )
                 try {

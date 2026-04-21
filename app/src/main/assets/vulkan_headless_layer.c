@@ -563,9 +563,17 @@ static PFN_GetImageFormatProps2 g_real_get_image_format_props2 = NULL;
 #define LOG_TAG "[HeadlessLayer] "
 #define LOG(...) do { fprintf(stderr, LOG_TAG __VA_ARGS__); fflush(stderr); } while(0)
 
-/* File-based debug markers — survives even if stderr is lost */
+/* File-based debug markers — survives even if stderr is lost.
+ * Uses TMPDIR when set (native Bionic wine writes to files/tmp there);
+ * falls back to /tmp which is what FEX-rootfs runs use. */
 static void layer_marker(const char* msg) {
-    FILE* f = fopen("/tmp/layer_trace.log", "a");
+    static char path[256] = {0};
+    if (!path[0]) {
+        const char *td = getenv("TMPDIR");
+        if (td && *td) snprintf(path, sizeof(path), "%s/layer_trace.log", td);
+        else           snprintf(path, sizeof(path), "/tmp/layer_trace.log");
+    }
+    FILE* f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
@@ -665,15 +673,23 @@ static int connect_frame_socket(void) {
         return 0;
     }
 
-    int flags = fcntl(g_frame_socket, F_GETFL, 0);
-    fcntl(g_frame_socket, F_SETFL, flags | O_NONBLOCK);
+    /* Blocking socket: Java reader thread paces us at ~vsync via
+     * lockHardwareCanvas. Non-blocking + drop-frame had a latent bug where
+     * the first partial-drain (EAGAIN) left g_pending_total > 0 forever
+     * and every subsequent frame was dropped at the top of send_frame,
+     * so only frame 0 ever reached Java. A blocking socket naturally
+     * throttles the present thread to whatever rate Java consumes.
+     * SO_SNDTIMEO guards against a dead receiver hanging the game. */
     int nodelay = 1;
     setsockopt(g_frame_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     int sndbuf = 4 * 1024 * 1024;
     setsockopt(g_frame_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    struct timeval to = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(g_frame_socket, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
 
     g_frame_connected = 1;
     g_pending_total = g_pending_sent = 0;
+    layer_marker("FRAME_SOCK_CONNECT_OK");
     LOG("Connected to frame socket on port %d\n", FRAME_SOCKET_PORT);
     return 1;
 }
@@ -704,7 +720,7 @@ static void send_frame(uint32_t width, uint32_t height, const void* pixels, size
     if (g_pending_total > 0) {
         int r = drain_pending();
         if (r < 0) { disconnect_frame_socket(); return; }
-        if (r == 0) return; /* drop frame */
+        if (r == 0) return; /* drop frame (shouldn't happen with blocking sock) */
     }
 
     size_t expected_pitch = width * 4;
@@ -734,7 +750,15 @@ static void send_frame(uint32_t width, uint32_t height, const void* pixels, size
 
     g_pending_total = frame_size;
     g_pending_sent = 0;
-    if (drain_pending() < 0) disconnect_frame_socket();
+    int r = drain_pending();
+    static int send_seq = 0;
+    if (send_seq < 8 || (send_seq & 0x3F) == 0) {
+        char b[96];
+        snprintf(b, sizeof(b), "FRAME_SEND #%d r=%d size=%zu", send_seq, r, frame_size);
+        layer_marker(b);
+    }
+    send_seq++;
+    if (r < 0) disconnect_frame_socket();
 }
 
 /* ============================================================================
