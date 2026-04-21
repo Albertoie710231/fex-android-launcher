@@ -313,10 +313,240 @@ class NativeWinePipeline(private val context: Context) {
                 """.trimIndent()
             )
 
+            ensureYs9Stubs()
+            ensureNullAlsaConfig()
+            ensurePatchedWineBinaries()
+
             true
         } catch (t: Throwable) {
             Log.e(TAG, "ensureImageFsMirror failed", t)
             false
+        }
+    }
+
+    /**
+     * Deploy game-specific stub DLLs into both the game's exe-dir and the
+     * prefix's system32. Each stub replaces a real DLL that otherwise crashes
+     * or hangs on this pipeline:
+     *   - xaudio2_7.dll: wine's builtin NULL-derefs at +0x33364 when ALSA can't
+     *     open a backend. Stub returns S_OK / mock IXAudio2 for every call.
+     *   - Galaxy64.dll: real DLL's GOG Galaxy IPC blocks main thread before
+     *     the render loop starts (old FEX pipeline's ProtonManager.kt line 933
+     *     explicitly calls this out).
+     *   - steam_api64.dll: real DLL blocks on Steam runtime IPC.
+     *   - GFSDK_SSAO_D3D11.win64.dll: NVIDIA GameWorks SSAO hits paths DXVK
+     *     doesn't implement identically.
+     *
+     * The stubs are x86_64 PE — wine runs ys9.exe in experimental ARM64EC
+     * mode which loads x86_64 via emulation. A pure ARM64 stub fails with
+     * STATUS_INVALID_IMAGE_FORMAT.
+     *
+     * Original files are backed up as `.orig` on first deploy so a user can
+     * revert if a real Steam runtime ever becomes available.
+     */
+    private fun ensureYs9Stubs(): Boolean {
+        try {
+            val sys32 = "$dataDir/proton11/prefix/.wine/drive_c/windows/system32"
+            val gameDir = "$dataDir/fex-rootfs/Ubuntu_22_04/home/user/Steam/steamapps/common/Ys IX Monstrum Nox"
+
+            val stubs = listOf(
+                "xaudio2_7.dll",
+                "Galaxy64.dll",
+                "steam_api64.dll",
+                "GFSDK_SSAO_D3D11.win64.dll",
+            )
+
+            // Sentinel file so we don't re-deploy on every launch.
+            val sentinel = File("$dataDir/.ys9_stubs_deployed_v1")
+            if (sentinel.exists()) {
+                return true
+            }
+
+            File(sys32).mkdirs()
+
+            for (name in stubs) {
+                // system32: overwrite whatever is there (wine's builtin
+                // re-populates system32 from lib/wine/aarch64-windows on every
+                // wineboot, so we must re-overwrite every time the sentinel
+                // is cleared).
+                context.assets.open(name).use { input ->
+                    File(sys32, name).outputStream().use { out -> input.copyTo(out) }
+                }
+
+                // Game dir: only deploy if the publisher's DLL is present,
+                // and back it up once as `.orig`.
+                val gameFile = File(gameDir, name)
+                if (gameFile.exists()) {
+                    val backup = File(gameDir, "$name.orig")
+                    if (!backup.exists()) {
+                        gameFile.copyTo(backup, overwrite = false)
+                    }
+                    context.assets.open(name).use { input ->
+                        gameFile.outputStream().use { out -> input.copyTo(out) }
+                    }
+                }
+            }
+
+            // Proton 9 (wine-9)'s CoCreateInstance for IXAudio2 goes through
+            // xapofx1_5.dll (DirectX Audio FX Pack) before xaudio2_7. Wine-9's
+            // builtin xapofx1_5 doesn't export DllGetClassObject, so the
+            // COM lookup fails and audio init exits without signaling. Reuse
+            // the xaudio2_7 stub as xapofx1_5 — same mock-IXAudio2 exports.
+            context.assets.open("xaudio2_7.dll").use { input ->
+                File(sys32, "xapofx1_5.dll").outputStream().use { out -> input.copyTo(out) }
+            }
+
+            // steam_api64 needs steamclient.dll/steamclient64.dll in
+            // C:\steamclient per the Valve registry entries, even though the
+            // stub doesn't actually load them. We reuse the steam_api64 stub
+            // as a placeholder — its Steamworks-shaped exports satisfy wine's
+            // delay-load resolver.
+            val steamclientDir = File("$dataDir/proton11/prefix/.wine/drive_c/steamclient")
+            steamclientDir.mkdirs()
+            for (fn in listOf("steamclient.dll", "steamclient64.dll")) {
+                context.assets.open("steam_api64.dll").use { input ->
+                    File(steamclientDir, fn).outputStream().use { out -> input.copyTo(out) }
+                }
+            }
+
+            // steam_appid.txt — some DRM checks read this from the game dir.
+            // 993940 is what the game's existing appid file had pre-deploy.
+            File(gameDir).mkdirs()
+            File(gameDir, "steam_appid.txt").writeText("993940\n")
+
+            // steam.pipe — Steam IPC handshake dummy. Path is wherever the
+            // game stat()s for it; placing one under files/.steam covers the
+            // most common location.
+            File("$dataDir/.steam").mkdirs()
+            File("$dataDir/.steam/steam.pipe").writeText("1\n")
+
+            sentinel.writeText("deployed ${System.currentTimeMillis()}")
+            Log.i(TAG, "ensureYs9Stubs deployed ${stubs.size} stubs + steamclient")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureYs9Stubs failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Deploy pre-patched services.exe + explorer.exe into the proton tree.
+     * Both wine-built PEs have a pre-fix `DebugInfo->Spare[0] = __FILE__`
+     * write that dereferences the `(void *)-1` sentinel wine-10 now assigns
+     * when not allocating RTL_CRITICAL_SECTION_DEBUG — instant page fault.
+     *
+     * The NOP patch was generated offline via
+     * `fex-emu/patch_wine_debuginfo_spare.py`. We bundle the patched PEs as
+     * assets rather than running python at runtime.
+     *
+     * Runs unconditionally (no sentinel) because wineboot re-copies the
+     * lib/wine/aarch64-windows originals into the prefix system32 on every
+     * boot. If `useProton9=true` was ever tested in-between, the lib/wine
+     * tree gets reset too, so we always write the patched versions back.
+     */
+    private fun ensurePatchedWineBinaries(): Boolean {
+        try {
+            val wineWinDir = "$dataDir/proton11/lib/wine/aarch64-windows"
+            File(wineWinDir).mkdirs()
+            for (name in listOf("services.exe", "explorer.exe")) {
+                context.assets.open(name).use { input ->
+                    File(wineWinDir, name).outputStream().use { out -> input.copyTo(out) }
+                }
+            }
+            // Wipe system32 copies so wineboot is forced to re-copy from
+            // our patched lib/wine tree. Without this wineboot sees the
+            // existing prefix copies (possibly corrupted by a prior
+            // useProton9=true test) and reuses them.
+            val sys32 = "$dataDir/proton11/prefix/.wine/drive_c/windows/system32"
+            for (name in listOf("services.exe", "explorer.exe")) {
+                File(sys32, name).delete()
+            }
+            Log.i(TAG, "ensurePatchedWineBinaries deployed services.exe + explorer.exe")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensurePatchedWineBinaries failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Overwrite imagefs_bionic's ALSA config to use a null PCM as the
+     * default device. The shipped config points the default PCM at the
+     * `android_aserver` ALSA plugin which needs an `aserverd` daemon we
+     * don't run — so PCM open fails, winealsa returns no-devices, and wine's
+     * builtin xaudio2_7 NULL-derefs. With a null PCM, ALSA opens a silent
+     * device (it still tries /dev/full but wine handles that case), and our
+     * xaudio2_7 stub is never asked to do audio anyway.
+     *
+     * Three files to patch — ALSA loads /usr/share/alsa/alsa.conf which in
+     * turn loads android_aserver.conf from both /usr/share/alsa/ and
+     * /usr/etc/alsa/conf.d/.
+     */
+    private fun ensureNullAlsaConfig(): Boolean {
+        try {
+            val sentinel = File("$dataDir/.alsa_null_pcm_v1")
+            if (sentinel.exists()) {
+                return true
+            }
+
+            val alsaConf = """
+                pcm.!default {
+                    type null
+                }
+                ctl.!default {
+                    type null
+                }
+                pcm.null {
+                    type null
+                }
+                ctl.null {
+                    type null
+                }
+            """.trimIndent()
+
+            val androidAserverConf = """
+                pcm.android_aserver {
+                    type null
+                }
+                ctl.android_aserver {
+                    type null
+                }
+                pcm.!default {
+                    type null
+                }
+                ctl.!default {
+                    type null
+                }
+            """.trimIndent()
+
+            val shareAlsa = "$dataDir/imagefs_bionic/usr/share/alsa"
+            val confD = "$dataDir/imagefs_bionic/usr/etc/alsa/conf.d"
+            File(shareAlsa).mkdirs()
+            File(confD).mkdirs()
+
+            // Back up originals once
+            for (path in listOf(
+                "$shareAlsa/alsa.conf",
+                "$shareAlsa/android_aserver.conf",
+                "$confD/android_aserver.conf",
+            )) {
+                val f = File(path)
+                val backup = File("$path.orig")
+                if (f.exists() && !backup.exists()) {
+                    f.copyTo(backup, overwrite = false)
+                }
+            }
+
+            File("$shareAlsa/alsa.conf").writeText(alsaConf)
+            File("$shareAlsa/android_aserver.conf").writeText(androidAserverConf)
+            File("$confD/android_aserver.conf").writeText(androidAserverConf)
+
+            sentinel.writeText("patched ${System.currentTimeMillis()}")
+            Log.i(TAG, "ensureNullAlsaConfig patched 3 files")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureNullAlsaConfig failed", t)
+            return false
         }
     }
 
@@ -437,6 +667,14 @@ class NativeWinePipeline(private val context: Context) {
             // evshim can find gamepad.mem etc. under our imagefs_bionic mirror.
             put("REDIRECT_FROM2", "/data/data/com.winlator.cmod/files/imagefs")
             put("REDIRECT_TO2", "$dataDir/imagefs_bionic")
+            // libasound (bundled with imagefs_bionic) has the bare
+            // /data/data/com.winlator/files/imagefs/... path baked in for
+            // alsa.conf — different from the .cmod-suffixed path above. If
+            // it can't load alsa.conf, xaudio2_7.dll dereferences a null and
+            // faults at +0x33364; Wine SEH catches it but the audio thread
+            // is left wedged, blocking the game right after the first present.
+            put("REDIRECT_FROM3", "/data/data/com.winlator/files/imagefs")
+            put("REDIRECT_TO3", "$dataDir/imagefs_bionic")
             put("REDIRECT_DEBUG", "1")
             // Keep using proton11/prefix/.wine (has DXVK DLLs + FEX DLLs
             // in drive_c/windows/system32 already). wine 9/10 share prefix
@@ -448,6 +686,9 @@ class NativeWinePipeline(private val context: Context) {
             // services.exe into a partial-init state where it page-faults
             // and explorer then can't start.
             put("WINEDEBUG", "-all")
+            // NOTE: WINEDLLOVERRIDES is set per-invocation in TerminalActivity
+            // because the Ys IX launch needs d3d11/dxgi forwarded to DXVK plus
+            // xaudio2_7 + alsa/pulse disabled (audio-init crash blocker).
             // Bionic Vulkan stack from GameNative's imagefs_bionic (extracted
             // to $dataDir/imagefs_bionic). libvulkan.so.1 is the Bionic-built
             // Khronos loader; libvulkan_wrapper.so is the ICD that forwards
@@ -485,8 +726,14 @@ class NativeWinePipeline(private val context: Context) {
             put("WRAPPER_USE_BCN_CACHE", "0")
             put("WRAPPER_MAX_IMAGE_COUNT", "0")
             put("WRAPPER_RESOURCE_TYPE", "auto")
-            put("WRAPPER_DISABLE_PRESENT_WAIT", "0")
-            put("WRAPPER_EXTENSION_BLACKLIST", "")
+            // PRESENT_WAIT disabled: with it enabled, DXVK asks our headless
+            // layer to block until present N completes via VK_KHR_present_wait,
+            // which we don't implement. The game's PH3_DrawThreadR was seen
+            // spinning forever after the first present while main + dxvk-submit
+            // were idle — classic present-wait-never-returns signature.
+            put("WRAPPER_DISABLE_PRESENT_WAIT", "1")
+            put("WRAPPER_EXTENSION_BLACKLIST",
+                "VK_KHR_present_wait,VK_KHR_present_id")
             put("ENABLE_BCN_COMPUTE", "1")
             put("ENABLE_UTIL_LAYER", "1")
             put("BCN_COMPUTE_AUTO", "1")
