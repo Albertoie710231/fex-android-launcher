@@ -48,6 +48,7 @@ class TerminalActivity : AppCompatActivity() {
     private var currentDir: String = ""  // initialized in onCreate from app.getFexHomeDir()
     private var frameSocketServer: FrameSocketServer? = null
     private var x11Server: X11Server? = null
+    private var darksideX11: DarksideX11Server? = null
     private var framebufferBridge: FramebufferBridge? = null
     private var isDisplayMode = false
     private var surfaceReady = false
@@ -402,12 +403,18 @@ class TerminalActivity : AppCompatActivity() {
         // native pipeline with a real game binary.
         findViewById<Button>(R.id.btnYsIXNative).setOnClickListener {
             appendOutput("=== wine ys9.exe (native Bionic) ===\n")
-            // proton-9's wine needs winex11.drv → needs an X server.
-            if (x11Server?.isRunning() != true) {
-                x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started for YsIX]\n") } }
-                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
-                    start()
+            // wine-10 needs winex11.drv → needs an X server. Use the
+            // Darkside-xserver-based DarksideX11Server for Ys IX because
+            // libXlorie doesn't emit FocusIn in headless mode, and without
+            // FocusIn wine never delivers WM_ACTIVATEAPP to the game's
+            // message pump — main thread parks forever after first present.
+            // Darkside listens on TCP 6000; we set DISPLAY=127.0.0.1:0 so
+            // wine connects there (libXlorie is left running on the
+            // abstract unix socket for other paths).
+            if (darksideX11?.isRunning() != true) {
+                darksideX11 = DarksideX11Server(this).apply {
+                    if (start()) handler.post { appendOutput("[Darkside X11 on :6000 for YsIX]\n") }
+                    else         handler.post { appendOutput("[Darkside X11 start failed]\n") }
                 }
             }
             // Toggle display mode so `vulkanSurface` is visible and
@@ -449,7 +456,7 @@ class TerminalActivity : AppCompatActivity() {
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
                             "GFSDK_SSAO_D3D11=n",
-                        "DISPLAY" to ":0",
+                        "DISPLAY" to "127.0.0.1:0",
                     ),
                     // Back on wine-10 (proton-10.0.99-arm64ec in proton11/).
                     // Proton 9 with the xapofx1_5 stub gets past audio init
