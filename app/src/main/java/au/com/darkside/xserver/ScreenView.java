@@ -145,6 +145,17 @@ public class ScreenView extends View {
     private final XServer _xServer;
     private final int _rootId;
     private Window _rootWindow = null;
+    // Headless-mode screen dimensions — used when the ScreenView is never
+    // attached to an Activity (no real Android View layout pass ever runs,
+    // so the View's intrinsic getWidth/getHeight stays 0). Set via
+    // initRootWindow(w,h); getWidth/getHeight overrides below return
+    // these when non-zero.
+    private int _headlessWidth = 0;
+    private int _headlessHeight = 0;
+
+    private int screenWidth()  { return _headlessWidth  > 0 ? _headlessWidth  : getWidth();  }
+    private int screenHeight() { return _headlessHeight > 0 ? _headlessHeight : getHeight(); }
+
     private Window _sharedClipboardWindow = null;
     private Property _sharedClipboardProperty = null;
     private Property _sharedClipboardPrimaryProperty = null;
@@ -667,6 +678,8 @@ public class ScreenView extends View {
      */
     public synchronized void initRootWindow(int width, int height) {
         if (_rootWindow != null) return;
+        _headlessWidth = width;
+        _headlessHeight = height;
 
         _rootWindow = new Window(_rootId, _xServer, null, this, null, 0, 0, width, height, 0, false, true);
         _sharedClipboardWindow = new Window(_xServer.nextFreeResourceId()+1, _xServer, null, this, _rootWindow, -1, -1, 1, 1, 0, true, false); // hidden window managing android <-> xServer clipboard
@@ -739,7 +752,7 @@ public class ScreenView extends View {
             int top = _drawnCursorY - _drawnCursor.getHotspotY();
             Bitmap bm = _drawnCursor.getBitmap();
 
-            postInvalidate(left, top, left + bm.getWidth(), top + bm.getHeight());
+            if (bm != null) postInvalidate(left, top, left + bm.getWidth(), top + bm.getHeight());
             _drawnCursor = null;
         }
 
@@ -750,6 +763,10 @@ public class ScreenView extends View {
         int left = x - cursor.getHotspotX();
         int top = y - cursor.getHotspotY();
         Bitmap bm = cursor.getBitmap();
+        // Headless mode: we stubbed R.drawable.xc_* to 0 in Cursor.java,
+        // so glyph-based cursors have a null bitmap. Skip the invalidate —
+        // nothing renders in headless mode anyway.
+        if (bm == null) return;
 
         postInvalidate(left, top, left + bm.getWidth(), top + bm.getHeight());
     }
@@ -1115,10 +1132,10 @@ public class ScreenView extends View {
         io.writeInt(_defaultColormap.getWhitePixel());    // White pixel.
         io.writeInt(_defaultColormap.getBlackPixel());    // Black pixel.
         io.writeInt(0);    // Current input masks.
-        io.writeShort((short) getWidth());    // Width in pixels.
-        io.writeShort((short) getHeight());    // Height in pixels.
-        io.writeShort((short) (getWidth() / _pixelsPerMillimeter));    // Width in millimeters.
-        io.writeShort((short) (getHeight() / _pixelsPerMillimeter));    // Height in millimeters.
+        io.writeShort((short) screenWidth());    // Width in pixels.
+        io.writeShort((short) screenHeight());    // Height in pixels.
+        io.writeShort((short) (screenWidth() / _pixelsPerMillimeter));    // Width in millimeters.
+        io.writeShort((short) (screenHeight() / _pixelsPerMillimeter));    // Height in millimeters.
         io.writeShort((short) 1);    // Minimum installed maps.
         io.writeShort((short) 1);    // Maximum installed maps.
         io.writeInt(vis.getId());    // Root visual ID.
