@@ -490,16 +490,21 @@ class TerminalActivity : AppCompatActivity() {
                         // code path while still satisfying the static import.
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
-                            // Keep our xaudio2 stub for now. Tested =b with
-                            // the PulseAudio daemon live AND winepulse.drv
-                            // restored to system32 — still crashes ys9 early.
-                            // Wine-builtin FAudio's init has a deeper issue
-                            // than just "no PulseAudio" — maybe proton-10
-                            // FAudio isn't compatible with GN's AAudioSink
-                            // PulseAudio module, or wine's FAudio has
-                            // ARM64EC-specific bugs we're hitting. Leaving
-                            // PA daemon running for future swap attempts;
-                            // stub keeps the game stable in BGM-loop state.
+                            // xaudio2 rule-out RESULTS (2026-04-22 final):
+                            //   =n (our stub):   game reaches BGM-loop, CSound
+                            //                    threads spawn, audio flows,
+                            //                    parks waiting on something.
+                            //   =b (wine builtin, with PA daemon + winepulse.drv):
+                            //                    game launches silently, NO
+                            //                    CSound threads, no BGM, but
+                            //                    MainThread still alternates
+                            //                    futex/wchan=0 — parks in a
+                            //                    DIFFERENT way.
+                            // Conclusion: AUDIO IS NOT THE BGM-LOOP BLOCKER.
+                            // Game parks either way. Real blocker is elsewhere
+                            // (wine-internal IPC, X11, or a wine-patch diff
+                            // between our proton-10 and GN's proton-9).
+                            // Stub kept as stable baseline.
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
                             "steamclient=n;steamclient64=n;" +
