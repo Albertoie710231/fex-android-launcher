@@ -342,6 +342,7 @@ class NativeWinePipeline(private val context: Context) {
             ensureYs9Stubs()
             ensureNullAlsaConfig()
             ensurePatchedWineBinaries()
+            ensurePulseAudioDaemon()
 
             true
         } catch (t: Throwable) {
@@ -572,6 +573,98 @@ class NativeWinePipeline(private val context: Context) {
             return true
         } catch (t: Throwable) {
             Log.e(TAG, "ensureNullAlsaConfig failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Spawn a PulseAudio daemon in the app sandbox if one isn't already
+     * running + serving our socket. GameNative uses a custom minimal
+     * PulseAudio build with a `module-aaudio-sink` module that outputs via
+     * Android's AAudio API — wine's FAudio connects to this via winepulse.drv
+     * and gets real audio-callback threads. Without this, wine-builtin
+     * xaudio2_7 silently fails at init (we verified 2026-04-22: switching
+     * to `xaudio2_7=b` without a PulseAudio daemon regressed — no CSound
+     * threads spawned, no BGM opened).
+     *
+     * Files deployed to `imagefs_bionic/usr/lib/` + `pulse-13.0/modules/`
+     * are pulled from GameNative's imagefs (GN's PulseAudio 13.0-dirty
+     * build with built-in AAudioSink).
+     *
+     * Side-effect: spawns a background pulseaudio process that persists
+     * across wineRun invocations (keeps the same socket). Idempotent:
+     * noop if socket already responsive.
+     */
+    private fun ensurePulseAudioDaemon(): Boolean {
+        try {
+            val socket = File("$dataDir/imagefs_bionic/tmp/.sound/PS0")
+            // Check if a pulseaudio process under our UID is ACTUALLY running —
+            // a stale socket file from a prior killed daemon would fool a
+            // file-exists check.
+            val running = try {
+                Runtime.getRuntime().exec(arrayOf("sh", "-c",
+                    "ps -A -o UID,NAME | awk '\$1==\"${android.os.Process.myUid()}\" && \$2==\"pulseaudio\"'"
+                )).inputStream.bufferedReader().readText().isNotBlank()
+            } catch (_: Throwable) { false }
+            if (running && socket.exists()) {
+                Log.i(TAG, "PulseAudio daemon already alive under our UID")
+                return true
+            }
+            // Clean stale socket/pid from prior runs before spawning fresh.
+            socket.delete()
+            File("$dataDir/imagefs_bionic/tmp/pulse-rt/pid").delete()
+            // Invoke via nativeLibDir — Android's SELinux only permits exec
+            // of binaries from the app's APK lib/ dir, not from /files/.
+            // pulseaudio binary is bundled as jniLibs/arm64-v8a/libpulseaudio_daemon.so
+            // (the 80 KB PIE executable pulled from GameNative's imagefs).
+            val paBin = File("$nativeLibDir/libpulseaudio_daemon.so")
+            val paConf = File("$dataDir/imagefs_bionic/usr/etc/pulse/default.pa")
+            val modulesDir = File("$dataDir/imagefs_bionic/usr/lib/pulse-13.0/modules")
+            if (!paBin.exists() || !paConf.exists() || !modulesDir.exists()) {
+                Log.w(TAG, "PulseAudio assets missing (binary=${paBin.exists()}, conf=${paConf.exists()}, modules=${modulesDir.exists()}) — skipping daemon spawn; audio will use our xaudio2 stub")
+                return false
+            }
+            val runtimeDir = File("$dataDir/imagefs_bionic/tmp/pulse-rt")
+            runtimeDir.mkdirs()
+            socket.parentFile?.mkdirs()
+
+            val env = mutableMapOf<String, String>().apply {
+                put("PULSE_RUNTIME_PATH", runtimeDir.absolutePath)
+                put("XDG_RUNTIME_DIR", runtimeDir.absolutePath)
+                put("LD_LIBRARY_PATH",
+                    "$dataDir/imagefs_bionic/usr/lib:" +
+                    "$dataDir/imagefs_bionic/usr/lib/pulse-13.0/modules:" +
+                    "/system/lib64")
+                put("HOME", "$dataDir/imagefs_bionic/home/xuser")
+            }
+            val pb = ProcessBuilder(
+                paBin.absolutePath,
+                "-nF", paConf.absolutePath,
+                "--dl-search-path=${modulesDir.absolutePath}",
+                "--daemonize=no",
+            )
+            pb.environment().clear()
+            pb.environment().putAll(env)
+            pb.redirectErrorStream(true)
+            pb.redirectOutput(File("$dataDir/pulseaudio.log"))
+            val proc = pb.start()
+            Log.i(TAG, "PulseAudio daemon spawned")
+
+            // Poll for socket to appear (up to ~3s) — pulseaudio takes a
+            // moment to initialize modules.
+            var waited = 0
+            while (waited < 3000 && !socket.exists()) {
+                Thread.sleep(100)
+                waited += 100
+            }
+            if (socket.exists()) {
+                Log.i(TAG, "PulseAudio socket live after ${waited}ms")
+                return true
+            }
+            Log.w(TAG, "PulseAudio started but socket never appeared in 3s")
+            return false
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensurePulseAudioDaemon failed", t)
             return false
         }
     }
