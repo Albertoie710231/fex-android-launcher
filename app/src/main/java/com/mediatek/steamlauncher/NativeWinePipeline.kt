@@ -687,8 +687,14 @@ class NativeWinePipeline(private val context: Context) {
             // used by wine, evshim before the game opens input.
             val sysvshm = "$dataDir/imagefs_bionic/usr/lib/libandroid-sysvshm.so"
             val evshim  = "$dataDir/imagefs_bionic/usr/lib/libevshim.so"
-            put("LD_PRELOAD", "$sysvshm:$evshim:$redirectLib")
-            put("WINE_LD_PRELOAD", "$sysvshm:$evshim:$redirectLib")
+            // libredirect-bionic.so — Winlator/GameNative's path-rewrite shim.
+            // Hooks openat/fstatat/ioctl/read to rewrite hardcoded
+            // com.winlator.cmod paths that evshim/sysvshm embed via dlsym
+            // (bypassing our LD_PRELOAD). 2026-04-22: pulled from GameNative
+            // and added to match their LD_PRELOAD chain exactly.
+            val redirectBionic = "$dataDir/imagefs_bionic/usr/lib/libredirect-bionic.so"
+            put("LD_PRELOAD", "$sysvshm:$evshim:$redirectBionic:$redirectLib")
+            put("WINE_LD_PRELOAD", "$sysvshm:$evshim:$redirectBionic:$redirectLib")
             // GameNative provides these as runtime-configurable paths. Use
             // the same subpaths under imagefs_bionic/tmp so anything hard-
             // coded to /data/data/com.winlator/files/imagefs/tmp resolves
