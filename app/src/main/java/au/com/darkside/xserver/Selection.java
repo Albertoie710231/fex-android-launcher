@@ -126,6 +126,13 @@ public class Selection {
 
                         if (sel != null && sel._ownerWindow != null) wid = sel._ownerWindow.getId();
 
+                        if (Client.LOG_REQUESTS) {
+                            Atom a = xServer.getAtom(aid);
+                            android.util.Log.i("DarksideReq", "  GetSelectionOwner(sel=\"" +
+                                    (a == null ? "<atom " + aid + ">" : a.getName()) +
+                                    "\") owner=0x" + Integer.toHexString(wid));
+                        }
+
                         synchronized (io) {
                             Util.writeReplyHeader(client, (byte) 0);
                             io.writeInt(0);    // Reply length.

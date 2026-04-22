@@ -339,6 +339,14 @@ public class Window extends Resource {
         return _drawable;
     }
 
+    public java.util.Vector<Window> getChildren() {
+        return _children;
+    }
+
+    public boolean isMapped() {
+        return _isMapped;
+    }
+
     /**
      * Return the window's cursor.
      *
