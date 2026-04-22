@@ -503,14 +503,11 @@ class TerminalActivity : AppCompatActivity() {
                         // is fine and the game's all-black frames are the
                         // game's actual output. Leave off by default.
                     ),
-                    // proton-10 baseline. 2026-04-22 retest with proton-9
-                    // produced IDENTICAL behavior (MainThread in pselect,
-                    // only bgm/y9_e001.opus open, 60 FPS black frames) —
-                    // so wine version is NOT the blocker. Reverted to p10
-                    // because more of our infra (services.exe/explorer.exe
-                    // DebugInfo NOP patches, winevulkan assert patch) is
-                    // wine-10 specific and those regressions re-surface
-                    // on p9 runs mid-session.
+                    // 2026-04-22 late: tested proton-9 + ColdClient. Same
+                    // parked state as proton-10. Reverted to p10 because
+                    // our services.exe/explorer.exe DebugInfo NOP patches
+                    // + winevulkan assert patch are wine-10 specific. p9
+                    // run left those overwritten by wine-9's wineboot.
                     useProton9 = false,
                 )
                 try {
