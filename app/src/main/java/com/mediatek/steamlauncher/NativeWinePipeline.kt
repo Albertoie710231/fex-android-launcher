@@ -216,6 +216,14 @@ class NativeWinePipeline(private val context: Context) {
             }
             File("$dataDir/tmp").mkdirs()
             File("$dataDir/dxvk_logs").mkdirs()
+            // Dirs GameNative env vars reference (sysvshm / pulse / dxvk
+            // config / xuser home). Most should already exist from the
+            // imagefs_bionic extract, but mkdirs() is idempotent.
+            File("$dataDir/imagefs_bionic/tmp/.sysvshm").mkdirs()
+            File("$dataDir/imagefs_bionic/tmp/.sound").mkdirs()
+            File("$dataDir/imagefs_bionic/usr/tmp").mkdirs()
+            File("$dataDir/imagefs_bionic/home/xuser/.config").mkdirs()
+            File("$dataDir/imagefs_bionic/home/xuser/.cache").mkdirs()
             // Pre-create the drive_c skeleton. Wine's wineboot expects
             // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
             // exist the dosdevices/c: symlink (../drive_c) dangles and
@@ -653,7 +661,65 @@ class NativeWinePipeline(private val context: Context) {
             return Result(-1, "", "failed to build imagefs mirror")
         }
         val env = buildEnv(useProton9).toMutableMap().apply {
-            put("LD_PRELOAD", redirectLib)
+            // Match GameNative's LD_PRELOAD chain so the game gets the shims
+            // it expects for SYSV shared memory (libandroid-sysvshm) and
+            // input event routing (libevshim). These are already in our
+            // imagefs_bionic mirror — just never loaded. libpathredirect
+            // sits last (wine-facing path rewrites) to keep our redirect
+            // semantics. Order matters: sysvshm must hook before libc is
+            // used by wine, evshim before the game opens input.
+            val sysvshm = "$dataDir/imagefs_bionic/usr/lib/libandroid-sysvshm.so"
+            val evshim  = "$dataDir/imagefs_bionic/usr/lib/libevshim.so"
+            put("LD_PRELOAD", "$sysvshm:$evshim:$redirectLib")
+            put("WINE_LD_PRELOAD", "$sysvshm:$evshim:$redirectLib")
+            // GameNative provides these as runtime-configurable paths. Use
+            // the same subpaths under imagefs_bionic/tmp so anything hard-
+            // coded to /data/data/com.winlator/files/imagefs/tmp resolves
+            // via REDIRECT_FROM3.
+            put("ANDROID_SYSVSHM_SERVER", "$dataDir/imagefs_bionic/tmp/.sysvshm/SM0")
+            put("EVSHIM_MAX_PLAYERS", "1")
+            put("EVSHIM_SHM_ID", "1")
+            put("EVSHIM_SHM_NAME", "controller-shm0")
+            // PulseAudio + ALSA paths — even though we stub xaudio2, the
+            // libasound init-time lookup still probes these and fails
+            // weirdly if unset. Pointing them at non-existent sockets is
+            // fine; libasound returns a clean error.
+            put("PULSE_LATENCY_MSEC", "144")
+            put("PULSE_SERVER", "$dataDir/imagefs_bionic/tmp/.sound/PS0")
+            put("ALSA_CONFIG_PATH",
+                "$dataDir/imagefs_bionic/usr/share/alsa/alsa.conf:" +
+                "$dataDir/imagefs_bionic/usr/etc/alsa/conf.d/android_aserver.conf")
+            put("ALSA_PLUGIN_DIR", "$dataDir/imagefs_bionic/usr/lib/alsa-lib")
+            // SDL input hints GameNative sets. Several games (Ys IX included)
+            // bring SDL2 as a sub-DLL and query these on startup.
+            put("SDL_ALLOW_TOPMOST", "0")
+            put("SDL_DIRECTINPUT_ENABLED", "1")
+            put("SDL_HINT_FORCE_RAISEWINDOW", "0")
+            put("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+            put("SDL_JOYSTICK_HIDAPI", "1")
+            put("SDL_JOYSTICK_RAWINPUT", "0")
+            put("SDL_JOYSTICK_WGI", "0")
+            put("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
+            put("SDL_XINPUT_ENABLED", "1")
+            // User identity matching GameNative's container (user=xuser).
+            // Some games stat HOME-relative paths on startup.
+            put("USER", "xuser")
+            put("HOME", "$dataDir/imagefs_bionic/home/xuser")
+            put("TMPDIR", "$dataDir/imagefs_bionic/usr/tmp")
+            // Fontconfig + SSL — fontconfig is needed for wine's GDI+, SSL
+            // for any curl/openssl the game links transitively.
+            put("FONTCONFIG_PATH", "$dataDir/imagefs_bionic/usr/etc/fonts")
+            put("OPENSSL_CONF", "$dataDir/imagefs_bionic/usr/etc/tls/openssl.cnf")
+            put("SSL_CERT_DIR", "$dataDir/imagefs_bionic/usr/etc/tls/certs")
+            put("SSL_CERT_FILE", "$dataDir/imagefs_bionic/usr/etc/tls/cert.pem")
+            // Locale / DNS / gstreamer — GameNative sets these unconditionally.
+            put("LC_ALL", "en_US.utf8")
+            put("ANDROID_RESOLV_DNS", "192.168.200.1")
+            put("GST_PLUGIN_PATH", "$dataDir/imagefs_bionic/usr/lib/gstreamer-1.0")
+            put("GST_PLUGIN_FEATURE_RANK", "ximagesink:3000")
+            // DXVK frame rate cap + config-file base. Matches GameNative.
+            put("DXVK_FRAME_RATE", "60")
+            put("DXVK_CONFIG_FILE", "$dataDir/imagefs_bionic/home/xuser/.config/dxvk.conf")
             put("REDIRECT_FROM", if (useProton9) BAKED_ROOT_P9 else BAKED_ROOT)
             // proton-9 was built expecting GameNative-style imagefs layout
             // (/usr/lib, /opt/wine/...). Our $dataDir/imagefs_bionic IS that
