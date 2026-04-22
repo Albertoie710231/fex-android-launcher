@@ -490,14 +490,16 @@ class TerminalActivity : AppCompatActivity() {
                         // code path while still satisfying the static import.
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
-                            // xaudio2_7 MUST be our callback-firing stub.
-                            // Tested wine-builtin (=b) 2026-04-22 with full GN
-                            // stack in place and it REGRESSED — CSound threads
-                            // not spawned, no BGM opened, MainThread parked
-                            // even faster. Wine's builtin FAudio fails
-                            // silently without a real PulseAudio daemon, and
-                            // our stub's fake CreateSourceVoice+buffer-drain
-                            // is what lets Ys IX's CSound engine start at all.
+                            // Keep our xaudio2 stub for now. Tested =b with
+                            // the PulseAudio daemon live AND winepulse.drv
+                            // restored to system32 — still crashes ys9 early.
+                            // Wine-builtin FAudio's init has a deeper issue
+                            // than just "no PulseAudio" — maybe proton-10
+                            // FAudio isn't compatible with GN's AAudioSink
+                            // PulseAudio module, or wine's FAudio has
+                            // ARM64EC-specific bugs we're hitting. Leaving
+                            // PA daemon running for future swap attempts;
+                            // stub keeps the game stable in BGM-loop state.
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
                             "steamclient=n;steamclient64=n;" +
