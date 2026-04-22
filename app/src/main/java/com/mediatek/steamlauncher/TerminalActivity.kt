@@ -490,10 +490,16 @@ class TerminalActivity : AppCompatActivity() {
                         // code path while still satisfying the static import.
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
+                            // xaudio2_7 MUST be our callback-firing stub.
+                            // Tested wine-builtin (=b) 2026-04-22 with full GN
+                            // stack in place and it REGRESSED — CSound threads
+                            // not spawned, no BGM opened, MainThread parked
+                            // even faster. Wine's builtin FAudio fails
+                            // silently without a real PulseAudio daemon, and
+                            // our stub's fake CreateSourceVoice+buffer-drain
+                            // is what lets Ys IX's CSound engine start at all.
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
-                            // ColdClient Steam emulator DLLs — native-only
-                            // (they live in C:\Program Files (x86)\Steam\)
                             "steamclient=n;steamclient64=n;" +
                             "GFSDK_SSAO_D3D11=n",
                         "DISPLAY" to "127.0.0.1:0",
