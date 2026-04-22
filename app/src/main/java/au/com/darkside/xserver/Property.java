@@ -283,6 +283,13 @@ public class Property {
         byte[] value = null;
         boolean generateNotify = false;
 
+        if (Client.LOG_REQUESTS) {
+            android.util.Log.i("DarksideReq", "  GetProperty(win=" + w.getId() +
+                    ", atom=\"" + property.getName() + "\", type=" + tid +
+                    ", offset=" + longOffset + ", len=" + longLength +
+                    ") exists=" + properties.containsKey(pid));
+        }
+
         if (properties.containsKey(pid)) {
             Property p = properties.get(pid);
 

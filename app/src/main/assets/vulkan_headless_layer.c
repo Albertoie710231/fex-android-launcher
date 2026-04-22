@@ -2074,7 +2074,21 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                 VkResult bcb_res = fn_bcb(sc->copy_cmd, &bi);
                 LOG("[COPY] BeginCB=%d\n", bcb_res);
 
-                /* Barrier: PRESENT_SRC → TRANSFER_SRC
+                /* DIAGNOSTIC: if HEADLESS_DIAG_CLEAR=1, clobber the image with
+                 * solid GREEN before copy. If captured bytes come back green
+                 * (B=0,G=ff,R=0,A=ff for BGRA8_UNORM), the layer+display path
+                 * is proven fine and the game is drawing black. If still black,
+                 * our capture path itself is broken. */
+                static int s_diag_checked = 0;
+                static int s_diag_clear = 0;
+                if (!s_diag_checked) {
+                    const char* v = getenv("HEADLESS_DIAG_CLEAR");
+                    s_diag_clear = (v && v[0] == '1') ? 1 : 0;
+                    s_diag_checked = 1;
+                    LOG("[DIAG] HEADLESS_DIAG_CLEAR=%d\n", s_diag_clear);
+                }
+
+                /* Barrier: PRESENT_SRC → TRANSFER_{DST or SRC}
                  * Use ALL_COMMANDS + MEMORY_WRITE to flush ALL prior writes from
                  * DXVK's earlier submissions, regardless of which pipeline stages
                  * they used. Narrower masks were causing Mali to deliver zeros. */
@@ -2082,9 +2096,13 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                     VkImageMemoryBarrier imb = {0};
                     imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                     imb.srcAccessMask = 0x10000 /* VK_ACCESS_MEMORY_WRITE_BIT */;
-                    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    imb.dstAccessMask = s_diag_clear
+                        ? VK_ACCESS_TRANSFER_WRITE_BIT
+                        : VK_ACCESS_TRANSFER_READ_BIT;
                     imb.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    imb.newLayout = s_diag_clear
+                        ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                        : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
                     imb.srcQueueFamilyIndex = 0xFFFFFFFF;
                     imb.dstQueueFamilyIndex = 0xFFFFFFFF;
                     imb.image = sc->images[idx];
@@ -2095,6 +2113,45 @@ static VkResult headless_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* 
                            0x00010000 /* VK_PIPELINE_STAGE_ALL_COMMANDS_BIT */,
                            VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, NULL, 0, NULL, 1, &imb);
+                }
+
+                /* DIAGNOSTIC clear + transition to TRANSFER_SRC */
+                if (s_diag_clear && fn_cci) {
+                    /* VkClearColorValue is a union {float32[4]; int32[4]; uint32[4];}
+                     * — 16 bytes. Pass as raw float[4]; matches PFN_CCI's void*. */
+                    float cc[4] = { 0.0f, 1.0f, 0.0f, 1.0f }; /* RGBA = green */
+                    /* VkImageSubresourceRange is 5 uint32: aspectMask,
+                     * baseMipLevel, levelCount, baseArrayLayer, layerCount.
+                     * Build it as a uint32_t array so we avoid the missing type. */
+                    uint32_t srr[5] = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, /* aspectMask */
+                        0,                          /* baseMipLevel */
+                        1,                          /* levelCount */
+                        0,                          /* baseArrayLayer */
+                        1,                          /* layerCount */
+                    };
+                    fn_cci(sc->copy_cmd, sc->images[idx],
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           cc, 1, srr);
+
+                    /* Transition DST → SRC for the copy below */
+                    VkImageMemoryBarrier d2s = {0};
+                    d2s.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    d2s.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    d2s.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    d2s.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    d2s.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    d2s.srcQueueFamilyIndex = 0xFFFFFFFF;
+                    d2s.dstQueueFamilyIndex = 0xFFFFFFFF;
+                    d2s.image = sc->images[idx];
+                    d2s.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    d2s.subresourceRange.levelCount = 1;
+                    d2s.subresourceRange.layerCount = 1;
+                    fn_cpb(sc->copy_cmd,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, NULL, 0, NULL, 1, &d2s);
+                    LOG("[COPY] DIAG_CLEAR: filled img with GREEN + transition DST→SRC\n");
                 }
 
                 /* Copy image to staging buffer */

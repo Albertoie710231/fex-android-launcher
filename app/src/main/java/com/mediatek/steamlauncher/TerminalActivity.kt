@@ -89,16 +89,16 @@ class TerminalActivity : AppCompatActivity() {
                 // Connect FramebufferBridge to the surface for Vortek rendering
                 framebufferBridge?.setOutputSurface(holder.surface)
                 if (isDisplayMode) {
-                    frameSocketServer?.setOutputSurface(holder.surface)
-                    Log.i(TAG, "Vulkan display surface created and connected")
+                    // Darkside render loop owns the surface in display mode —
+                    // do NOT wire frameSocketServer here (would flicker).
+                    Log.i(TAG, "Display surface created; Darkside render loop owns it")
                 }
             }
 
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
                 framebufferBridge?.setOutputSurface(holder.surface)
                 if (isDisplayMode) {
-                    frameSocketServer?.setOutputSurface(holder.surface)
-                    Log.i(TAG, "Vulkan display surface changed: ${width}x${height}")
+                    Log.i(TAG, "Display surface changed: ${width}x${height} (Darkside owns)")
                 }
             }
 
@@ -417,6 +417,26 @@ class TerminalActivity : AppCompatActivity() {
                     else         handler.post { appendOutput("[Darkside X11 start failed]\n") }
                 }
             }
+            // Diagnostic: after the game settles into BGM-loop, dump
+            // Darkside's composited root pixmap to a PNG. If the game is
+            // rendering a launcher dialog via GDI (which our DXVK-only
+            // capture misses), the pixmap will show it. If the pixmap is
+            // pure black, the game isn't GDI-rendering either and we need
+            // to look elsewhere. (2026-04-22 — pivot based on user feedback
+            // that we're reinventing what GameNative/libXlorie already do.)
+            handler.postDelayed({
+                try {
+                    val srv = darksideX11
+                    srv?.dumpWindowTree()
+                    val path = srv?.renderRootToFile(java.io.File(
+                        getExternalFilesDir(null),
+                        "darkside_root_at_45s.png"
+                    ))
+                    appendOutput("[Darkside pixmap dumped: $path]\n")
+                } catch (t: Throwable) {
+                    appendOutput("[Darkside dump failed: ${t.message}]\n")
+                }
+            }, 45000L)
             // Toggle display mode so `vulkanSurface` is visible and
             // frameSocketServer binds it as its output. DXVK's presents
             // are captured by VK_LAYER_HEADLESS_surface, streamed over
@@ -442,8 +462,6 @@ class TerminalActivity : AppCompatActivity() {
                         // deployed into game-dir + prefix system32. Each "=n"
                         // picks up the stub instead of wine's builtin or the
                         // publisher's real DLL:
-                        //   - xaudio2_7: wine builtin NULL-derefs when ALSA has
-                        //     no backend; stub returns S_OK for every call.
                         //   - Galaxy64: GOG Galaxy IPC blocks main thread before
                         //     the render loop starts (explicit comment in
                         //     ProtonManager.kt line 933). THIS was the post-
@@ -451,20 +469,38 @@ class TerminalActivity : AppCompatActivity() {
                         //   - steam_api64: real DLL blocks on Steam runtime.
                         //   - GFSDK_SSAO: NVIDIA GameWorks SSAO hits paths DXVK
                         //     doesn't implement identically.
+                        //
+                        //   - xaudio2_7: wine-builtin (b) tested 2026-04-22 with
+                        //     null ALSA in place — same BGM-loop, no crash, no
+                        //     progress. XAudio2 is NOT the blocker. Reverted to
+                        //     stub (n) so we stay on the known-stable path.
+                        // 2026-04-22: Galaxy64= (disabled) CRASHED the game —
+                        // confirmed Galaxy64.dll is a STATIC IMPORT. Game
+                        // cannot start without a DLL providing its exports.
+                        // So we must keep Galaxy64=n (our stub). Next test
+                        // would be: modify the stub to return FAILURE from
+                        // Init(), forcing the game onto its "Galaxy absent"
+                        // code path while still satisfying the static import.
                         "WINEDLLOVERRIDES" to
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
                             "GFSDK_SSAO_D3D11=n",
                         "DISPLAY" to "127.0.0.1:0",
+                        // HEADLESS_DIAG_CLEAR=1 would make the layer clobber
+                        // every presented image with solid green before copy
+                        // — used 2026-04-21 to prove the capture+surface path
+                        // is fine and the game's all-black frames are the
+                        // game's actual output. Leave off by default.
                     ),
-                    // Back on wine-10 (proton-10.0.99-arm64ec in proton11/).
-                    // Proton 9 with the xapofx1_5 stub gets past audio init
-                    // (CSound threads spawn) but deadlocks EARLIER than
-                    // wine-10 — stuck at vkAcquireNextImageKHR with 0
-                    // presents, while wine-10 gets to 1 present (black
-                    // frame reaches Java). wine-10 is strictly better
-                    // progress until we figure out either deadlock.
+                    // proton-10 baseline. 2026-04-22 retest with proton-9
+                    // produced IDENTICAL behavior (MainThread in pselect,
+                    // only bgm/y9_e001.opus open, 60 FPS black frames) —
+                    // so wine version is NOT the blocker. Reverted to p10
+                    // because more of our infra (services.exe/explorer.exe
+                    // DebugInfo NOP patches, winevulkan assert patch) is
+                    // wine-10 specific and those regressions re-surface
+                    // on p9 runs mid-session.
                     useProton9 = false,
                 )
                 try {
@@ -692,20 +728,74 @@ class TerminalActivity : AppCompatActivity() {
             vulkanSurface.visibility = View.VISIBLE
             btnDisplay.text = "Terminal"
 
-            // Connect surface if already ready
-            if (surfaceReady) {
-                frameSocketServer?.setOutputSurface(vulkanSurface.holder.surface)
-            }
-            Log.i(TAG, "Switched to Vulkan display mode")
+            // Display path: render Darkside's X11 pixmap to the surface.
+            // wine's winex11.drv paints GDI content (title bars, taskbar,
+            // dialogs, wine-drawn window decorations) into Darkside's
+            // internal Bitmap. The DXVK Vulkan-capture layer ONLY sees the
+            // game's 3D swapchain — all non-DXVK UI is invisible via
+            // that path. So display the X11 root composite directly.
+            //
+            // FrameSocketServer is NOT bound to the surface here to avoid
+            // both renderers racing for the canvas (which flickers between
+            // DXVK's black frames and the Darkside desktop). If we ever
+            // need the DXVK content composited on top, we'd need a real
+            // compositor drawing both onto the same canvas per frame.
+            // (2026-04-22 — pivot after BGM-loop diagnostics showed
+            // Darkside has real content the user never sees.)
+            frameSocketServer?.setOutputSurface(null)
+            startDarksideRenderLoop()
+            Log.i(TAG, "Switched to X11 display mode")
         } else {
             vulkanSurface.visibility = View.GONE
             scrollView.visibility = View.VISIBLE
             btnDisplay.text = "Display"
 
-            // Disconnect surface
             frameSocketServer?.setOutputSurface(null)
+            stopDarksideRenderLoop()
             Log.i(TAG, "Switched to terminal mode")
         }
+    }
+
+    private var darksideRenderThread: Thread? = null
+    @Volatile private var darksideRenderStop = false
+
+    private fun startDarksideRenderLoop() {
+        if (darksideRenderThread?.isAlive == true) return
+        darksideRenderStop = false
+        val t = Thread({
+            val srcRect = android.graphics.Rect()
+            val dstRect = android.graphics.Rect()
+            while (!darksideRenderStop) {
+                val bmp = try { darksideX11?.renderRoot() } catch (_: Throwable) { null }
+                val sv = vulkanSurface
+                val holder = sv.holder
+                val surf = holder.surface
+                if (bmp != null && surf != null && surf.isValid) {
+                    try {
+                        val canvas = holder.lockHardwareCanvas() ?: continue
+                        try {
+                            srcRect.set(0, 0, bmp.width, bmp.height)
+                            dstRect.set(0, 0, canvas.width, canvas.height)
+                            canvas.drawBitmap(bmp, srcRect, dstRect, null)
+                        } finally {
+                            holder.unlockCanvasAndPost(canvas)
+                        }
+                    } catch (_: Throwable) {
+                        // surface gone / locked by DXVK frame socket; skip frame
+                    }
+                }
+                try { Thread.sleep(100) } catch (_: InterruptedException) { break }
+            }
+        }, "DarksideRender")
+        t.isDaemon = true
+        t.start()
+        darksideRenderThread = t
+    }
+
+    private fun stopDarksideRenderLoop() {
+        darksideRenderStop = true
+        darksideRenderThread?.interrupt()
+        darksideRenderThread = null
     }
 
     private fun showWelcome() {

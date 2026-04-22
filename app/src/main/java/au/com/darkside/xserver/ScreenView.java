@@ -223,6 +223,51 @@ public class ScreenView extends View {
         _focusWindow = target;
         _focusRevertTo = 2;
         _focusLastChangeTime = now;
+
+        broadcastNetActiveWindowChange(target.getId(), now);
+    }
+
+    /**
+     * Update root's `_NET_ACTIVE_WINDOW` EWMH property to the given window id
+     * and notify every client selecting PropertyChangeMask on root. Wine's
+     * X11 driver (and Yamaneko-engine games like Ys IX) poll / wait for this
+     * transition to decide that the window has become foreground-active.
+     * When no compliant WM runs, the property stays 0 forever and the game
+     * parks at the "play intro BGM, wait for activation" state.
+     *
+     * Best-effort: silently no-ops if the `_NET_ACTIVE_WINDOW` atom wasn't
+     * interned (no EWMH stub installed) or the property isn't on root.
+     */
+    private void broadcastNetActiveWindowChange(int activeWindowId, int timestamp) {
+        if (_rootWindow == null) return;
+        Atom atom = _xServer.findAtom("_NET_ACTIVE_WINDOW");
+        if (atom == null) return;
+        Property p = _rootWindow.getProperty(atom.getId());
+        if (p == null) return;
+
+        byte[] data = new byte[] {
+            (byte)(activeWindowId & 0xff),
+            (byte)((activeWindowId >>> 8) & 0xff),
+            (byte)((activeWindowId >>> 16) & 0xff),
+            (byte)((activeWindowId >>> 24) & 0xff),
+        };
+        p.setData(data);
+
+        Vector<Client> sc = _rootWindow.getSelectingClients(EventCode.MaskPropertyChange);
+        int notified = (sc == null) ? 0 : sc.size();
+        android.util.Log.i("DarksideReq",
+                "broadcastNetActiveWindow: active=0x" + Integer.toHexString(activeWindowId) +
+                " selectingClients=" + notified);
+        if (sc != null) {
+            for (Client c : sc) {
+                if (c == null) continue;
+                try {
+                    EventCode.sendPropertyNotify(c, _rootWindow, atom, timestamp, 0);
+                } catch (Throwable t) {
+                    // best-effort; one failing client shouldn't break focus
+                }
+            }
+        }
     }
 
     private Window _sharedClipboardWindow = null;
@@ -538,6 +583,37 @@ public class ScreenView extends View {
      */
     public Window getRootWindow() {
         return _rootWindow;
+    }
+
+    /**
+     * Diagnostic: composite Darkside's whole window tree (root + all mapped
+     * descendants) into an Android Bitmap — exactly what `ScreenView.onDraw`
+     * would produce if the view were attached to the Activity. Returns null
+     * if the tree isn't ready yet.
+     *
+     * Used to verify GDI content (wine paints launcher dialogs, Win32
+     * DialogBox decorations, etc. via winex11.drv → Darkside X11 requests →
+     * each window's internal Bitmap). Our DXVK-only display pipeline
+     * captures the Vulkan swapchain but NOT this X11 pixmap — so
+     * compositing this bitmap onto the display would surface hidden
+     * launcher UI.
+     */
+    public android.graphics.Bitmap renderRootToBitmap() {
+        Window root = _rootWindow;
+        if (root == null) return null;
+        int w = screenWidth();
+        int h = screenHeight();
+        if (w <= 0 || h <= 0) return null;
+        android.graphics.Bitmap bmp =
+                android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(bmp);
+        android.graphics.Paint paint = new android.graphics.Paint();
+        try {
+            root.draw(canvas, paint);
+        } catch (Throwable t) {
+            android.util.Log.w("DarksideReq", "renderRootToBitmap failed", t);
+        }
+        return bmp;
     }
 
     /**

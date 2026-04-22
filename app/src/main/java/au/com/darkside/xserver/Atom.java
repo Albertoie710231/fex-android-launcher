@@ -1,5 +1,7 @@
 package au.com.darkside.xserver;
 
+import android.util.Log;
+
 import java.io.IOException;
 
 
@@ -148,6 +150,11 @@ public class Atom {
             a = new Atom(xServer.nextFreeAtomId(), s);
             xServer.addAtom(a);
             id = a.getId();
+        }
+
+        if (Client.LOG_REQUESTS) {
+            Log.i("DarksideReq", "  InternAtom(\"" + s + "\", onlyIfExists=" +
+                    onlyIfExists + ") -> id=" + id);
         }
 
         synchronized (io) {

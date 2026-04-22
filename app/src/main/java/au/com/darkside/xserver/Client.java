@@ -30,6 +30,23 @@ public class Client extends Thread {
     private int _closeDownMode = Destroy;
     private boolean _imperviousToServerGrabs = false;
 
+    /** Toggle to log every incoming X11 request. Extremely verbose — only enable
+     *  for targeted diagnosis (e.g. "why is Yamaneko engine stuck"). */
+    public static boolean LOG_REQUESTS = false;
+    private static final String[] OP_NAME = new String[256];
+    static {
+        OP_NAME[1]="CreateWindow"; OP_NAME[2]="ChangeWindowAttributes"; OP_NAME[3]="GetWindowAttributes";
+        OP_NAME[4]="DestroyWindow"; OP_NAME[8]="MapWindow"; OP_NAME[10]="UnmapWindow";
+        OP_NAME[12]="ConfigureWindow"; OP_NAME[14]="GetGeometry"; OP_NAME[15]="QueryTree";
+        OP_NAME[16]="InternAtom"; OP_NAME[17]="GetAtomName"; OP_NAME[18]="ChangeProperty";
+        OP_NAME[19]="DeleteProperty"; OP_NAME[20]="GetProperty"; OP_NAME[21]="ListProperties";
+        OP_NAME[22]="SetSelectionOwner"; OP_NAME[23]="GetSelectionOwner"; OP_NAME[24]="ConvertSelection";
+        OP_NAME[25]="SendEvent"; OP_NAME[26]="GrabPointer"; OP_NAME[33]="GrabKey"; OP_NAME[34]="UngrabKey";
+        OP_NAME[38]="QueryPointer"; OP_NAME[40]="TranslateCoordinates"; OP_NAME[42]="SetInputFocus";
+        OP_NAME[43]="GetInputFocus"; OP_NAME[44]="QueryKeymap"; OP_NAME[98]="QueryExtension";
+        OP_NAME[99]="ListExtensions"; OP_NAME[101]="GetKeyboardMapping"; OP_NAME[119]="GetModifierMapping";
+    }
+
     /**
      * Constructor.
      *
@@ -283,6 +300,18 @@ public class Client extends Thread {
      */
     private void processRequest(byte opcode, byte arg, int bytesRemaining) throws IOException {
         _sequenceNumber++;
+        if (LOG_REQUESTS) {
+            int op = opcode & 0xff;
+            String name = (op < 256 && OP_NAME[op] != null) ? OP_NAME[op] : "op" + op;
+            if (opcode == RequestCode.InternAtom) {
+                // Peek atom name without consuming the request
+                Log.i("DarksideReq", "req#" + _sequenceNumber + " " + name + " (arg=" + arg + ")");
+            } else if (opcode == RequestCode.GetProperty) {
+                Log.i("DarksideReq", "req#" + _sequenceNumber + " " + name + " del=" + arg);
+            } else {
+                Log.i("DarksideReq", "req#" + _sequenceNumber + " " + name);
+            }
+        }
         switch (opcode) {
             case RequestCode.CreateWindow:
                 if (bytesRemaining < 28) {
