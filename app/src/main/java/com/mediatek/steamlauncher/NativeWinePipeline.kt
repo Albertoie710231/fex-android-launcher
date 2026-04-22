@@ -215,6 +215,7 @@ class NativeWinePipeline(private val context: Context) {
                 )
             }
             File("$dataDir/tmp").mkdirs()
+            File("$dataDir/dxvk_logs").mkdirs()
             // Pre-create the drive_c skeleton. Wine's wineboot expects
             // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
             // exist the dosdevices/c: symlink (../drive_c) dangles and
@@ -744,9 +745,11 @@ class NativeWinePipeline(private val context: Context) {
             put("SPOOF_FEATURES", "1")
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
-            // Write DXVK log to its own file so we can reconstruct its
-            // sequence without wine-server traces interleaving char-by-char.
-            put("DXVK_LOG_PATH", "$dataDir/dxvk_ys9.log")
+            // DXVK_LOG_PATH is a DIRECTORY (DXVK writes <exe>_<dll>.log
+            // inside it, e.g. ys9_dxgi.log + ys9_d3d11.log). Previously
+            // we set this to a file-name-looking path and DXVK silently
+            // fell back to cwd-relative, leaving us with no fresh logs.
+            put("DXVK_LOG_PATH", "$dataDir/dxvk_logs")
             // Disable DXVK's OpenVR/OpenXR extension providers. On this
             // pipeline they fail "Failed to locate module" (no openvr_api
             // / openxr_loader on device) and, right after enumeration,
