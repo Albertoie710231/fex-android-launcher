@@ -444,8 +444,15 @@ class TerminalActivity : AppCompatActivity() {
             // lockHardwareCanvas to vulkanSurface.
             if (!isDisplayMode) toggleDisplayMode()
             val pipeline = NativeWinePipeline(this)
+            // 2026-04-22: Launch via ColdClient Steam-emulator loader
+            // (matches GameNative's architecture). The loader reads
+            // `C:\Program Files (x86)\Steam\ColdClientLoader.ini` for
+            // the actual target exe + AppId, sets up the emulated Steam
+            // client runtime, then spawns ys9.exe as a subprocess.
+            // Without this, our bare stubs made Ys IX enter "DRM-free
+            // mode" which still parks at BGM-loop.
             val gameWindowsPath =
-                "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\fex-rootfs\\Ubuntu_22_04\\home\\user\\Steam\\steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe"
+                "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
             scope.launch {
                 // Explorer /desktop wrapper is REQUIRED. Without it wine has
                 // no graphics driver registered for window creation (directly
@@ -485,6 +492,9 @@ class TerminalActivity : AppCompatActivity() {
                             "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
                             "xaudio2_7=n;xapofx1_5=n;" +
                             "Galaxy64=n;steam_api64=n;" +
+                            // ColdClient Steam emulator DLLs — native-only
+                            // (they live in C:\Program Files (x86)\Steam\)
+                            "steamclient=n;steamclient64=n;" +
                             "GFSDK_SSAO_D3D11=n",
                         "DISPLAY" to "127.0.0.1:0",
                         // HEADLESS_DIAG_CLEAR=1 would make the layer clobber
