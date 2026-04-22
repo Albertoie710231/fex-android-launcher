@@ -174,10 +174,25 @@ static const char *fn_names[] = {
 };
 
 static void trace(const char *fn) {
-    static int total = 0;
-    if (total++ < 50) {
-        fprintf(stderr, "[steam_api64] %s\n", fn);
-        fflush(stderr);
+    static volatile long long total = 0;
+    long long t = __sync_add_and_fetch(&total, 1);
+    /* Log first 30 calls + every 200th after that — captures the full
+     * polling pattern without drowning in spam. Writes to a file since
+     * wineRun's stderr capture dies after outer-proc exit. */
+    if (t <= 30 || (t % 200) == 0) {
+        HANDLE hf = CreateFileA("C:\\\\steam_api64_stub.log",
+            FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            SetFilePointer(hf, 0, NULL, FILE_END);
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                "[pid=%lu tick=%lu total=%lld] %s\n",
+                GetCurrentProcessId(), GetTickCount(), t, fn);
+            DWORD w;
+            WriteFile(hf, buf, n, &w, NULL);
+            CloseHandle(hf);
+        }
     }
 }
 
@@ -839,26 +854,34 @@ const char* __cdecl SteamAPI_GetSteamInstallPath_alt(void) {
  * Core Steamworks API
  * ======================================================================== */
 
+/* 2026-04-22: GameNative container-mode runs the game WITHOUT Steam init
+ * (title bar has no "Steam Enabled" suffix) and progresses past the phase
+ * where our build parks. Our stubs previously returned success → game
+ * took the "Steam online" code path and waited forever for user stats /
+ * cloud / etc. Return FALSE now so the game takes the offline path that
+ * GameNative's container-mode gets. init_mocks() still runs so later
+ * interface queries (SteamUser(), SteamApps()) work if the game calls
+ * them anyway. */
 int __cdecl SteamAPI_Init(void) {
     call_counts[FN_INIT]++;
-    trace("SteamAPI_Init() -> true");
+    trace("SteamAPI_Init() -> false (offline mode)");
     init_mocks();
-    return 1; /* true = success */
+    return 0; /* false = init failed → game takes offline path */
 }
 
 int __cdecl SteamAPI_InitSafe(void) {
     call_counts[FN_INIT_SAFE]++;
-    trace("SteamAPI_InitSafe() -> true");
+    trace("SteamAPI_InitSafe() -> false (offline mode)");
     init_mocks();
-    return 1;
+    return 0;
 }
 
-/* Flat API init (newer SDK) */
+/* Flat API init (newer SDK) — non-zero = error result */
 int __cdecl SteamAPI_InitFlat(void *errMsg) {
     call_counts[FN_INIT_FLAT]++;
-    trace("SteamAPI_InitFlat() -> 0 (ok)");
+    trace("SteamAPI_InitFlat() -> 2 (NoSteamClient)");
     init_mocks();
-    return 0; /* ESteamAPIInitResult_OK */
+    return 2; /* ESteamAPIInitResult_NoSteamClient */
 }
 
 void __cdecl SteamAPI_Shutdown(void) {

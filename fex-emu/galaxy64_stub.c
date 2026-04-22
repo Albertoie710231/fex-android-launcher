@@ -41,13 +41,31 @@
  *   - void methods → 0 ignored by caller
  * ======================================================================== */
 
+/* Side-channel file log — stderr dies when wineRun's outer proc exits. */
+static void galaxy_file_log(const char *msg)
+{
+    HANDLE hf = CreateFileA("C:\\\\galaxy64_stub.log",
+        FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, NULL, FILE_END);
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "[pid=%lu tick=%lu tid=%lu] %s\n",
+        GetCurrentProcessId(), GetTickCount(), GetCurrentThreadId(), msg);
+    DWORD w;
+    WriteFile(hf, buf, n, &w, NULL);
+    CloseHandle(hf);
+}
+
 static long long mock_method(void) {
     static volatile LONG count = 0;
     LONG c = InterlockedIncrement(&count);
-    /* Log first 10, then every 500th call to detect polling loops */
-    if (c <= 10 || (c % 500) == 0)
-        fprintf(stderr, "[Galaxy64] mock vtable method called (count=%ld, tid=%lu)\n",
-                c, GetCurrentThreadId());
+    if (c <= 30 || (c % 1000) == 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "mock_vtable call #%ld", c);
+        galaxy_file_log(msg);
+    }
     return 0;
 }
 
@@ -98,6 +116,27 @@ static MockObj mock_listener_reg;
 static MockObj mock_custom_networking;
 static MockObj mock_logger;
 
+/* 2026-04-22: Mock IError for reporting Galaxy init failure.
+ * GameNative uses the REAL 13.7 MB Galaxy64.dll which fails to init
+ * (no GOG client running on the device) — Ys IX then takes the offline
+ * code path and progresses. Our stub previously returned NULL from
+ * GetError() = "init succeeded" — which made the game wait forever for
+ * Galaxy events. IError vtable (from GOG SDK headers):
+ *   [0] ~IError()                 [1] GetType() -> uint32_t
+ *   [2] GetName() -> const char*  [3] GetMsg() -> const char*
+ * With virtual destructor at [0], methods shift to [1..3]. */
+static long long __cdecl mock_error_getType(void) {
+    return 2; /* UNEXPECTED_ERROR = "something went wrong" */
+}
+static const char* __cdecl mock_error_getName(void) {
+    return "NoGalaxyClient";
+}
+static const char* __cdecl mock_error_getMsg(void) {
+    return "Galaxy client not running";
+}
+static void *mock_error_vtable[8];
+static MockObj mock_error;
+
 static void init_mocks(void)
 {
     /* Default vtable: all methods return 0 */
@@ -136,6 +175,23 @@ static void init_mocks(void)
     mock_listener_reg.vptr = mock_vtable;
     mock_custom_networking.vptr = mock_vtable;
     mock_logger.vptr = mock_vtable;
+
+    /* IError vtable — methods in both no-dtor and with-dtor layouts.
+     * We set [0..3] so whichever is correct, GetType/GetName/GetMsg work. */
+    for (int i = 0; i < 8; i++)
+        mock_error_vtable[i] = (void *)mock_method;
+    mock_error_vtable[0] = (void *)mock_error_getType;   /* no-dtor: GetType */
+    mock_error_vtable[1] = (void *)mock_error_getName;   /* no-dtor: GetName,  with-dtor: GetType */
+    mock_error_vtable[2] = (void *)mock_error_getMsg;    /* no-dtor: GetMsg,   with-dtor: GetName */
+    mock_error_vtable[3] = (void *)mock_error_getMsg;    /* with-dtor: GetMsg */
+    mock_error.vptr = mock_error_vtable;
+}
+
+/* Return the mock IError — tells the game "Galaxy init failed, go offline".
+ * Replaces `stub_return_null` mapping for ?GetError in the .def. */
+void *stub_get_error(void) {
+    galaxy_file_log("GetError() -> IError* (offline mode)");
+    return &mock_error;
 }
 
 /* ========================================================================
@@ -147,10 +203,12 @@ static void init_mocks(void)
 static void trace(const char *fn) {
     static volatile LONG total = 0;
     LONG t = InterlockedIncrement(&total);
-    /* Log first 20, then every 200th call */
-    if (t <= 20 || (t % 200) == 0)
-        fprintf(stderr, "[Galaxy64] %s called (total=%ld, tid=%lu)\n",
-                fn, t, GetCurrentThreadId());
+    /* Log first 30 then every 200th call — via file-log since stderr dies */
+    if (t <= 30 || (t % 200) == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s (total=%ld)", fn, t);
+        galaxy_file_log(msg);
+    }
 }
 
 void *stub_get_user(void)              { trace("User()"); return &mock_user; }
