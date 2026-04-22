@@ -224,6 +224,23 @@ class NativeWinePipeline(private val context: Context) {
             File("$dataDir/imagefs_bionic/usr/tmp").mkdirs()
             File("$dataDir/imagefs_bionic/home/xuser/.config").mkdirs()
             File("$dataDir/imagefs_bionic/home/xuser/.cache").mkdirs()
+            // libevshim (GameNative's input-event shim) looks for a
+            // memory-mapped file at imagefs/tmp/gamepad.mem to read
+            // gamepad state from. GameNative's Java side creates + mmaps
+            // it at runtime (WinHandler.start, 64 bytes). Without it,
+            // every wine thread that loads libevshim retries forever
+            // ("Failed to open memory file ..."), stalling game startup
+            // before YamanekoCoreSystem Init. Since we don't inject
+            // gamepad state (no physical controller wiring here), just
+            // create the backing files as 64-byte zero files — libevshim
+            // mmaps them fine and reads an all-zeros "no buttons pressed"
+            // state forever, which is what a stubbed gamepad should be.
+            for (name in listOf("gamepad.mem", "gamepad1.mem", "gamepad2.mem", "gamepad3.mem")) {
+                val f = File("$dataDir/imagefs_bionic/tmp/$name")
+                if (!f.exists() || f.length() != 64L) {
+                    f.writeBytes(ByteArray(64))
+                }
+            }
             // Pre-create the drive_c skeleton. Wine's wineboot expects
             // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
             // exist the dosdevices/c: symlink (../drive_c) dangles and
