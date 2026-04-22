@@ -737,6 +737,15 @@ class NativeWinePipeline(private val context: Context) {
             // DXVK frame rate cap + config-file base. Matches GameNative.
             put("DXVK_FRAME_RATE", "60")
             put("DXVK_CONFIG_FILE", "$dataDir/imagefs_bionic/home/xuser/.config/dxvk.conf")
+            // DXVK_ASYNC=1 enables the async-pipeline-compilation fork's
+            // background dxvk-pcompiler worker threads. GameNative sets this
+            // and has 5 dxvk-pcompiler threads; without it our DXVK does
+            // synchronous compilation on the calling thread. Ys IX may wait
+            // on a pipeline-ready event that async compilation would signal.
+            // (2026-04-22 diagnosed: MainThread parks at futex wait @0x73a4365110;
+            // audio/Steam/Galaxy all ruled out; pcompiler thread profile gap
+            // is the last major DXVK-level diff vs GameNative.)
+            put("DXVK_ASYNC", "1")
             put("REDIRECT_FROM", if (useProton9) BAKED_ROOT_P9 else BAKED_ROOT)
             // proton-9 was built expecting GameNative-style imagefs layout
             // (/usr/lib, /opt/wine/...). Our $dataDir/imagefs_bionic IS that
