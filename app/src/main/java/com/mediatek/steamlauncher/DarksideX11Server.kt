@@ -95,6 +95,20 @@ class DarksideX11Server(private val context: Context) {
     fun renderRoot(): android.graphics.Bitmap? =
         xServer?.screen?.renderRootToBitmap()
 
+    /**
+     * Expose the underlying ScreenView so TerminalActivity can feed
+     * Android touch/key events into Darkside's input path. Our ScreenView
+     * is created headless (never added to the view tree), so no normal
+     * Android event dispatch reaches it — callers must invoke the public
+     * input entry points (updatePointerPosition, updatePointerButtons,
+     * onKeyDown, onKeyUp) directly.
+     */
+    fun screenView(): au.com.darkside.xserver.ScreenView? = xServer?.screen
+
+    /** Root window dimensions in X11 coordinates; mirror of installEwmhStub(). */
+    fun rootWidth(): Int = 1920
+    fun rootHeight(): Int = 1080
+
     /** Dump the whole mapped-window tree (root + descendants) to logcat. */
     fun dumpWindowTree() {
         val srv = xServer ?: return

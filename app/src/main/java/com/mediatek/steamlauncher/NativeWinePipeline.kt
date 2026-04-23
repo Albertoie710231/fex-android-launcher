@@ -796,6 +796,7 @@ class NativeWinePipeline(private val context: Context) {
             put("EVSHIM_MAX_PLAYERS", "1")
             put("EVSHIM_SHM_ID", "1")
             put("EVSHIM_SHM_NAME", "controller-shm0")
+            put("EVSHIM_DEBUG", "1")
             // PulseAudio + ALSA paths — even though we stub xaudio2, the
             // libasound init-time lookup still probes these and fails
             // weirdly if unset. Pointing them at non-existent sockets is
@@ -845,28 +846,49 @@ class NativeWinePipeline(private val context: Context) {
             // audio/Steam/Galaxy all ruled out; pcompiler thread profile gap
             // is the last major DXVK-level diff vs GameNative.)
             put("DXVK_ASYNC", "1")
-            put("REDIRECT_FROM", if (useProton9) BAKED_ROOT_P9 else BAKED_ROOT)
-            // proton-9 was built expecting GameNative-style imagefs layout
-            // (/usr/lib, /opt/wine/...). Our $dataDir/imagefs_bionic IS that
-            // layout (from GameNative's imagefs_bionic.txz). For Pepelespooder
-            // keep the old proton11/imagefs mirror that was shaped for its
-            // different baked paths.
-            put("REDIRECT_TO",
-                if (useProton9) "$dataDir/imagefs_bionic" else imageFsMirror)
-            // GameNative's shim libraries (libevshim.so, libandroid-sysvshm.so)
-            // have paths under /data/data/com.winlator.cmod/... baked in (the
-            // original Winlator package name). Redirect that namespace too so
-            // evshim can find gamepad.mem etc. under our imagefs_bionic mirror.
-            put("REDIRECT_FROM2", "/data/data/com.winlator.cmod/files/imagefs")
-            put("REDIRECT_TO2", "$dataDir/imagefs_bionic")
-            // libasound (bundled with imagefs_bionic) has the bare
-            // /data/data/com.winlator/files/imagefs/... path baked in for
-            // alsa.conf — different from the .cmod-suffixed path above. If
-            // it can't load alsa.conf, xaudio2_7.dll dereferences a null and
-            // faults at +0x33364; Wine SEH catches it but the audio thread
-            // is left wedged, blocking the game right after the first present.
-            put("REDIRECT_FROM3", "/data/data/com.winlator/files/imagefs")
-            put("REDIRECT_TO3", "$dataDir/imagefs_bionic")
+            // Path redirect rules. ORDER MATTERS — libpathredirect uses
+            // first-match-wins. Most-specific rule must come first.
+            //
+            // Also: libredirect-bionic.so (earlier in LD_PRELOAD) rewrites
+            // hardcoded `com.winlator.cmod` paths to `app.gamenative` before
+            // libpathredirect sees them. So the ACTUAL paths we receive are
+            // already `app.gamenative` — the `.cmod` rules below are only
+            // hit by shims that call dlopen("libc.so")+dlsym to bypass the
+            // LD_PRELOAD chain (e.g. evshim did, before we patched it).
+            if (useProton9) {
+                // proton-9 wineserver has `com.winlator.cmod/files/imagefs/usr/../opt/wine/share/wine/nls/...`
+                // baked (strings-verified). After `.cmod → app.gamenative`
+                // rewrite, that becomes `app.gamenative/files/imagefs/opt/wine/...`
+                // (the `/usr/..` collapses in path normalization). Our
+                // proton9/{bin,lib,share} dir mirrors /opt/wine/{bin,lib,share}
+                // 1:1 — the specific rule routes p9 wine-tree lookups there.
+                put("REDIRECT_FROM", "/data/data/app.gamenative/files/imagefs/opt/wine")
+                put("REDIRECT_TO",   "$dataDir/proton9")
+                // Everything ELSE under app.gamenative/files/imagefs resolves
+                // to imagefs_bionic (usr/lib/libSDL2, etc.). General fallback.
+                put("REDIRECT_FROM2", "/data/data/app.gamenative/files/imagefs")
+                put("REDIRECT_TO2",   "$dataDir/imagefs_bionic")
+                // Defense-in-depth for shims that bypass libredirect-bionic.
+                put("REDIRECT_FROM3", "/data/data/com.winlator.cmod/files/imagefs")
+                put("REDIRECT_TO3",   "$dataDir/imagefs_bionic")
+                put("REDIRECT_FROM4", "/data/data/com.winlator/files/imagefs")
+                put("REDIRECT_TO4",   "$dataDir/imagefs_bionic")
+            } else {
+                // proton-10 / Pepelespooder: BAKED_ROOT is `app.gamenative`
+                // path; target is proton11/imagefs mirror (shaped for
+                // Pepelespooder's own baked layout).
+                put("REDIRECT_FROM", BAKED_ROOT)
+                put("REDIRECT_TO",   imageFsMirror)
+                // GameNative's shim libraries (libevshim, libandroid-sysvshm)
+                // have `com.winlator.cmod` paths baked. Shim lookups that
+                // dodge the LD_PRELOAD chain hit this rule.
+                put("REDIRECT_FROM2", "/data/data/com.winlator.cmod/files/imagefs")
+                put("REDIRECT_TO2",   "$dataDir/imagefs_bionic")
+                // libasound has bare `com.winlator` (no `.cmod`) baked for
+                // alsa.conf. Without this, xaudio2_7.dll faults at +0x33364.
+                put("REDIRECT_FROM3", "/data/data/com.winlator/files/imagefs")
+                put("REDIRECT_TO3",   "$dataDir/imagefs_bionic")
+            }
             put("REDIRECT_DEBUG", "1")
             // Keep using proton11/prefix/.wine (has DXVK DLLs + FEX DLLs
             // in drive_c/windows/system32 already). wine 9/10 share prefix
@@ -1002,12 +1024,22 @@ class NativeWinePipeline(private val context: Context) {
             val proc = pb.start()
             val outBuf = StringBuilder()
             val errBuf = StringBuilder()
+            // Live-flush stderr/stdout to files so a force-stop or kill
+            // while wineRun is blocked on waitFor still preserves the
+            // log (normal exit path also overwrites these via TerminalActivity).
+            val stderrLive = File("$dataDir/ys9_stderr.live.log")
+            val stdoutLive = File("$dataDir/ys9_stdout.live.log")
+            try { stderrLive.writeText("") } catch (_: Throwable) {}
+            try { stdoutLive.writeText("") } catch (_: Throwable) {}
+            val stderrLiveFw = java.io.FileWriter(stderrLive, true)
+            val stdoutLiveFw = java.io.FileWriter(stdoutLive, true)
             val o = Thread {
                 try {
                     val r = proc.inputStream.bufferedReader()
                     while (true) {
                         val l = r.readLine() ?: break
                         synchronized(outBuf) { outBuf.append(l).append('\n') }
+                        try { synchronized(stdoutLiveFw) { stdoutLiveFw.write(l); stdoutLiveFw.write("\n"); stdoutLiveFw.flush() } } catch (_: Throwable) {}
                     }
                 } catch (_: Throwable) {}
             }.apply { start() }
@@ -1017,12 +1049,15 @@ class NativeWinePipeline(private val context: Context) {
                     while (true) {
                         val l = r.readLine() ?: break
                         synchronized(errBuf) { errBuf.append(l).append('\n') }
+                        try { synchronized(stderrLiveFw) { stderrLiveFw.write(l); stderrLiveFw.write("\n"); stderrLiveFw.flush() } } catch (_: Throwable) {}
                     }
                 } catch (_: Throwable) {}
             }.apply { start() }
             val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             val code = if (finished) proc.exitValue() else { proc.destroyForcibly(); -99 }
             o.join(500); e.join(500)
+            try { stderrLiveFw.close() } catch (_: Throwable) {}
+            try { stdoutLiveFw.close() } catch (_: Throwable) {}
             Result(code, synchronized(outBuf) { outBuf.toString() }, synchronized(errBuf) { errBuf.toString() })
         } catch (t: Throwable) {
             Log.e(TAG, "wineRun failed", t)
