@@ -170,6 +170,12 @@ public class XClientRequestHandler implements RequestHandler {
         client.setRequestData(requestData);
         client.setRequestLength(requestLength);
 
+        // Trace every opcode briefly to understand the presentation path
+        // (we're diagnosing why DXVK's rendered pixels don't show up).
+        if (opcode == 53 || opcode == 56 || opcode == 62 || opcode == 72
+                || opcode == 73 || opcode == 8 || opcode == 12 || opcode == 14) {
+            android.util.Log.i("XReq", "opcode=" + (opcode & 0xff));
+        }
         try {
             switch (opcode) {
                 case ClientOpcodes.CREATE_WINDOW:

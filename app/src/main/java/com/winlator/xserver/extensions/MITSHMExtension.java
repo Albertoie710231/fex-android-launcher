@@ -118,6 +118,7 @@ public class MITSHMExtension implements Extension {
 
     @Override
     public void handleRequest(XClient client, XInputStream inputStream, XOutputStream outputStream) throws IOException, XRequestError {
+        android.util.Log.i("MITSHMExtension", "handleRequest opcode=" + client.getRequestData());
         int opcode = client.getRequestData();
         switch (opcode) {
             case ClientOpcodes.QUERY_VERSION :
