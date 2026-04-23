@@ -1,78 +1,87 @@
 package com.winlator.xconnector;
 
-import dalvik.annotation.optimization.CriticalNative;
+import com.winlator.xserver.XServer;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteOrder;
 import java.util.concurrent.locks.ReentrantLock;
 
-/* loaded from: classes.dex */
 public class XOutputStream {
+    private static final byte[] ZERO = new byte[64];
+    public ByteBuffer buffer;
+    public final ClientSocket clientSocket;
     private final ReentrantLock lock = new ReentrantLock();
-    private final long nativePtr;
+    private int ancillaryFd = -1;
+    private static final double FP3232_SCALE = 4294967296.0;
 
-    private static native void destroy(long j);
-
-    private native long nativeAllocate(int i, int i2);
-
-    /* JADX INFO: Access modifiers changed from: private */
-    public static native boolean sendData(long j);
-
-    @CriticalNative
-    private static native void setAncillaryFd(long j, int i);
-
-    @CriticalNative
-    private static native void writeByte(long j, byte b);
-
-    private static native void writeByteBuffer(long j, ByteBuffer byteBuffer, int i, int i2);
-
-    @CriticalNative
-    private static native void writeInt(long j, int i);
-
-    @CriticalNative
-    private static native void writeLong(long j, long j2);
-
-    @CriticalNative
-    private static native void writePad(long j, int i);
-
-    @CriticalNative
-    private static native void writeShort(long j, short s);
-
-    static {
-        System.loadLibrary("winlator");
+    public XOutputStream(int initialCapacity) {
+        this(null, initialCapacity);
     }
 
-    public XOutputStream(int clientFd, int initialCapacity) {
-        this.nativePtr = nativeAllocate(clientFd, initialCapacity);
+    public XOutputStream(ClientSocket clientSocket, int initialCapacity) {
+        this.clientSocket = clientSocket;
+        buffer = ByteBuffer.allocateDirect(initialCapacity);
+    }
+
+    public void setByteOrder(ByteOrder byteOrder) {
+        buffer.order(byteOrder);
     }
 
     public void setAncillaryFd(int ancillaryFd) {
-        setAncillaryFd(this.nativePtr, ancillaryFd);
+        this.ancillaryFd = ancillaryFd;
     }
 
     public void writeByte(byte value) {
-        writeByte(this.nativePtr, value);
+        ensureSpaceIsAvailable(1);
+        buffer.put(value);
     }
 
     public void writeShort(short value) {
-        writeShort(this.nativePtr, value);
+        ensureSpaceIsAvailable(2);
+        buffer.putShort(value);
     }
 
     public void writeInt(int value) {
-        writeInt(this.nativePtr, value);
+        ensureSpaceIsAvailable(4);
+        buffer.putInt(value);
     }
 
     public void writeLong(long value) {
-        writeLong(this.nativePtr, value);
+        ensureSpaceIsAvailable(8);
+        buffer.putLong(value);
+    }
+
+    public void writeFP3232(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            throw new IllegalArgumentException("FP3232 value must be finite");
+        }
+
+        long fixed = Math.round(value * FP3232_SCALE);
+
+        int integral = (int) (fixed >> 32);
+        int frac = (int) fixed;
+
+        // FP3232 is a struct { int32_t integral; uint32_t frac; } in X11.
+        writeInt(integral);
+        writeInt(frac);
+    }
+
+    public void writeFP3232(int integerPart, long fractionalPart) {
+        if (fractionalPart < 0L || fractionalPart > 0xFFFFFFFFL) {
+            throw new IllegalArgumentException("fractionalPart must be in range 0 .. 0xFFFFFFFF");
+        }
+
+        writeInt(integerPart);
+        writeInt((int) fractionalPart);
     }
 
     public void writeString8(String str) {
-        byte[] bytes = str.getBytes(StandardCharsets.ISO_8859_1);
-        int length = (-str.length()) & 3;
-        write(bytes);
-        if (length > 0) {
-            writePad(length);
-        }
+        byte[] bytes = str.getBytes(XServer.LATIN1_CHARSET);
+        int length = -str.length() & 3;
+        ensureSpaceIsAvailable(bytes.length + length);
+        buffer.put(bytes);
+        if (length > 0) writePad(length);
     }
 
     public void write(byte[] data) {
@@ -80,48 +89,68 @@ public class XOutputStream {
     }
 
     public void write(byte[] data, int offset, int length) {
-        for (int i = offset; i < length; i++) {
-            writeByte(this.nativePtr, data[i]);
-        }
+        ensureSpaceIsAvailable(length);
+        buffer.put(data, offset, length);
     }
 
     public void write(ByteBuffer data) {
-        if (data.isDirect()) {
-            writeByteBuffer(this.nativePtr, data, data.position(), data.remaining());
-            return;
-        }
-        int length = data.remaining();
-        for (int i = data.position(); i < length; i++) {
-            writeByte(this.nativePtr, data.get(i));
-        }
+        ensureSpaceIsAvailable(data.remaining());
+        buffer.put(data);
     }
 
     public void writePad(int length) {
-        writePad(this.nativePtr, length);
+        write(ZERO, 0, length);
+    }
+
+    private void flush() throws IOException {
+        if (buffer.position() != 0) {
+            buffer.flip();
+
+            if (ancillaryFd != -1) {
+                clientSocket.sendAncillaryMsg(buffer, ancillaryFd);
+                ancillaryFd = -1;
+            }
+            else clientSocket.write(buffer);
+
+            buffer.clear();
+        }
     }
 
     public XStreamLock lock() {
         return new OutputStreamLock();
     }
 
-    public void destroy() {
-        destroy(this.nativePtr);
+    private void ensureSpaceIsAvailable(int length) {
+        int position = buffer.position();
+        if ((buffer.capacity() - position) >= length) return;
+        ByteBuffer newBuffer = ByteBuffer.allocateDirect(buffer.capacity() + length).order(buffer.order());
+        buffer.rewind();
+        newBuffer.put(buffer).position(position);
+        buffer = newBuffer;
     }
 
-    /* loaded from: classes.dex */
+    public void writeSuccessReply(int sequenceNumber, int replyLength) throws IOException {
+        try (XStreamLock lock = lock()) {
+            writeByte((byte) 1);
+            writeByte((byte) 0);
+            writeShort((short) sequenceNumber);
+            writeInt(replyLength);
+            writePad(24);
+        }
+    }
+
     private class OutputStreamLock implements XStreamLock {
         public OutputStreamLock() {
-            XOutputStream.this.lock.lock();
+            lock.lock();
         }
 
-        @Override // com.winlator.xconnector.XStreamLock, java.lang.AutoCloseable
+        @Override
         public void close() throws IOException {
             try {
-                if (!XOutputStream.sendData(XOutputStream.this.nativePtr)) {
-                    throw new IOException("Failed to send data.");
-                }
-            } finally {
-                XOutputStream.this.lock.unlock();
+                flush();
+            }
+            finally {
+                lock.unlock();
             }
         }
     }

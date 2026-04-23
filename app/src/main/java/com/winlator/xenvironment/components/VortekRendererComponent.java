@@ -1,276 +1,196 @@
 package com.winlator.xenvironment.components;
 
-import android.util.Log;
+import android.content.Context;
 import androidx.annotation.Keep;
-import com.winlator.xconnector.ConnectedClient;
+import com.winlator.core.GPUHelper;
+// import com.winlator.core.GeneralComponents;  // removed in port; adrenotools disabled
+import com.winlator.core.KeyValueSet;
+import com.winlator.renderer.GPUImage;
+import com.winlator.renderer.Texture;
+import com.winlator.widget.XServerView;
+import com.winlator.xconnector.Client;
 import com.winlator.xconnector.ConnectionHandler;
 import com.winlator.xconnector.RequestHandler;
 import com.winlator.xconnector.UnixSocketConfig;
 import com.winlator.xconnector.XConnectorEpoll;
 import com.winlator.xconnector.XInputStream;
+import com.winlator.xenvironment.EnvironmentComponent;
+import com.winlator.xserver.Drawable;
+import com.winlator.xserver.Window;
+import com.winlator.xserver.XServer;
 import java.io.IOException;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
 
-/**
- * Vortek Vulkan renderer component.
- *
- * This is a port of Winlator's VortekRendererComponent to work with
- * our Steam Launcher. It handles:
- * - Unix socket server for Vortek client connections
- * - JNI calls to libvortekrenderer.so for Vulkan passthrough
- *
- * The native library expects this exact class path for JNI bindings.
- */
-public class VortekRendererComponent implements ConnectionHandler, RequestHandler {
-    private static final String TAG = "VortekRenderer";
-
-    // Vulkan version: 1.3.128
-    public static final int VK_MAX_VERSION = vkMakeVersion(1, 3, 128);
-
+public class VortekRendererComponent extends EnvironmentComponent implements ConnectionHandler, RequestHandler {
+    public static final int VK_MAX_VERSION = GPUHelper.vkMakeVersion(1, 3, 128);
     private XConnectorEpoll connector;
     private final Options options;
     private final UnixSocketConfig socketConfig;
-    private final ConcurrentHashMap<Integer, Long> clientContexts = new ConcurrentHashMap<>();
+    private final XServer xServer;
+    private Context context;
 
-    // Window info callback - set by the app
-    private WindowInfoProvider windowInfoProvider;
+    private native long createVkContext(int i, Options options);
 
-    // Track Vulkan initialization state
-    private boolean vulkanInitialized = false;
+    private native void destroyVkContext(long j);
 
-    // JNI native methods - must match libvortekrenderer.so exports
-    private native long createVkContext(int fd, Options options);
-    private native void destroyVkContext(long contextPtr);
-    private native boolean handleExtraDataRequest(long contextPtr, int requestId, int requestLength);
-    private native void initVulkanWrapper(String nativeLibDir, String libvulkanPath);
+    private native boolean handleExtraDataRequest(long j, int i, int i2);
+
+    private native void initVulkanWrapper(String str, String str2);
 
     static {
-        try {
-            System.loadLibrary("vortekrenderer");
-            Log.i(TAG, "libvortekrenderer.so loaded successfully");
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load libvortekrenderer.so: " + e.getMessage());
-        }
+        System.loadLibrary("vortekrenderer");
     }
 
-    /**
-     * Options for Vortek renderer configuration.
-     * This class is passed to native code, field names must match.
-     */
-    @Keep
     public static class Options {
-        public int vkMaxVersion = VK_MAX_VERSION;
-        public short maxDeviceMemory = 0;  // 0 = use actual device memory (Winlator v11 default)
-        public short imageCacheSize = 256;    // MB
+        public int vkMaxVersion = VortekRendererComponent.VK_MAX_VERSION;
+        public short maxDeviceMemory = 0;
+        public short imageCacheSize = 256;
         public byte resourceMemoryType = 0;
         public String[] exposedDeviceExtensions = null;
         public String libvulkanPath = null;
-    }
 
-    /**
-     * Interface for providing window information to native code.
-     */
-    public interface WindowInfoProvider {
-        int getWindowWidth(int windowId);
-        int getWindowHeight(int windowId);
-        long getWindowHardwareBuffer(int windowId);
-        void updateWindowContent(int windowId);
-    }
-
-    public VortekRendererComponent(String socketPath, String nativeLibDir, Options options) {
-        this.socketConfig = UnixSocketConfig.create(
-            socketPath.substring(0, socketPath.lastIndexOf('/')),
-            socketPath.substring(socketPath.lastIndexOf('/') + 1)
-        );
-        this.options = options != null ? options : new Options();
-
-        // Initialize Vulkan wrapper with library paths
-        Log.i(TAG, "Initializing Vulkan wrapper: nativeLibDir=" + nativeLibDir + ", libvulkanPath=" + this.options.libvulkanPath);
-        try {
-            initVulkanWrapper(nativeLibDir, this.options.libvulkanPath);
-            vulkanInitialized = true;
-            Log.i(TAG, "Vulkan wrapper initialized successfully");
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to initialize Vulkan wrapper (UnsatisfiedLinkError): " + e.getMessage());
-            vulkanInitialized = false;
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to initialize Vulkan wrapper: " + e.getMessage());
-            vulkanInitialized = false;
+        public static Options fromKeyValueSet(Context context, KeyValueSet config) {
+            if (config == null || config.isEmpty()) {
+                return new Options();
+            }
+            Options options = new Options();
+            String exposedDeviceExtensions = config.get("exposedDeviceExtensions", "all");
+            if (!exposedDeviceExtensions.isEmpty() && !exposedDeviceExtensions.equals("all")) {
+                options.exposedDeviceExtensions = exposedDeviceExtensions.split("\\|");
+            }
+            String str = "1.3.128";
+            String vkMaxVersion = config.get("vkMaxVersion", str);
+            if (!vkMaxVersion.equals(str)) {
+                String[] parts = vkMaxVersion.split("\\.");
+                options.vkMaxVersion = GPUHelper.vkMakeVersion(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), 128);
+            }
+            options.maxDeviceMemory = (short) config.getInt("maxDeviceMemory");
+            options.imageCacheSize = (short) config.getInt("imageCacheSize", 256);
+            options.resourceMemoryType = (byte) config.getInt("resourceMemoryType");
+            // adrenotools driver lookup removed in port — caller can set
+            // options.libvulkanPath manually if hotswap is desired.
+            options.libvulkanPath = null;
+            return options;
         }
     }
 
-    /**
-     * Check if Vulkan was initialized successfully.
-     */
-    public boolean isVulkanInitialized() {
-        return vulkanInitialized;
+    public VortekRendererComponent(XServer xServer, UnixSocketConfig socketConfig, Options options, Context context) {
+        this.xServer = xServer;
+        this.socketConfig = socketConfig;
+        this.options = options;
+        this.context = context;
+        String nativeLibraryDir = context.getApplicationInfo().nativeLibraryDir;
+        initVulkanWrapper(nativeLibraryDir, options.libvulkanPath);
     }
 
-    public void setWindowInfoProvider(WindowInfoProvider provider) {
-        this.windowInfoProvider = provider;
-    }
-
+    @Override // com.winlator.xenvironment.EnvironmentComponent
     public void start() {
-        if (connector != null) {
-            Log.w(TAG, "Connector already running");
+        if (this.connector != null) {
             return;
         }
-
-        try {
-            connector = new XConnectorEpoll(socketConfig, this, this);
-            connector.setInitialInputBufferCapacity(8);
-            connector.setInitialOutputBufferCapacity(0);
-            connector.start();
-            Log.i(TAG, "Vortek server started on: " + socketConfig.path);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to start Vortek server: " + e.getMessage());
-            connector = null;
-        }
+        XConnectorEpoll xConnectorEpoll = new XConnectorEpoll(this.socketConfig, this, this);
+        this.connector = xConnectorEpoll;
+        xConnectorEpoll.setInitialInputBufferCapacity(8);
+        this.connector.setInitialOutputBufferCapacity(0);
+        this.connector.start();
     }
 
+    @Override // com.winlator.xenvironment.EnvironmentComponent
     public void stop() {
-        if (connector != null) {
-            connector.destroy();
-            connector = null;
-        }
-
-        // Destroy all client contexts
-        for (Long contextPtr : clientContexts.values()) {
-            try {
-                destroyVkContext(contextPtr);
-            } catch (Exception e) {
-                Log.w(TAG, "Error destroying context: " + e.getMessage());
-            }
-        }
-        clientContexts.clear();
-
-        Log.i(TAG, "Vortek server stopped");
-    }
-
-    // === ConnectionHandler implementation ===
-
-    @Override
-    public void handleNewConnection(ConnectedClient client) {
-        Log.d(TAG, "New Vortek client connected: fd=" + client.fd);
-    }
-
-    @Override
-    public void handleConnectionShutdown(ConnectedClient client) {
-        Log.d(TAG, "Vortek client disconnected: fd=" + client.fd);
-        if (client.getTag() != null) {
-            long contextPtr = (Long) client.getTag();
-            try {
-                destroyVkContext(contextPtr);
-            } catch (Exception e) {
-                Log.w(TAG, "Error destroying context on disconnect: " + e.getMessage());
-            }
-            clientContexts.remove(client.fd);
+        XConnectorEpoll xConnectorEpoll = this.connector;
+        if (xConnectorEpoll != null) {
+            xConnectorEpoll.stop();
+            this.connector = null;
         }
     }
-
-    // === RequestHandler implementation ===
-
-    @Override
-    public boolean handleRequest(ConnectedClient client) throws IOException {
-        XInputStream inputStream = client.getInputStream();
-        if (inputStream == null || inputStream.available() < 8) {
-            return false;
-        }
-
-        int requestCode = inputStream.readInt();
-        int requestLength = inputStream.readInt();
-
-        if (requestCode == 1) {
-            // Guard: Check if Vulkan was initialized successfully
-            if (!vulkanInitialized) {
-                Log.e(TAG, "Cannot create context: Vulkan not initialized");
-                connector.killConnection(client);
-                return true;
-            }
-
-            // Guard: Check if WindowInfoProvider is set (required for rendering)
-            if (windowInfoProvider == null) {
-                Log.e(TAG, "Cannot create context: WindowInfoProvider not set");
-                connector.killConnection(client);
-                return true;
-            }
-
-            // Create Vulkan context for this client
-            Log.d(TAG, "Creating Vulkan context for fd=" + client.fd + " (WindowInfoProvider: set)");
-            Log.d(TAG, "Options: vkMaxVersion=" + options.vkMaxVersion +
-                       ", maxDeviceMemory=" + options.maxDeviceMemory +
-                       ", imageCacheSize=" + options.imageCacheSize +
-                       ", libvulkanPath=" + options.libvulkanPath);
-            try {
-                long contextPtr = createVkContext(client.fd, options);
-                Log.d(TAG, "createVkContext returned: " + contextPtr + " (0x" + Long.toHexString(contextPtr) + ")");
-                // Note: contextPtr is a native pointer which can have high bits set
-                // (ARM64 MTE tagged pointers), making it negative as signed long.
-                // Check != 0 instead of > 0.
-                if (contextPtr != 0) {
-                    client.setTag(Long.valueOf(contextPtr));
-                    clientContexts.put(client.fd, contextPtr);
-                    Log.i(TAG, "Created Vulkan context: 0x" + Long.toHexString(contextPtr));
-                } else {
-                    Log.e(TAG, "Failed to create Vulkan context (returned null)");
-                    connector.killConnection(client);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Exception creating Vulkan context: " + e.getMessage());
-                connector.killConnection(client);
-            }
-        } else if (requestCode > 32767 && (requestCode >> 16) == 2) {
-            int requestId = 65535 & requestCode;
-            boolean success = handleExtraDataRequest(
-                ((Long) client.getTag()).longValue(), requestId, requestLength);
-            if (!success) {
-                throw new IOException("Failed to handle extra data request.");
-            }
-        }
-
-        return true;
-    }
-
-    // === Native callbacks (called from libvortekrenderer.so) ===
 
     @Keep
     private int getWindowWidth(int windowId) {
-        if (windowInfoProvider != null) {
-            return windowInfoProvider.getWindowWidth(windowId);
-        }
-        return 1920; // Default fallback
-    }
-
-    @Keep
-    private int getWindowHeight(int windowId) {
-        if (windowInfoProvider != null) {
-            return windowInfoProvider.getWindowHeight(windowId);
-        }
-        return 1080; // Default fallback
-    }
-
-    @Keep
-    private long getWindowHardwareBuffer(int windowId) {
-        if (windowInfoProvider != null) {
-            return windowInfoProvider.getWindowHardwareBuffer(windowId);
+        Window window = this.xServer.windowManager.getWindow(windowId);
+        if (window != null) {
+            return window.getWidth();
         }
         return 0;
     }
 
     @Keep
+    private int getWindowHeight(int windowId) {
+        Window window = this.xServer.windowManager.getWindow(windowId);
+        if (window != null) {
+            return window.getHeight();
+        }
+        return 0;
+    }
+
+    @Keep
+    private long getWindowHardwareBuffer(int windowId) {
+        Window window = this.xServer.windowManager.getWindow(windowId);
+        if (window != null) {
+            Drawable drawable = window.getContent();
+            Texture texture = drawable.getTexture();
+            if (!(texture instanceof GPUImage)) {
+                XServerView xServerView = this.xServer.getRenderer().xServerView;
+                Objects.requireNonNull(texture);
+                xServerView.queueEvent(() -> VortekRendererComponent.destroyTexture(texture));
+                drawable.setTexture(new GPUImage(drawable.width, drawable.height));
+            }
+            return ((GPUImage) drawable.getTexture()).getHardwareBufferPtr();
+        }
+        return 0L;
+    }
+
+    @Keep
     private void updateWindowContent(int windowId) {
-        if (windowInfoProvider != null) {
-            windowInfoProvider.updateWindowContent(windowId);
+        Window window = this.xServer.windowManager.getWindow(windowId);
+        if (window != null) {
+            Drawable drawable = window.getContent();
+            synchronized (drawable.renderLock) {
+                drawable.forceUpdate();
+            }
         }
     }
 
-    // === Helper methods ===
-
-    public static int vkMakeVersion(int major, int minor, int patch) {
-        return (major << 22) | (minor << 12) | patch;
+    @Override // com.winlator.xconnector.ConnectionHandler
+    public void handleConnectionShutdown(Client client) {
+        if (client.getTag() != null) {
+            long contextPtr = ((Long) client.getTag()).longValue();
+            destroyVkContext(contextPtr);
+        }
     }
 
-    public String getSocketPath() {
-        return socketConfig != null ? socketConfig.path : null;
+    @Override // com.winlator.xconnector.ConnectionHandler
+    public void handleNewConnection(Client client) {
+        client.createIOStreams();
+    }
+
+    @Override // com.winlator.xconnector.RequestHandler
+    public boolean handleRequest(Client client) throws IOException {
+        XInputStream inputStream = client.getInputStream();
+        if (inputStream.available() < 8) {
+            return false;
+        }
+        int requestCode = inputStream.readInt();
+        int requestLength = inputStream.readInt();
+        if (requestCode == 1) {
+            long contextPtr = createVkContext(client.clientSocket.fd, this.options);
+            if (contextPtr > 0) {
+                client.setTag(Long.valueOf(contextPtr));
+            } else {
+                this.connector.killConnection(client);
+            }
+        } else if (requestCode > 32767 && (requestCode >> 16) == 2) {
+            int requestId = 65535 & requestCode;
+            boolean success = handleExtraDataRequest(((Long) client.getTag()).longValue(), requestId, requestLength);
+            if (!success) {
+                throw new IOException("Failed to handle extra data request.");
+            }
+        }
+        return true;
+    }
+
+    public static void destroyTexture(Texture texture) {
+        if (texture != null) {
+            texture.destroy();
+        }
     }
 }
