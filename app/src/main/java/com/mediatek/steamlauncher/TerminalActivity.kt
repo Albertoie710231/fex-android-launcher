@@ -50,6 +50,8 @@ class TerminalActivity : AppCompatActivity() {
     private var frameSocketServer: FrameSocketServer? = null
     private var x11Server: X11Server? = null
     private var darksideX11: DarksideX11Server? = null
+    private var xConnectorX11: XConnectorX11Server? = null
+    private var xServerView: com.winlator.widget.XServerView? = null
     private var framebufferBridge: FramebufferBridge? = null
     private var isDisplayMode = false
     private var surfaceReady = false
@@ -437,46 +439,45 @@ class TerminalActivity : AppCompatActivity() {
         // native pipeline with a real game binary.
         findViewById<Button>(R.id.btnYsIXNative).setOnClickListener {
             appendOutput("=== wine ys9.exe (native Bionic) ===\n")
-            // wine-10 needs winex11.drv → needs an X server. Use the
-            // Darkside-xserver-based DarksideX11Server for Ys IX because
-            // libXlorie doesn't emit FocusIn in headless mode, and without
-            // FocusIn wine never delivers WM_ACTIVATEAPP to the game's
-            // message pump — main thread parks forever after first present.
-            // Darkside listens on TCP 6000; we set DISPLAY=127.0.0.1:0 so
-            // wine connects there (libXlorie is left running on the
-            // abstract unix socket for other paths).
-            if (darksideX11?.isRunning() != true) {
-                darksideX11 = DarksideX11Server(this).apply {
-                    if (start()) handler.post { appendOutput("[Darkside X11 on :6000 for YsIX]\n") }
-                    else         handler.post { appendOutput("[Darkside X11 start failed]\n") }
+            // 2026-04-23: switched from DarksideX11Server to
+            // XConnectorX11Server. Darkside was a pure-Java X11 server
+            // without DRI3/Present extensions — wine's VK_KHR_xlib_surface
+            // refused to initialize ("No DRI3 support detected") and we
+            // had to route DXVK through our fake headless Vulkan layer,
+            // which Mali's driver optimized to all-black frames. Winlator's
+            // XConnector (imported from GameNative) has full DRI3 + Present
+            // support via libxconnectorpatch.so ancillary-FD passing, so
+            // DXVK can present natively through VK_KHR_xlib_surface.
+            if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
+                xConnectorX11 = XConnectorX11Server(this).apply {
+                    // Socket goes to imagefs_bionic/tmp/.X11-unix/X0 so our
+                    // libpathredirect rule that maps com.winlator.cmod/files/imagefs/
+                    // → imagefs_bionic can let wine reach it when DISPLAY=:0 triggers
+                    // a path through that shim.
+                    val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
+                    if (start(socketRoot)) {
+                        handler.post {
+                            appendOutput("[XConnector X11 listening on ${socketPath()}]\n")
+                        }
+                        // Attach XServerView to vulkanSurface's parent FrameLayout
+                        // so the X server's GL compositor renders on-screen.
+                        try {
+                            val container = vulkanSurface.parent as android.widget.FrameLayout
+                            val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
+                            xServer.setRenderer(xsv.renderer)
+                            runOnUiThread {
+                                vulkanSurface.visibility = android.view.View.GONE
+                                container.addView(xsv)
+                                xServerView = xsv
+                            }
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "XServerView attach failed", t)
+                        }
+                    } else {
+                        handler.post { appendOutput("[XConnector X11 start failed]\n") }
+                    }
                 }
             }
-            // Diagnostic: after the game settles into BGM-loop, dump
-            // Darkside's composited root pixmap to a PNG. If the game is
-            // rendering a launcher dialog via GDI (which our DXVK-only
-            // capture misses), the pixmap will show it. If the pixmap is
-            // pure black, the game isn't GDI-rendering either and we need
-            // to look elsewhere. (2026-04-22 — pivot based on user feedback
-            // that we're reinventing what GameNative/libXlorie already do.)
-            handler.postDelayed({
-                try {
-                    val srv = darksideX11
-                    srv?.dumpWindowTree()
-                    val path = srv?.renderRootToFile(java.io.File(
-                        getExternalFilesDir(null),
-                        "darkside_root_at_45s.png"
-                    ))
-                    appendOutput("[Darkside pixmap dumped: $path]\n")
-                } catch (t: Throwable) {
-                    appendOutput("[Darkside dump failed: ${t.message}]\n")
-                }
-            }, 45000L)
-            // Toggle display mode so `vulkanSurface` is visible and
-            // frameSocketServer binds it as its output. DXVK's presents
-            // are captured by VK_LAYER_HEADLESS_surface, streamed over
-            // TCP 19850 to FrameSocketServer, which renders via
-            // lockHardwareCanvas to vulkanSurface.
-            if (!isDisplayMode) toggleDisplayMode()
             val pipeline = NativeWinePipeline(this)
             // 2026-04-22: Launch via ColdClient Steam-emulator loader
             // (matches GameNative's architecture). The loader reads
@@ -548,7 +549,9 @@ class TerminalActivity : AppCompatActivity() {
                             "Galaxy64=n;steam_api64=n;" +
                             "steamclient=n;steamclient64=n;" +
                             "GFSDK_SSAO_D3D11=n",
-                        "DISPLAY" to "127.0.0.1:0",
+                        // DISPLAY=:0 resolves via libpathredirect to the
+                        // XConnector unix socket at $tmpRoot/tmp/.X11-unix/X0.
+                        "DISPLAY" to ":0",
                         // HEADLESS_DIAG_CLEAR=1 would make the layer clobber
                         // every presented image with solid green before copy
                         // — used 2026-04-21 to prove the capture+surface path

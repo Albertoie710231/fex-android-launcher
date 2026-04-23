@@ -918,13 +918,13 @@ class NativeWinePipeline(private val context: Context) {
             put("VK_LAYER_PATH",
                 "$dataDir/imagefs_bionic/usr/share/vulkan/implicit_layer.d:" +
                 "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d")
-            // VK_LAYER_HEADLESS_surface: keep enabled as fallback path.
-            // Wine now sees DRI3+Present stubs advertised by Darkside, so
-            // it won't abort at VK surface creation. DXVK still goes
-            // through our headless layer for actual pixel capture (stubs
-            // don't implement DMA-BUF import, so xlib-surface isn't a
-            // real presentation path).
-            put("ENABLE_HEADLESS_LAYER", "1")
+            // VK_LAYER_HEADLESS_surface: disabled. The XConnector X server
+            // implements real DRI3 + Present extensions with ancillary-FD
+            // passing via libxconnectorpatch.so, so wine's VK_KHR_xlib_surface
+            // + DXVK presentation path now works natively — no need for our
+            // headless capture layer.
+            put("DISABLE_HEADLESS_LAYER", "1")
+            put("ENABLE_HEADLESS_LAYER", "0")
             put("VORTEK_SERVER_PATH", "$cacheDir/tmp/vortek.sock")
             // Exact env set GameNative uses for a working Ys IX run on this
             // Mali tablet (captured from /proc/<ys9-pid>/environ — see
