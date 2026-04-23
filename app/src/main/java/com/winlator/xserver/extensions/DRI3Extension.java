@@ -157,7 +157,9 @@ public class DRI3Extension implements Extension {
 
     private void pixmapFromHardwareBuffer(XClient client, int pixmapId, short width, short height, byte depth, int fd) throws IOException, XRequestError {
         try {
+            android.util.Log.i("DRI3Extension", "pixmapFromHardwareBuffer fd=" + fd + " w=" + width + " h=" + height + " depth=" + depth + " GPUImage.supported=" + GPUImage.isSupported());
             GPUImage gpuImage = new GPUImage(fd);
+            android.util.Log.i("DRI3Extension", "GPUImage created stride=" + gpuImage.getStride());
             Drawable drawable = client.xServer.drawableManager.createDrawable(pixmapId, gpuImage.getStride(), height, depth);
             drawable.setTexture(gpuImage);
             client.xServer.pixmapManager.createPixmap(drawable);
@@ -187,6 +189,7 @@ public class DRI3Extension implements Extension {
     @Override
     public void handleRequest(XClient client, XInputStream inputStream, XOutputStream outputStream) throws IOException, XRequestError {
         int opcode = client.getRequestData();
+        android.util.Log.i("DRI3Extension", "handleRequest opcode=" + opcode);
         switch (opcode) {
             case ClientOpcodes.QUERY_VERSION :
                 queryVersion(client, inputStream, outputStream);
