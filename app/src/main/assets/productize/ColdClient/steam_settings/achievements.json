@@ -1,0 +1,974 @@
+[
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "King of the Monstrums",
+      "token": "NEW_ACHIEVEMENT_1_0_NAME",
+      "french": "Le roi des Monstrums",
+      "japanese": "King of Monstrum"
+    },
+    "description": {
+      "english": "Finish \"Balduq Prison\" by Adol Christin in its entirety by earning all achievements.",
+      "token": "NEW_ACHIEVEMENT_1_0_DESC",
+      "french": "Lecture compl\u00e8te de la \u00ab Cage de Balduq \u00bb.",
+      "japanese": "\u30a2\u30c9\u30eb\u30fb\u30af\u30ea\u30b9\u30c6\u30a3\u30f3\u8457\u300e\u30d0\u30eb\u30c9\u30a5\u30fc\u30af\u306e\u6abb\u300f\u3092\u719f\u8aad\u3057\u305f\u8a3c\u3002"
+    },
+    "icon": "img/9747d0affc76e5af455073bb776674f66499a3b1.jpg",
+    "icon_gray": "img/65643283c84d9939c605c9e13f09dadfc5cf27b4.jpg",
+    "name": "NEW_ACHIEVEMENT_1_0"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Cartographer",
+      "token": "NEW_ACHIEVEMENT_1_1_NAME",
+      "french": "La carte parfaite",
+      "japanese": "\u5b8c\u5168\u306a\u308b\u5730\u56f3"
+    },
+    "description": {
+      "english": "Complete the map of Balduq.",
+      "token": "NEW_ACHIEVEMENT_1_1_DESC",
+      "french": "Carte de Balduq compl\u00e9t\u00e9e.",
+      "japanese": "\u30d0\u30eb\u30c9\u30a5\u30fc\u30af\u306e\u5730\u56f3\u3092\u5b8c\u6210\u3055\u305b\u305f\u3002"
+    },
+    "icon": "img/326ee3e13c1789944484ce3a3a2b89c91d84b7a0.jpg",
+    "icon_gray": "img/bc1f73b2a853d73fa18217bd31579002063b55b6.jpg",
+    "name": "NEW_ACHIEVEMENT_1_1"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Seeker of Fortune",
+      "token": "NEW_ACHIEVEMENT_1_2_NAME",
+      "french": "Le chasseur de tr\u00e9sors",
+      "japanese": "\u8ca1\u5b9d\u30cf\u30f3\u30bf\u30fc"
+    },
+    "description": {
+      "english": "Attain 100% of all treasure chests.",
+      "token": "NEW_ACHIEVEMENT_1_2_DESC",
+      "french": "100 % des coffres d\u00e9couverts.",
+      "japanese": "\u5b9d\u7bb1\u767a\u898b\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/d601037ef72d50f85a59fce88d7c9f9117008246.jpg",
+    "icon_gray": "img/4b445849aae2f7fbf123f0fe36a9989ef609ee58.jpg",
+    "name": "NEW_ACHIEVEMENT_1_2"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Good Samaritan",
+      "token": "NEW_ACHIEVEMENT_1_3_NAME",
+      "french": "L\u2019artisan r\u00e9put\u00e9",
+      "japanese": "\u540d\u3046\u3066\u306e\u4ed5\u4e8b\u4eba"
+    },
+    "description": {
+      "english": "Attain 100% of all quests.",
+      "token": "NEW_ACHIEVEMENT_1_3_DESC",
+      "french": "100 % des qu\u00eates effectu\u00e9es.",
+      "japanese": "\u30af\u30a8\u30b9\u30c8\u9054\u6210\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/3b98b71aafc173d7a4a1e5be82cccd5a52b94f81.jpg",
+    "icon_gray": "img/0d4201d46512bbf4964c6ed324ca49043c5d41d7.jpg",
+    "name": "NEW_ACHIEVEMENT_1_3"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Debonair Socialite",
+      "token": "NEW_ACHIEVEMENT_1_4_NAME",
+      "french": "Sociabilit\u00e9 avant tout",
+      "japanese": "\u6c17\u3055\u304f\u306a\u793e\u4ea4\u5bb6"
+    },
+    "description": {
+      "english": "Attain 100% of all \"People\" entries in your Journal.",
+      "token": "NEW_ACHIEVEMENT_1_4_DESC",
+      "french": "100 % des personnages inscrits dans le carnet.",
+      "japanese": "\u5192\u967a\u65e5\u8a8c\u300c\u4eba\u7269\u300d\u958b\u5c01\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/3655522bfaa66a7d6b3bc17d5d3d14fc6f2d663e.jpg",
+    "icon_gray": "img/59c91c43d8dac49c59af9a318305ea67b098ad85.jpg",
+    "name": "NEW_ACHIEVEMENT_1_4"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Monster Zoologist",
+      "token": "NEW_ACHIEVEMENT_1_5_NAME",
+      "french": "Le sp\u00e9cialiste des monstres",
+      "japanese": "\u30e2\u30f3\u30b9\u30bf\u30fc\u535a\u58eb"
+    },
+    "description": {
+      "english": "Attain 100% of all \"Monsters\" entries in your Journal.",
+      "token": "NEW_ACHIEVEMENT_1_5_DESC",
+      "french": "100 % des monstres inscrits dans le carnet.",
+      "japanese": "\u5192\u967a\u65e5\u8a8c\u300c\u30e2\u30f3\u30b9\u30bf\u30fc\u300d\u958b\u5c01\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/53f1d70eba004ffdc66643af9e3a5a072cacaef2.jpg",
+    "icon_gray": "img/a586962c3611388fc38bb1cf967a7f277f54e35f.jpg",
+    "name": "NEW_ACHIEVEMENT_1_5"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Material Girl",
+      "token": "NEW_ACHIEVEMENT_1_6_NAME",
+      "french": "Le chercheur d\u2019ingr\u00e9dients",
+      "japanese": "\u30de\u30c6\u30ea\u30a2\u30eb\u7814\u7a76\u5bb6"
+    },
+    "description": {
+      "english": "Attain 100% of all \"Materials\" entries in your Journal.",
+      "token": "NEW_ACHIEVEMENT_1_6_DESC",
+      "french": "100 % des ingr\u00e9dients inscrits dans le carnet.",
+      "japanese": "\u5192\u967a\u65e5\u8a8c\u300c\u7d20\u6750\u300d\u767b\u9332\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/d74867ebbf6e8f54899ac3d9ac698f427939071d.jpg",
+    "icon_gray": "img/f552f18259f24e9b72d497cda3c91f2fafb93e48.jpg",
+    "name": "NEW_ACHIEVEMENT_1_6"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "I Would Walk 300 Krimelye",
+      "token": "NEW_ACHIEVEMENT_1_7_NAME",
+      "french": "Exploration profonde",
+      "japanese": "\u9065\u304b\u306a\u308b\u63a2\u7d22"
+    },
+    "description": {
+      "english": "Travel a total distance of 300 krimelye.",
+      "token": "NEW_ACHIEVEMENT_1_7_DESC",
+      "french": "300 krimelys parcourus.",
+      "japanese": "\u7dcf\u79fb\u52d5\u8ddd\u96e2\u30fb\uff13\uff10\uff10\u30af\u30ea\u30e1\u30e9\u30a4\u9054\u6210\u3002"
+    },
+    "icon": "img/a16b268affa5adb5e0d124dc1074dc322dfd16cb.jpg",
+    "icon_gray": "img/e8a6c8393b8e102b5314b4c94b782c082c85d1d7.jpg",
+    "name": "NEW_ACHIEVEMENT_1_7"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Ambassador of the Dandelion",
+      "token": "NEW_ACHIEVEMENT_1_8_NAME",
+      "french": "L\u2019\u00e9toile du Dent-de-lion",
+      "japanese": "\u30c0\u30f3\u30c7\u30ea\u30aa\u30f3\u306e\u661f"
+    },
+    "description": {
+      "english": "Attain 100% of Affinity with all characters.",
+      "token": "NEW_ACHIEVEMENT_1_8_DESC",
+      "french": "100 % d\u2019affinit\u00e9s obtenus.",
+      "japanese": "\u89aa\u5bc6\u5ea6\u9054\u6210\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/ce35d87f2872ba9b74c88db6219baa4f5b12e8df.jpg",
+    "icon_gray": "img/72a1ca1a8e377bfc65c88e8047dc4ef63a6868f4.jpg",
+    "name": "NEW_ACHIEVEMENT_1_8"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Hermetic Bastion",
+      "token": "NEW_ACHIEVEMENT_1_9_NAME",
+      "french": "Le renforceur juste",
+      "japanese": "\u7834\u90aa\u306e\u6226\u9663"
+    },
+    "description": {
+      "english": "Attain 100% of Ritual Relics enhanced.",
+      "token": "NEW_ACHIEVEMENT_1_9_DESC",
+      "french": "100 % de renforcement des Remparts occultes.",
+      "japanese": "\u964d\u9b54\u8a2d\u5099\u5f37\u5316\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/4c67af78e048b21b2c87dd5f0f7671457086e4b6.jpg",
+    "icon_gray": "img/981356656279ba9d975171fa2628cff753ee3326.jpg",
+    "name": "NEW_ACHIEVEMENT_1_9"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Fields of Blue",
+      "token": "NEW_ACHIEVEMENT_1_10_NAME",
+      "french": "Le missionnaire du bonheur",
+      "japanese": "\u5e78\u305b\u306e\u4f1d\u9053\u5e2b"
+    },
+    "description": {
+      "english": "Attain 100% of Azure Petals found.",
+      "token": "NEW_ACHIEVEMENT_1_10_DESC",
+      "french": "100 % des p\u00e9tales bleus trouv\u00e9s.",
+      "japanese": "\u84bc\u3044\u82b1\u3073\u3089\u53ce\u96c6\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/dd3f6b6d4d8f4efdf0d0912682d4c1067edd4460.jpg",
+    "icon_gray": "img/50536751e933843840c8be5673a280d9eac3d0a1.jpg",
+    "name": "NEW_ACHIEVEMENT_1_10"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Art Critic",
+      "token": "NEW_ACHIEVEMENT_1_11_NAME",
+      "french": "L\u2019amoureux des \u00e9crits",
+      "japanese": "\u843d\u66f8\u304d\u611b\u597d\u5bb6"
+    },
+    "description": {
+      "english": "Attain 100% of graffiti discovered.",
+      "token": "NEW_ACHIEVEMENT_1_11_DESC",
+      "french": "100 % des inscriptions d\u00e9couvertes.",
+      "japanese": "\u843d\u66f8\u304d\u767a\u898b\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/fae5cfd6031d5e46fe2c6f37809d2acd12e8720e.jpg",
+    "icon_gray": "img/dc69837f2772bde8719d259b2356a42b1bd639c2.jpg",
+    "name": "NEW_ACHIEVEMENT_1_11"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Intrepid Tourist",
+      "token": "NEW_ACHIEVEMENT_1_12_NAME",
+      "french": "L\u2019explorateur romantique",
+      "japanese": "\u6d6a\u6f2b\u306e\u63a2\u7a76\u8005"
+    },
+    "description": {
+      "english": "Attain 100% of landmarks discovered.",
+      "token": "NEW_ACHIEVEMENT_1_12_DESC",
+      "french": "100 % des panoramas d\u00e9couverts.",
+      "japanese": "\u30ed\u30b1\u30fc\u30b7\u30e7\u30f3\u30dd\u30a4\u30f3\u30c8\u767a\u898b\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/d40411654faabeacff6bcf5ed165b011d8745d7b.jpg",
+    "icon_gray": "img/fe26751a50ff36ba52bdadf28b533a17d4593f10.jpg",
+    "name": "NEW_ACHIEVEMENT_1_12"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Shopaholic",
+      "token": "NEW_ACHIEVEMENT_1_13_NAME",
+      "french": "Le d\u00e9couvreur de boutiques",
+      "japanese": "\u30b7\u30e7\u30c3\u30d7\u958b\u62d3\u8005"
+    },
+    "description": {
+      "english": "Attain 100% of shops discovered.",
+      "token": "NEW_ACHIEVEMENT_1_13_DESC",
+      "french": "100 % des boutiques d\u00e9couvertes.",
+      "japanese": "\u30b7\u30e7\u30c3\u30d7\u767a\u898b\u7387\u30fb\uff11\uff10\uff10\uff05\u9054\u6210\u3002"
+    },
+    "icon": "img/957e8f15f46e572c102077e6d0a68ae432e554c9.jpg",
+    "icon_gray": "img/813b793f27016111b627b0c0a0db04645300cff7.jpg",
+    "name": "NEW_ACHIEVEMENT_1_13"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Twilight Guardian",
+      "token": "NEW_ACHIEVEMENT_1_14_NAME",
+      "french": "Le h\u00e9ros de l\u2019obscurit\u00e9",
+      "japanese": "\u5bb5\u95c7\u306e\u82f1\u96c4"
+    },
+    "description": {
+      "english": "Have obtained a total of 2,000 NOX points.",
+      "token": "NEW_ACHIEVEMENT_1_14_DESC",
+      "french": "Total de 2000 points NOX obtenus.",
+      "japanese": "\u7d2f\u8a08\uff2e\uff2f\uff38\u30dd\u30a4\u30f3\u30c8\u30fb2,000\u30dd\u30a4\u30f3\u30c8\u9054\u6210\u3002"
+    },
+    "icon": "img/8eecfc3f73c7befe22902beca25c59c48caddc6d.jpg",
+    "icon_gray": "img/b9131cad03d38d2673dd8e08ed0bf7ebd8561376.jpg",
+    "name": "NEW_ACHIEVEMENT_1_14"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Errant Millionaire",
+      "token": "NEW_ACHIEVEMENT_1_15_NAME",
+      "french": "Le nanti vagabond",
+      "japanese": "\u3055\u3059\u3089\u3044\u306e\u5927\u5bcc\u8c6a"
+    },
+    "description": {
+      "english": "Have 1,000,000 Gold in possession.",
+      "token": "NEW_ACHIEVEMENT_1_15_DESC",
+      "french": "Un million de pi\u00e8ces d\u2019or obtenues.",
+      "japanese": "\u6700\u5927\u6240\u6301\u91d11,000,000\u30b4\u30fc\u30eb\u30c9\u9054\u6210\u3002"
+    },
+    "icon": "img/4936096ad70390ba4795a861e8f6da31d468ac13.jpg",
+    "icon_gray": "img/4ce2a491d233d502cfee7dcdd1873e0c4a448181.jpg",
+    "name": "NEW_ACHIEVEMENT_1_15"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Haute Cuisine",
+      "token": "NEW_ACHIEVEMENT_1_16_NAME",
+      "french": "Restaurant trois \u00e9toiles",
+      "japanese": "\u4e09\u30c4\u661f\u30ec\u30b9\u30c8\u30e9\u30f3"
+    },
+    "description": {
+      "english": "Unlock all 13 recipes at the Dandelion.",
+      "token": "NEW_ACHIEVEMENT_1_16_DESC",
+      "french": "Toutes les recettes du Dent-de-lion accessibles (13 en tout).",
+      "japanese": "\u30c0\u30f3\u30c7\u30ea\u30aa\u30f3\u3067\u5168\u3066\u306e\u6599\u7406\u304c\u4f5c\u308c\u308b\u3088\u3046\u306b\u306a\u3063\u305f\uff08\u5168\uff11\uff13\u7a2e\u985e\uff09\u3002"
+    },
+    "icon": "img/3a910ca7ca8587b7e554b36a27a40cc1f51b423b.jpg",
+    "icon_gray": "img/9db0f96a3dddb3c8ee183c45f69960c5a47f159b.jpg",
+    "name": "NEW_ACHIEVEMENT_1_16"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Virtuoso",
+      "token": "NEW_ACHIEVEMENT_1_17_NAME",
+      "french": "Le perfectionniste",
+      "japanese": "\u81f3\u5883\u306e\u6280\u5de7\u5bb6"
+    },
+    "description": {
+      "english": "Reach max level with all skills.",
+      "token": "NEW_ACHIEVEMENT_1_17_DESC",
+      "french": "Niveau MAX pour toutes les capacit\u00e9s.",
+      "japanese": "\u5168\u3066\u306e\u30b9\u30ad\u30eb\u3092\uff2c\uff56\uff2d\uff21\uff38\u306b\u3057\u305f\u3002"
+    },
+    "icon": "img/32d5ddd5de4899058824d64f02afa128c0743510.jpg",
+    "icon_gray": "img/cb40bc10d81824abbd30f26390fc8310d6efef04.jpg",
+    "name": "NEW_ACHIEVEMENT_1_17"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Dressed to Kill",
+      "token": "NEW_ACHIEVEMENT_1_18_NAME",
+      "french": "Armure ultime",
+      "japanese": "\u81f3\u9ad8\u306e\u93a7"
+    },
+    "description": {
+      "english": "Forge an Ultimate Armor.",
+      "token": "NEW_ACHIEVEMENT_1_18_DESC",
+      "french": "Armure la plus puissante fabriqu\u00e9e.",
+      "japanese": "\u6700\u5f37\u306e\u93a7\u3092\u9020\u3063\u305f\u3002"
+    },
+    "icon": "img/a6a727a892abff09c1781b01f181273bb0958441.jpg",
+    "icon_gray": "img/4485d6863c698aab187b8f8c02c109c70d3a9eaa.jpg",
+    "name": "NEW_ACHIEVEMENT_1_18"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Golden Anvil",
+      "token": "NEW_ACHIEVEMENT_1_19_NAME",
+      "french": "Armes supr\u00eames",
+      "japanese": "\u81f3\u6975\u306e\u6b66\u88c5"
+    },
+    "description": {
+      "english": "Forge Ultimate Weapons for all Monstrums (6 in total).",
+      "token": "NEW_ACHIEVEMENT_1_19_DESC",
+      "french": "Armes max fabriqu\u00e9es pour tout le monde (6 en tout).",
+      "japanese": "\u6700\u5f37\u306e\u6b66\u5668\u3092\u5168\u54e1\u5206\u9020\u3063\u305f\uff08\u5168\uff16\u7a2e\u985e\uff09\u3002"
+    },
+    "icon": "img/a2bc4a41aa3eca85bd68cb80b0b6ac05e2dad07d.jpg",
+    "icon_gray": "img/978f98c364ef71afe62e003fad3fdeebb81130c6.jpg",
+    "name": "NEW_ACHIEVEMENT_1_19"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Apex Predator",
+      "token": "NEW_ACHIEVEMENT_1_20_NAME",
+      "french": "Double Neuf",
+      "japanese": "\u30c0\u30d6\u30eb\u30ca\u30a4\u30f3"
+    },
+    "description": {
+      "english": "Reach level 99 with any character.",
+      "token": "NEW_ACHIEVEMENT_1_20_DESC",
+      "french": "Niveau d\u2019un personnage \u00e0 99.",
+      "japanese": "\u8ab0\u304b\u306e\uff2c\uff56\u3092\uff19\uff19\u306b\u3057\u305f\u3002"
+    },
+    "icon": "img/6e57bdd320985a727b91c8a1d464c567e7b923ea.jpg",
+    "icon_gray": "img/027cf5aea6fb5e7d3b942510c2a2310a9b7e910b.jpg",
+    "name": "NEW_ACHIEVEMENT_1_20"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Culling the Herd",
+      "token": "NEW_ACHIEVEMENT_1_21_NAME",
+      "french": "Le tueur de monstres",
+      "japanese": "\u30e2\u30f3\u30b9\u30bf\u30fc\u30ad\u30e9\u30fc"
+    },
+    "description": {
+      "english": "Defeat 2,000 monsters.",
+      "token": "NEW_ACHIEVEMENT_1_21_DESC",
+      "french": "2000 monstres \u00e9limin\u00e9s.",
+      "japanese": "\u30e2\u30f3\u30b9\u30bf\u30fc\u6483\u7834\u6570\u30fb\uff12\uff10\uff10\uff10\u4f53\u9054\u6210\u3002"
+    },
+    "icon": "img/9ba82eae054bb5cc1f5440f8b8e0da4349254df8.jpg",
+    "icon_gray": "img/ca74c97a880aa782ccb39eb2aac75a0d2cffd005.jpg",
+    "name": "NEW_ACHIEVEMENT_1_21"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Lemures Exterminator",
+      "token": "NEW_ACHIEVEMENT_1_22_NAME",
+      "french": "L\u2019abatteur de Larvas",
+      "japanese": "\u30e9\u30eb\u30f4\u30a1\u30b9\u30ec\u30a4\u30e4\u30fc"
+    },
+    "description": {
+      "english": "Defeat 1,000 Lemures.",
+      "token": "NEW_ACHIEVEMENT_1_22_DESC",
+      "french": "1000 Larvas \u00e9limin\u00e9es.",
+      "japanese": "\u30e9\u30eb\u30f4\u30a1\u6483\u7834\u6570\u30fb\uff11\uff10\uff10\uff10\u4f53\u9054\u6210\u3002"
+    },
+    "icon": "img/185c23167a093d43d3c74ec315c7be377fd706fa.jpg",
+    "icon_gray": "img/75d7fdfc1b07fb701d66a346f17d53d53fca15cd.jpg",
+    "name": "NEW_ACHIEVEMENT_1_22"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Heartbreaker",
+      "token": "NEW_ACHIEVEMENT_1_23_NAME",
+      "french": "Le briseur",
+      "japanese": "\u30b0\u30e9\u30f3\u30d6\u30ec\u30a4\u30ab\u30fc"
+    },
+    "description": {
+      "english": "Inflict Break 1,000 times.",
+      "token": "NEW_ACHIEVEMENT_1_23_DESC",
+      "french": "1000 Ruptures effectu\u00e9es.",
+      "japanese": "\u30d6\u30ec\u30a4\u30af\u767a\u52d5\u56de\u6570\u30fb\uff11\uff10\uff10\uff10\u56de\u9054\u6210\u3002"
+    },
+    "icon": "img/f1342434730f8c2ee0cafbcddfb60cde1f0539ba.jpg",
+    "icon_gray": "img/0d6288fda9267741c6d75ec09458a012a2d00c3f.jpg",
+    "name": "NEW_ACHIEVEMENT_1_23"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Impervious",
+      "token": "NEW_ACHIEVEMENT_1_24_NAME",
+      "french": "Le gardeur rapide",
+      "japanese": "\u30d5\u30e9\u30c3\u30b7\u30e5\u30ac\u30fc\u30c0\u30fc"
+    },
+    "description": {
+      "english": "Use Flash Guard 100 times.",
+      "token": "NEW_ACHIEVEMENT_1_24_DESC",
+      "french": "100 Gardes Flash effectu\u00e9es.",
+      "japanese": "\u30d5\u30e9\u30c3\u30b7\u30e5\u30ac\u30fc\u30c9\u767a\u52d5\u56de\u6570\u30fb\uff11\uff10\uff10\u56de\u9054\u6210\u3002"
+    },
+    "icon": "img/7c1f736f50c8ed306bf70fa419eb13144903c96c.jpg",
+    "icon_gray": "img/3387e598732286cde0b8f2b602df030611cc3f61.jpg",
+    "name": "NEW_ACHIEVEMENT_1_24"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Untouchable",
+      "token": "NEW_ACHIEVEMENT_1_25_NAME",
+      "french": "L\u2019esquiveur prompt",
+      "japanese": "\u30d5\u30e9\u30c3\u30b7\u30e5\u30e0\u30fc\u30d0\u30fc"
+    },
+    "description": {
+      "english": "Use Flash Move 100 times.",
+      "token": "NEW_ACHIEVEMENT_1_25_DESC",
+      "french": "100 Esquives Flash effectu\u00e9es.",
+      "japanese": "\u30d5\u30e9\u30c3\u30b7\u30e5\u30e0\u30fc\u30d6\u767a\u52d5\u56de\u6570\u30fb\uff11\uff10\uff10\u56de\u9054\u6210\u3002"
+    },
+    "icon": "img/e908df1257f766c13673c86d488e5ea5819c34a0.jpg",
+    "icon_gray": "img/3c33206d673f30f33d9d4a5347414af981692ba6.jpg",
+    "name": "NEW_ACHIEVEMENT_1_25"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Overdrive",
+      "token": "NEW_ACHIEVEMENT_1_26_NAME",
+      "french": "Le combattant dop\u00e9",
+      "japanese": "\u30d6\u30fc\u30b9\u30c8\u30d5\u30a1\u30a4\u30bf\u30fc"
+    },
+    "description": {
+      "english": "Use Boost Mode 100 times.",
+      "token": "NEW_ACHIEVEMENT_1_26_DESC",
+      "french": "100 Boosts effectu\u00e9s.",
+      "japanese": "\u30d6\u30fc\u30b9\u30c8\u767a\u52d5\u56de\u6570\u30fb\uff11\uff10\uff10\u56de\u9054\u6210\u3002"
+    },
+    "icon": "img/dd1a19eb6db716457523f003253e74d6945490a4.jpg",
+    "icon_gray": "img/1881b6a59f2a86d98ef7fc99092a0444d3a38fb9.jpg",
+    "name": "NEW_ACHIEVEMENT_1_26"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Showstopper",
+      "token": "NEW_ACHIEVEMENT_1_27_NAME",
+      "french": "Le ma\u00eetre de l\u2019EXTRA",
+      "japanese": "\u30a8\u30af\u30b9\u30c8\u30e9\u30de\u30b9\u30bf\u30fc"
+    },
+    "description": {
+      "english": "Use Extra Skills 100 times.",
+      "token": "NEW_ACHIEVEMENT_1_27_DESC",
+      "french": "100 d\u00e9clenchements de capacit\u00e9 EXTRA effectu\u00e9s.",
+      "japanese": "\uff25\uff38\uff34\uff32\uff21\u30b9\u30ad\u30eb\u767a\u52d5\u56de\u6570\u30fb\uff11\uff10\uff10\u56de\u9054\u6210\u3002"
+    },
+    "icon": "img/97c4accc5d58487fb5deee3b2913aec70e98dfc8.jpg",
+    "icon_gray": "img/5f6966ecfcbb47a57cc9c7e24ca1b5c3b658d2c8.jpg",
+    "name": "NEW_ACHIEVEMENT_1_27"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Zenith of the Grimwald",
+      "token": "NEW_ACHIEVEMENT_1_28_NAME",
+      "french": "Nuit resplendissante",
+      "japanese": "\u83ef\u9e97\u306a\u308b\u591c"
+    },
+    "description": {
+      "english": "Achieve an S in a Grimwald Nox.",
+      "token": "NEW_ACHIEVEMENT_1_28_DESC",
+      "french": "Rang S obtenu dans une Nuit de Grimwald.",
+      "japanese": "\u3044\u305a\u308c\u304b\u306e\u300a\u30b0\u30ea\u30e0\u30ef\u30eb\u30c9\u306e\u591c\u300b\u3067\uff33\u30e9\u30f3\u30af\u3092\u53d6\u3063\u305f\u3002"
+    },
+    "icon": "img/391bbff32c1489bff5422084f56121c6b8692640.jpg",
+    "icon_gray": "img/7a3e82d5541fe819383dd4d67923bc29f97d84c3.jpg",
+    "name": "NEW_ACHIEVEMENT_1_28"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Conqueror of the Nox",
+      "token": "NEW_ACHIEVEMENT_1_29_NAME",
+      "french": "Le Souverain du Grimwald",
+      "japanese": "\u30b0\u30ea\u30e0\u30ef\u30eb\u30c9\u306e\u8987\u8005"
+    },
+    "description": {
+      "english": "Clear all Grimwald Nox.",
+      "token": "NEW_ACHIEVEMENT_1_29_DESC",
+      "french": "Toutes les Nuits de Grimwald termin\u00e9es.",
+      "japanese": "\u5168\u3066\u306e\u300a\u30b0\u30ea\u30e0\u30ef\u30eb\u30c9\u306e\u591c\u300b\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/73a6651512b71e4b5a3895476e1e85a6bfabafb4.jpg",
+    "icon_gray": "img/05801c913653b0b8c1e077195b4968e1c83f857d.jpg",
+    "name": "NEW_ACHIEVEMENT_1_29"
+  },
+  {
+    "hidden": 0,
+    "displayName": {
+      "english": "Vanquisher of the Nox",
+      "token": "NEW_ACHIEVEMENT_1_30_NAME",
+      "french": "Nuits vermeilles",
+      "japanese": "\u7d62\u721b\u306a\u308b\u591c\u7687"
+    },
+    "description": {
+      "english": "Achieve an S on all Grimwald Nox.",
+      "token": "NEW_ACHIEVEMENT_1_30_DESC",
+      "french": "Rang S obtenu dans toutes les Nuits de Grimwald.",
+      "japanese": "\u5168\u3066\u306e\u300a\u30b0\u30ea\u30e0\u30ef\u30eb\u30c9\u306e\u591c\u300b\u3067\uff33\u30e9\u30f3\u30af\u3092\u53d6\u3063\u305f\u3002"
+    },
+    "icon": "img/fa665930521b3491ed7a2c5fea470959c376910c.jpg",
+    "icon_gray": "img/64262811d5f56866d2ad821943c8ecafdcdb25f8.jpg",
+    "name": "NEW_ACHIEVEMENT_1_30"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Crimson King, the Radiant",
+      "token": "NEW_ACHIEVEMENT_1_31_NAME",
+      "french": "Le roi ardent",
+      "japanese": "\u71c3\u3048\u4e0a\u304c\u308b\u738b"
+    },
+    "description": {
+      "english": "Explore Balduq with the Crimson King as leader.",
+      "token": "NEW_ACHIEVEMENT_1_31_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec le Roi Rouge.",
+      "japanese": "\u300a\u8d64\u306e\u738b\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/cda79a8fce2371486104b9c66e420a0cdd6e7e8a.jpg",
+    "icon_gray": "img/7f054f576f6c5454aa5f973784dc45b925891f2c.jpg",
+    "name": "NEW_ACHIEVEMENT_1_31"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "White Cat, the Nimble",
+      "token": "NEW_ACHIEVEMENT_2_0_NAME",
+      "french": "Le chat agile",
+      "japanese": "\u8efd\u5feb\u306a\u308b\u767d\u732b"
+    },
+    "description": {
+      "english": "Explore Balduq with the White Cat as leader.",
+      "token": "NEW_ACHIEVEMENT_2_0_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec Alba Felis.",
+      "japanese": "\u300a\u767d\u732b\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/a71ec0f4902d4cacd0172f70ef8ce334f24248f0.jpg",
+    "icon_gray": "img/cfb5a9c6aee7d395928992f11417bee8a0e98267.jpg",
+    "name": "NEW_ACHIEVEMENT_2_0"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Hawk, the Peerless",
+      "token": "NEW_ACHIEVEMENT_2_1_NAME",
+      "french": "Le faucon fou",
+      "japanese": "\u72c2\u731b\u306a\u308b\u9df9"
+    },
+    "description": {
+      "english": "Explore Balduq with the Hawk as leader.",
+      "token": "NEW_ACHIEVEMENT_2_1_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec Falco.",
+      "japanese": "\u300a\u9df9\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/e689234862967a3e1cc55f293a478b4007ad31d6.jpg",
+    "icon_gray": "img/f4d4064da4a5ad8fc30d4de39dab1e7ec16db597.jpg",
+    "name": "NEW_ACHIEVEMENT_2_1"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Doll, the Resplendent",
+      "token": "NEW_ACHIEVEMENT_2_2_NAME",
+      "french": "La poup\u00e9e sublime",
+      "japanese": "\u512a\u7f8e\u306a\u308b\u4eba\u5f62"
+    },
+    "description": {
+      "english": "Explore Balduq with the Doll as leader.",
+      "token": "NEW_ACHIEVEMENT_2_2_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec Pupa.",
+      "japanese": "\u300a\u4eba\u5f62\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/f601bd4f254758f0de67696b9b8536f4148398af.jpg",
+    "icon_gray": "img/53f19b2f4d0023236d82551500450830e42197a4.jpg",
+    "name": "NEW_ACHIEVEMENT_2_2"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Raging Bull, the Unyielding",
+      "token": "NEW_ACHIEVEMENT_2_3_NAME",
+      "french": "Le taureau robuste",
+      "japanese": "\u52c7\u307e\u3057\u304d\u731b\u725b"
+    },
+    "description": {
+      "english": "Explore Balduq with the Raging Bull as leader.",
+      "token": "NEW_ACHIEVEMENT_2_3_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec Furens Taurus.",
+      "japanese": "\u300a\u731b\u725b\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/b4c45dff9c48aeb93c35ce7c0299c2248ca91283.jpg",
+    "icon_gray": "img/761df968e510f9cbfd8a11a36ff1464fdbd4d920.jpg",
+    "name": "NEW_ACHIEVEMENT_2_3"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Renegade, the Cunning",
+      "token": "NEW_ACHIEVEMENT_2_4_NAME",
+      "french": "L\u2019apostat perspicace",
+      "japanese": "\u601c\u60a7\u306a\u308b\u80cc\u6559\u8005"
+    },
+    "description": {
+      "english": "Explore Balduq with the Renegade as leader.",
+      "token": "NEW_ACHIEVEMENT_2_4_DESC",
+      "french": "Avanc\u00e9e significative dans le jeu avec Renegatus.",
+      "japanese": "\u300a\u80cc\u6559\u8005\u300b\u3067\u3068\u3053\u3068\u3093\u5192\u967a\u3057\u305f\u3002"
+    },
+    "icon": "img/5a102b5401d6f039665b6756aa0f2d84d8ca2a53.jpg",
+    "icon_gray": "img/9c94945635abd48e051b8d0345c81a5156b794b3.jpg",
+    "name": "NEW_ACHIEVEMENT_2_4"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Greased Lightning",
+      "token": "NEW_ACHIEVEMENT_2_5_NAME",
+      "french": "Le guerrier foudroyant",
+      "japanese": "\u30e9\u30a4\u30c8\u30cb\u30f3\u30b0\u30a6\u30a9\u30ea\u30a2\u30fc"
+    },
+    "description": {
+      "english": "In Time Attack, defeat the boss in 30 seconds or less.",
+      "token": "NEW_ACHIEVEMENT_2_5_DESC",
+      "french": "Boss \u00e9limin\u00e9 en moins de 30 sec en Contre-la-montre.",
+      "japanese": "\u30bf\u30a4\u30e0\u30a2\u30bf\u30c3\u30af\u3067\uff13\uff10\u79d2\u4ee5\u5185\u306b\u30dc\u30b9\u3092\u5012\u3057\u305f\u3002"
+    },
+    "icon": "img/aad5e0e26a86ecb6ff73f266e8d52a636ce56bbf.jpg",
+    "icon_gray": "img/2f6d6d95630ebb5577d16d43ed9ca67a7627e0cb.jpg",
+    "name": "NEW_ACHIEVEMENT_2_5"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Fleeting Mirage",
+      "token": "NEW_ACHIEVEMENT_2_6_NAME",
+      "french": "Le soldat du mirage",
+      "japanese": "\u30df\u30e9\u30fc\u30b8\u30e5\u30bd\u30eb\u30b8\u30e3\u30fc"
+    },
+    "description": {
+      "english": "In Time Attack, defeat the boss without taking damage.",
+      "token": "NEW_ACHIEVEMENT_2_6_DESC",
+      "french": "Boss \u00e9limin\u00e9 sans avoir subi de d\u00e9g\u00e2ts en Contre-la-montre.",
+      "japanese": "\u30bf\u30a4\u30e0\u30a2\u30bf\u30c3\u30af\u3067\u7121\u50b7\u306e\u307e\u307e\u30dc\u30b9\u3092\u5012\u3057\u305f\u3002"
+    },
+    "icon": "img/df67dd5bb5fddccffcaa7efdd0e8f558552313e0.jpg",
+    "icon_gray": "img/790281d6899ab05519c49d5135d7fa11b6d24e5f.jpg",
+    "name": "NEW_ACHIEVEMENT_2_6"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Paragon",
+      "token": "NEW_ACHIEVEMENT_2_7_NAME",
+      "french": "Le plus puissant des guerriers",
+      "japanese": "\u6700\u5f37\u306e\u95d8\u58eb"
+    },
+    "description": {
+      "english": "Complete Boss Rush.",
+      "token": "NEW_ACHIEVEMENT_2_7_DESC",
+      "french": "Mode Boss Rush termin\u00e9.",
+      "japanese": "\u30dc\u30b9\u30e9\u30c3\u30b7\u30e5\u3092\u5236\u8987\u3057\u305f\u3002"
+    },
+    "icon": "img/245d19240418b5594f47c68bf831f857b3ea890c.jpg",
+    "icon_gray": "img/57246495107b6845c16e3ee98101d5e1177a8cfe.jpg",
+    "name": "NEW_ACHIEVEMENT_2_7"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Indomitable Champion",
+      "token": "NEW_ACHIEVEMENT_2_8_NAME",
+      "french": "Le roi invaincu",
+      "japanese": "\u7121\u6557\u306e\u738b\u8005"
+    },
+    "description": {
+      "english": "Complete Boss Rush without retrying.",
+      "token": "NEW_ACHIEVEMENT_2_8_DESC",
+      "french": "Mode Boss Rush termin\u00e9 d\u2019une traite.",
+      "japanese": "\u30ea\u30c8\u30e9\u30a4\u305b\u305a\u306b\u30dc\u30b9\u30e9\u30c3\u30b7\u30e5\u3092\u5236\u8987\u3057\u305f\u3002"
+    },
+    "icon": "img/16bbf845bd3e44a764d949a7fbfe3ffa8e8f2f39.jpg",
+    "icon_gray": "img/0779866211248680b421e4d1c662563485e2ef33.jpg",
+    "name": "NEW_ACHIEVEMENT_2_8"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Nightmare Survivor",
+      "token": "NEW_ACHIEVEMENT_2_9_NAME",
+      "french": "Surpassant le cauchemar",
+      "japanese": "\u60aa\u5922\u3092\u8d85\u3048\u3057\u8005"
+    },
+    "description": {
+      "english": "Clear the game on Nightmare difficulty or above.",
+      "token": "NEW_ACHIEVEMENT_2_9_DESC",
+      "french": "Jeu termin\u00e9 en mode Cauchemar ou plus.",
+      "japanese": "\u96e3\u6613\u5ea6\u30ca\u30a4\u30c8\u30e1\u30a2\u4ee5\u4e0a\u3067\u30b2\u30fc\u30e0\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/4babdb090909c8aa9a2dc0b3219598827ce5fcff.jpg",
+    "icon_gray": "img/16550f810ccf09569cfcf6d3d09fedbcab30bd12.jpg",
+    "name": "NEW_ACHIEVEMENT_2_9"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Banisher of Dawn",
+      "token": "NEW_ACHIEVEMENT_2_10_NAME",
+      "french": "Le dompteur",
+      "japanese": "\u6681\u306e\u8abf\u4f0f\u8005"
+    },
+    "description": {
+      "english": "Defeat the ultimate Lemures, Vakh Medios (excludes Time Attack).",
+      "token": "NEW_ACHIEVEMENT_2_10_DESC",
+      "french": "Larva Vaf Medios \u00e9limin\u00e9e (except\u00e9 en Contre-la-montre).",
+      "japanese": "\u6700\u5f37\u306e\u30e9\u30eb\u30f4\u30a1\u300a\u30f4\u30a1\u30d5\u30fb\u30e1\u30c7\u30a3\u30aa\u30b9\u300b\u3092\u5012\u3057\u305f\u3002\uff08\u30bf\u30a4\u30e0\u30a2\u30bf\u30c3\u30af\u4ee5\u5916\uff09"
+    },
+    "icon": "img/f83635c52ad4633e648ead1ea9d04924911232c5.jpg",
+    "icon_gray": "img/f21693e125dc7f71884492cc5e772860dc974b97.jpg",
+    "name": "NEW_ACHIEVEMENT_2_10"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "To Freedom",
+      "token": "NEW_ACHIEVEMENT_2_11_NAME",
+      "french": "D\u00e9but de l\u2019\u00e9vasion",
+      "japanese": "\u8131\u7344\u958b\u59cb"
+    },
+    "description": {
+      "english": "Begin your escape from the prison.",
+      "token": "NEW_ACHIEVEMENT_2_11_DESC",
+      "french": "\u00c9vasion lanc\u00e9e.",
+      "japanese": "\u8131\u7344\u3092\u958b\u59cb\u3057\u305f\u3002"
+    },
+    "icon": "img/612f687dd28f8e5bfe9b52cc911d62407364441b.jpg",
+    "icon_gray": "img/e9dc94b406feefd561582f3537f4dd89366f078a.jpg",
+    "name": "NEW_ACHIEVEMENT_2_11"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Adol, the Fugitive",
+      "token": "NEW_ACHIEVEMENT_2_12_NAME",
+      "french": "L\u2019\u00e9vasion d\u2019Adol",
+      "japanese": "\u8d64\u6bdb\u306e\u8131\u7344\u8005"
+    },
+    "description": {
+      "english": "Clear the prologue.",
+      "token": "NEW_ACHIEVEMENT_2_12_DESC",
+      "french": "Prologue termin\u00e9.",
+      "japanese": "\u30d7\u30ed\u30ed\u30fc\u30b0\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/f39a0cea1194c5a94e11891d52d90ad64d3c32e6.jpg",
+    "icon_gray": "img/09de51e27e4de5783f0e1f5d83b376d36ad4ce87.jpg",
+    "name": "NEW_ACHIEVEMENT_2_12"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Monstrum Nox",
+      "token": "NEW_ACHIEVEMENT_2_13_NAME",
+      "french": "Les Monstrums de Balduq",
+      "japanese": "\u30d0\u30eb\u30c9\u30a5\u30fc\u30af\u306e\u602a\u4eba\u305f\u3061"
+    },
+    "description": {
+      "english": "Clear Chapter 1.",
+      "token": "NEW_ACHIEVEMENT_2_13_DESC",
+      "french": "Chapitre I termin\u00e9.",
+      "japanese": "\u7b2c\u2160\u90e8 \u300c\u30d0\u30eb\u30c9\u30a5\u30fc\u30af\u306e\u602a\u4eba\u305f\u3061\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/e7ed2e627f3aaa5c6028b24b7be5ad5f91d46fc4.jpg",
+    "icon_gray": "img/6f3961725f21958cbe35b88a3d2c99d31d176b80.jpg",
+    "name": "NEW_ACHIEVEMENT_2_13"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "The White Cat's Melancholy",
+      "token": "NEW_ACHIEVEMENT_2_14_NAME",
+      "french": "La m\u00e9lancolie du chat blanc",
+      "japanese": "\u767d\u732b\u306e\u6182\u9b31"
+    },
+    "description": {
+      "english": "Clear Chapter 2.",
+      "token": "NEW_ACHIEVEMENT_2_14_DESC",
+      "french": "Chapitre II termin\u00e9.",
+      "japanese": "\u7b2c\u2161\u90e8 \u300c\u767d\u732b\u306e\u6182\u9b31\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/cb45b3c36c95d45f8ca24bb18756b25739112203.jpg",
+    "icon_gray": "img/52f042f8871b68f5c5e7aeec55831eb697c70686.jpg",
+    "name": "NEW_ACHIEVEMENT_2_14"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "The Feral Hawk's Fury",
+      "token": "NEW_ACHIEVEMENT_2_15_NAME",
+      "french": "La folie du faucon azur",
+      "japanese": "\u84bc\u304d\u9df9\u306e\u72c2\u6c17"
+    },
+    "description": {
+      "english": "Clear Chapter 3.",
+      "token": "NEW_ACHIEVEMENT_2_15_DESC",
+      "french": "Chapitre III termin\u00e9.",
+      "japanese": "\u7b2c\u2162\u90e8 \u300c\u84bc\u304d\u9df9\u306e\u72c2\u6c17\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/c4ee4b8f3c3d16fe0b4a59558f1c4f5b2f7b1299.jpg",
+    "icon_gray": "img/866e8d5d3b97a729b87560fb2d32363cc835486e.jpg",
+    "name": "NEW_ACHIEVEMENT_2_15"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "The Doll's Search",
+      "token": "NEW_ACHIEVEMENT_2_16_NAME",
+      "french": "Qu\u00eate d'une poup\u00e9e",
+      "japanese": "\u4eba\u5f62\u306e\u63a2\u3057\u7269"
+    },
+    "description": {
+      "english": "Clear Chapter 4.",
+      "token": "NEW_ACHIEVEMENT_2_16_DESC",
+      "french": "Chapitre IV termin\u00e9.",
+      "japanese": "\u7b2c\u2163\u90e8 \u300c\u4eba\u5f62\u306e\u63a2\u3057\u7269\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/5c93b4cf77180d0cda42c99d18f2734bbda8be7e.jpg",
+    "icon_gray": "img/043bb5e4988121febd87ae2ec7ad65f67dc5ec68.jpg",
+    "name": "NEW_ACHIEVEMENT_2_16"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "The Raging Bull's Treasure",
+      "token": "NEW_ACHIEVEMENT_2_17_NAME",
+      "french": "Le tr\u00e9sor du taureau enrag\u00e9",
+      "japanese": "\u731b\u725b\u306e\u5b9d\u7269"
+    },
+    "description": {
+      "english": "Clear Chapter 5.",
+      "token": "NEW_ACHIEVEMENT_2_17_DESC",
+      "french": "Chapitre V termin\u00e9.",
+      "japanese": "\u7b2c\u2164\u90e8 \u300c\u731b\u725b\u306e\u5b9d\u7269\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/67211732ede5bbaabe8342dc4a3b17524bb12643.jpg",
+    "icon_gray": "img/bbebde5c8e10ba4bc02a9f015a85ef215b564dbd.jpg",
+    "name": "NEW_ACHIEVEMENT_2_17"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "The Renegade's Secret",
+      "token": "NEW_ACHIEVEMENT_2_18_NAME",
+      "french": "Le secret du ren\u00e9gat",
+      "japanese": "\u80cc\u6559\u8005\u306e\u79d8\u5bc6"
+    },
+    "description": {
+      "english": "Clear Chapter 6.",
+      "token": "NEW_ACHIEVEMENT_2_18_DESC",
+      "french": "Chapitre VI termin\u00e9.",
+      "japanese": "\u7b2c\u2165\u90e8 \u300c\u80cc\u6559\u8005\u306e\u79d8\u5bc6\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/eba08c91d3259de443ea204e6b544168b80f3547.jpg",
+    "icon_gray": "img/6a3ce2a06ee07323184a43a7902037f9ba4c4bfc.jpg",
+    "name": "NEW_ACHIEVEMENT_2_18"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Capriccio of the Prison",
+      "token": "NEW_ACHIEVEMENT_2_19_NAME",
+      "french": "Cacophonie carc\u00e9rale",
+      "japanese": "\u76e3\u7344\u72c2\u9a12\u66f2"
+    },
+    "description": {
+      "english": "Clear Chapter 7.",
+      "token": "NEW_ACHIEVEMENT_2_19_DESC",
+      "french": "Chapitre VII termin\u00e9.",
+      "japanese": "\u7b2c\u2166\u90e8 \u300c\u76e3\u7344\u72c2\u9a12\u66f2\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/a108d80a1a23e4f7e63f05d4a26647b5aa84906a.jpg",
+    "icon_gray": "img/5ad8ad5227d524c3e0905b426874f07041c7553f.jpg",
+    "name": "NEW_ACHIEVEMENT_2_19"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Thus Spoke the Alchemist",
+      "token": "NEW_ACHIEVEMENT_2_20_NAME",
+      "french": "Paroles d'un alchimiste",
+      "japanese": "\u932c\u91d1\u8853\u5e2b\u306f\u304b\u304f\u8a9e\u308a\u304d"
+    },
+    "description": {
+      "english": "Clear Chapter 8.",
+      "token": "NEW_ACHIEVEMENT_2_20_DESC",
+      "french": "Chapitre VIII termin\u00e9.",
+      "japanese": "\u7b2c\u2167\u90e8 \u300c\u932c\u91d1\u8853\u5e2b\u306f\u304b\u304f\u8a9e\u308a\u304d\u300d\u3092\u30af\u30ea\u30a2\u3057\u305f\u3002"
+    },
+    "icon": "img/b1b0387acae7178e407fa7523762c56f22f51ae7.jpg",
+    "icon_gray": "img/2e7cce23501590fc9aa9de57dcfbd23cc50b0636.jpg",
+    "name": "NEW_ACHIEVEMENT_2_20"
+  },
+  {
+    "hidden": 1,
+    "displayName": {
+      "english": "Monstrum Nox",
+      "token": "NEW_ACHIEVEMENT_2_21_NAME",
+      "french": "La nuit des Monstrums",
+      "japanese": "\u602a\u4eba\u305f\u3061\u306e\u591c"
+    },
+    "description": {
+      "english": "Clear the Final Chapter.",
+      "token": "NEW_ACHIEVEMENT_2_21_DESC",
+      "french": "Dernier chapitre termin\u00e9.",
+      "japanese": "\u6700\u7d42\u5e55 \u300c\u602a\u4eba\u305f\u3061\u306e\u591c\u300d\u3092\u30af\u30ea\u30a2\u3057\u3001\u30a8\u30f3\u30c7\u30a3\u30f3\u30b0\u3092\u8fce\u3048\u305f\u3002"
+    },
+    "icon": "img/d657ca4aad24aa15f6ed73c359d865be85a2af50.jpg",
+    "icon_gray": "img/a8bdad6298d5259db5b037fa80ad0e068c5b5164.jpg",
+    "name": "NEW_ACHIEVEMENT_2_21"
+  }
+]

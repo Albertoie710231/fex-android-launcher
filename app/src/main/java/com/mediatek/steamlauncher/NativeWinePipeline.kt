@@ -241,6 +241,34 @@ class NativeWinePipeline(private val context: Context) {
                     f.writeBytes(ByteArray(64))
                 }
             }
+            // The binary-patched libevshim.so hardcodes $dataDir/gp.mem and
+            // $dataDir/gp[1-3].mem (strings -e  libevshim.so shows
+            // /data/data/com.mediatek.steamlauncher/files/gp%d.mem). These
+            // are a separate set from the gamepad*.mem above and sit at the
+            // dataDir root, not under imagefs_bionic/tmp.
+            for (name in listOf("gp.mem", "gp1.mem", "gp2.mem", "gp3.mem")) {
+                val f = File("$dataDir/$name")
+                if (!f.exists() || f.length() != 64L) {
+                    f.writeBytes(ByteArray(64))
+                }
+            }
+            // Mirror GN's libvulkan_wrapper.so (md5 f1644f8f...) from jniLibs
+            // into imagefs_bionic/usr/lib. The bundled imagefs_bionic tree
+            // may ship an older build (md5 994a0a6e...) that fails to render
+            // Vulkan surfaces past DRI3 PIXMAP_FROM_BUFFERS — this override
+            // is required per the 2026-04-23 rendering breakthrough. Safe
+            // no-op when imagefs_bionic hasn't been extracted yet.
+            run {
+                val src = File("$nativeLibDir/libvulkan_wrapper.so")
+                val destDir = File("$dataDir/imagefs_bionic/usr/lib")
+                if (src.exists() && destDir.exists()) {
+                    val dest = File(destDir, "libvulkan_wrapper.so")
+                    if (!dest.exists() || dest.length() != src.length()) {
+                        src.copyTo(dest, overwrite = true)
+                        Log.i(TAG, "Mirrored libvulkan_wrapper.so (${src.length()} bytes) into imagefs_bionic/usr/lib")
+                    }
+                }
+            }
             // Pre-create the drive_c skeleton. Wine's wineboot expects
             // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
             // exist the dosdevices/c: symlink (../drive_c) dangles and
@@ -343,6 +371,9 @@ class NativeWinePipeline(private val context: Context) {
             ensureNullAlsaConfig()
             ensurePatchedWineBinaries()
             ensurePulseAudioDaemon()
+            ensureLibevshimPatched()
+            ensureDxvkAndLibarm64ec()
+            ensureColdClient()
 
             true
         } catch (t: Throwable) {
@@ -492,6 +523,137 @@ class NativeWinePipeline(private val context: Context) {
             return true
         } catch (t: Throwable) {
             Log.e(TAG, "ensurePatchedWineBinaries failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Deploy GN's current `libvulkan_wrapper.so`-compatible `libevshim.so`
+     * (binary-patched to look for `$dataDir/gp.mem` et al instead of
+     * GameNative's baked `/data/data/com.winlator.cmod/...` paths). Overlays
+     * imagefs_bionic/usr/lib/libevshim.so from the bundled asset. Compares
+     * size as a cheap content check — if the on-device copy matches the
+     * asset size we skip.
+     */
+    private fun ensureLibevshimPatched(): Boolean {
+        try {
+            val destDir = File("$dataDir/imagefs_bionic/usr/lib")
+            if (!destDir.exists()) return true  // imagefs_bionic not extracted yet
+            val dest = File(destDir, "libevshim.so")
+            val bytes = context.assets.open("productize/libevshim.so").use { it.readBytes() }
+            if (dest.exists() && dest.length() == bytes.size.toLong()) return true
+            dest.writeBytes(bytes)
+            Log.i(TAG, "Deployed patched libevshim.so (${bytes.size} bytes)")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureLibevshimPatched failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Deploy the working `libarm64ecfex.dll` + DXVK/VKD3D DLL set into
+     * prefix system32 (and libarm64ecfex also into lib/wine/aarch64-windows
+     * so wineboot doesn't revert it). The DXVK DLLs here are ARM64 PE builds
+     * from K0diak12's hybrid Proton tree — DIFFERENT from wine's builtin
+     * wined3d at `lib/wine/aarch64-windows/`, which is why they must be
+     * bundled separately.
+     *
+     * Runs unconditionally per file (size-compared); deploy is idempotent.
+     * Prefix directory must already exist (wineboot must have run at least
+     * once).
+     */
+    private fun ensureDxvkAndLibarm64ec(): Boolean {
+        try {
+            val sys32 = File("$dataDir/proton10/prefix/.wine/drive_c/windows/system32")
+            if (!sys32.exists()) return true  // prefix not created yet
+            val wineLibDir = File("$dataDir/proton10/lib/wine/aarch64-windows")
+
+            // libarm64ecfex.dll — deploy to both so wineboot revert is safe
+            context.assets.open("productize/libarm64ecfex.dll").use { input ->
+                val bytes = input.readBytes()
+                val sys32Dst = File(sys32, "libarm64ecfex.dll")
+                if (!sys32Dst.exists() || sys32Dst.length() != bytes.size.toLong()) {
+                    sys32Dst.writeBytes(bytes)
+                }
+                if (wineLibDir.exists()) {
+                    val libDst = File(wineLibDir, "libarm64ecfex.dll")
+                    if (!libDst.exists() || libDst.length() != bytes.size.toLong()) {
+                        libDst.writeBytes(bytes)
+                    }
+                }
+            }
+
+            val dxvkDlls = listOf(
+                "d3d8.dll", "d3d9.dll",
+                "d3d10.dll", "d3d10_1.dll", "d3d10core.dll",
+                "d3d11.dll", "dxgi.dll",
+                "d3d12.dll", "d3d12core.dll",
+            )
+            for (name in dxvkDlls) {
+                context.assets.open("productize/dxvk/$name").use { input ->
+                    val bytes = input.readBytes()
+                    val dst = File(sys32, name)
+                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
+                        dst.writeBytes(bytes)
+                    }
+                }
+            }
+            Log.i(TAG, "Deployed libarm64ecfex.dll + ${dxvkDlls.size} DXVK/VKD3D DLLs")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureDxvkAndLibarm64ec failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Deploy ColdClient Steam emulator into
+     * prefix/.wine/drive_c/Program Files (x86)/Steam/. Five DLLs/EXEs plus
+     * the steam_settings/ configs. Wine resolves Steam IPC against these
+     * stubs instead of a real Steam runtime (which isn't feasible under
+     * our sandbox).
+     */
+    private fun ensureColdClient(): Boolean {
+        try {
+            val prefix = File("$dataDir/proton10/prefix/.wine")
+            if (!prefix.exists()) return true  // prefix not created yet
+            val steamDir = File(prefix, "drive_c/Program Files (x86)/Steam")
+            val settingsDir = File(steamDir, "steam_settings")
+            settingsDir.mkdirs()
+
+            val coldClientFiles = listOf(
+                "ColdClientLoader.ini",
+                "steamclient.dll",
+                "steamclient64.dll",
+                "steamclient_loader_x64.exe",
+                "GameOverlayRenderer64.dll",
+            )
+            for (name in coldClientFiles) {
+                val dst = File(steamDir, name)
+                context.assets.open("productize/ColdClient/$name").use { input ->
+                    val bytes = input.readBytes()
+                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
+                        dst.writeBytes(bytes)
+                    }
+                }
+            }
+
+            val settingsFiles = context.assets.list("productize/ColdClient/steam_settings")
+                ?: emptyArray()
+            for (name in settingsFiles) {
+                val dst = File(settingsDir, name)
+                context.assets.open("productize/ColdClient/steam_settings/$name").use { input ->
+                    val bytes = input.readBytes()
+                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
+                        dst.writeBytes(bytes)
+                    }
+                }
+            }
+            Log.i(TAG, "Deployed ColdClient (${coldClientFiles.size} files + ${settingsFiles.size} settings)")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureColdClient failed", t)
             return false
         }
     }

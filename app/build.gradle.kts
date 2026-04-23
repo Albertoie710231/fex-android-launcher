@@ -74,6 +74,11 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // AGP's stripDebugDebugSymbols reduces GN's libvulkan_wrapper.so
+            // from 19 MB to 2.5 MB — it treats most of the binary as debug
+            // sections and strips real code. Keep it unstripped so the
+            // jniLib matches the f1644f8f build we actually want to ship.
+            keepDebugSymbols += "**/libvulkan_wrapper.so"
         }
     }
 }
