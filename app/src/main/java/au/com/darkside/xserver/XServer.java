@@ -109,6 +109,13 @@ public class XServer {
         _extensions.put("RANDR", new Extension(Extensions.Randr, au.com.darkside.xserver.Xext.XRandr.EventBase, au.com.darkside.xserver.Xext.XRandr.ErrorBase));
         _extensions.put("XINERAMA", new Extension(Extensions.Xinerama, (byte) 0, (byte) 0));
         //_extensions.put("XKEYBOARD", new Extension(Extensions.XKB, au.com.darkside.xserver.Xext.XKB.EventBase, au.com.darkside.xserver.Xext.XKB.ErrorBase));
+        // DRI3 + Present stubs: wine checks for these extensions when creating
+        // a VK_KHR_xlib_surface. With the stubs present, XQueryExtension
+        // returns TRUE and wine proceeds to the Vulkan surface creation path.
+        // The actual DRI3 functionality (DMA-BUF fd import) is not implemented
+        // — we just advertise + reply to QueryVersion. See DRI3Stub.java.
+        _extensions.put("DRI3", new Extension(Extensions.DRI3, (byte) 0, (byte) 0));
+        _extensions.put("Present", new Extension(Extensions.Present, (byte) 0, (byte) 0));
 
         _formats.add(new Format((byte) 1, (byte) 1, (byte) 32));
         _formats.add(new Format((byte) 8, (byte) 8, (byte) 32));

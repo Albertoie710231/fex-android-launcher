@@ -23,6 +23,11 @@ public class Extensions {
     public static final byte Randr = -122;
     public static final byte Xinerama = -121;
     public static final byte XKB = -120;
+    // DRI3 + Present opcodes match Winlator's XConnector values so wine's
+    // libxcb-dri3 / libxcb-present see the same major opcode the
+    // extension it interacts with elsewhere uses.
+    public static final byte DRI3 = -102;
+    public static final byte Present = -103;
 
     static public void Initialize(){
         XSync.Initialize();
@@ -94,6 +99,12 @@ public class Extensions {
                 break;
             case XKB:
                 au.com.darkside.xserver.Xext.XKB.processRequest(xServer, client, opcode, arg, bytesRemaining);
+                break;
+            case DRI3:
+                DRI3Stub.processRequest(xServer, client, opcode, arg, bytesRemaining);
+                break;
+            case Present:
+                PresentStub.processRequest(xServer, client, opcode, arg, bytesRemaining);
                 break;
             default:
                 io.readSkip(bytesRemaining);    // Not implemented.
