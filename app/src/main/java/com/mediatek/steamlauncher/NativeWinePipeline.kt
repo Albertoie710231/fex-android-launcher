@@ -941,12 +941,10 @@ class NativeWinePipeline(private val context: Context) {
             put("WRAPPER_USE_BCN_CACHE", "0")
             put("WRAPPER_MAX_IMAGE_COUNT", "0")
             put("WRAPPER_RESOURCE_TYPE", "auto")
-            // PRESENT_WAIT disabled: with it enabled, DXVK asks our headless
-            // layer to block until present N completes via VK_KHR_present_wait,
-            // which we don't implement. The game's PH3_DrawThreadR was seen
-            // spinning forever after the first present while main + dxvk-submit
-            // were idle — classic present-wait-never-returns signature.
-            put("WRAPPER_DISABLE_PRESENT_WAIT", "1")
+            // GN sets this to "0" (PRESENT_WAIT enabled) in its live env.
+            // Earlier we set it to "1" assuming our headless layer couldn't
+            // handle it — but we're on XConnector's real Vulkan WSI path now.
+            put("WRAPPER_DISABLE_PRESENT_WAIT", "0")
             put("WRAPPER_EXTENSION_BLACKLIST",
                 "VK_KHR_present_wait,VK_KHR_present_id")
             put("ENABLE_BCN_COMPUTE", "1")
