@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -109,6 +110,39 @@ class TerminalActivity : AppCompatActivity() {
                 Log.i(TAG, "Vulkan display surface destroyed")
             }
         })
+
+        // Route touches on the Vulkan surface into Darkside's X11 input
+        // when we're displaying the wine desktop. The game sees no Android
+        // events otherwise — our ScreenView is headless, so Darkside
+        // doesn't receive tap/motion events via the normal Android path.
+        vulkanSurface.isFocusable = true
+        vulkanSurface.isClickable = true
+        vulkanSurface.setOnTouchListener { v, event ->
+            Log.i(TAG, "vulkanSurface onTouch: action=${event.actionMasked} x=${event.x} y=${event.y} displayMode=$isDisplayMode darksideUp=${darksideX11?.isRunning()}")
+            if (!isDisplayMode) return@setOnTouchListener false
+            val srv = darksideX11 ?: return@setOnTouchListener false
+            val sv = srv.screenView() ?: return@setOnTouchListener false
+            val w = v.width
+            val h = v.height
+            if (w <= 0 || h <= 0) return@setOnTouchListener false
+            // Map view px -> X11 root coords (letterbox-free scale).
+            val x = (event.x * srv.rootWidth() / w).toInt().coerceIn(0, srv.rootWidth() - 1)
+            val y = (event.y * srv.rootHeight() / h).toInt().coerceIn(0, srv.rootHeight() - 1)
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    Log.i(TAG, "X11 pointer DOWN at ($x,$y)")
+                    sv.updatePointerPosition(x, y, 0)
+                    sv.updatePointerButtons(1, true)
+                }
+                MotionEvent.ACTION_MOVE -> sv.updatePointerPosition(x, y, 0)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    Log.i(TAG, "X11 pointer UP at ($x,$y)")
+                    sv.updatePointerPosition(x, y, 0)
+                    sv.updatePointerButtons(1, false)
+                }
+            }
+            true
+        }
 
         setupUI()
         showWelcome()
@@ -505,7 +539,12 @@ class TerminalActivity : AppCompatActivity() {
                             // (wine-internal IPC, X11, or a wine-patch diff
                             // between our proton-10 and GN's proton-9).
                             // Stub kept as stable baseline.
-                            "xaudio2_7=n;xapofx1_5=n;" +
+                            // 2026-04-22 night: wine-9 specifically — try =b
+                            // (wine builtin xaudio2 → FAudio → winepulse). GN
+                            // runtime diff shows GN has FAudio_AudioCli +
+                            // audio_client_ma/ti threads, ours doesn't. wine-10
+                            // FAudio previously crashed — maybe wine-9 works.
+                            "xaudio2_7=b;xapofx1_5=b;" +
                             "Galaxy64=n;steam_api64=n;" +
                             "steamclient=n;steamclient64=n;" +
                             "GFSDK_SSAO_D3D11=n",
@@ -521,7 +560,7 @@ class TerminalActivity : AppCompatActivity() {
                     // our services.exe/explorer.exe DebugInfo NOP patches
                     // + winevulkan assert patch are wine-10 specific. p9
                     // run left those overwritten by wine-9's wineboot.
-                    useProton9 = false,
+                    useProton9 = true,
                 )
                 try {
                     java.io.File(filesDir, "ys9_stdout.log").writeText(r.stdout)
@@ -1212,6 +1251,33 @@ class TerminalActivity : AppCompatActivity() {
                 Log.e(TAG, "Failed to start frame socket server")
             }
         }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        Log.i(TAG, "dispatchKeyEvent kc=${event.keyCode} action=${event.action} displayMode=$isDisplayMode etFocus=${etCommand.isFocused}")
+        // In display mode, forward keys to Darkside so the wine/game sees
+        // them. Exclude back/volume and keys that should reach the IME
+        // when the EditText is focused (the command prompt still needs
+        // to work for diagnostics).
+        if (isDisplayMode && !etCommand.isFocused) {
+            val sv = darksideX11?.screenView()
+            if (sv != null) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_BACK,
+                    KeyEvent.KEYCODE_VOLUME_UP,
+                    KeyEvent.KEYCODE_VOLUME_DOWN,
+                    KeyEvent.KEYCODE_MENU -> { /* let Android handle */ }
+                    else -> {
+                        Log.i(TAG, "forwarding kc=${event.keyCode} to Darkside")
+                        when (event.action) {
+                            KeyEvent.ACTION_DOWN -> { sv.onKeyDown(event.keyCode, event); return true }
+                            KeyEvent.ACTION_UP   -> { sv.onKeyUp(event.keyCode, event);   return true }
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onDestroy() {
