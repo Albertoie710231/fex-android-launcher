@@ -56,7 +56,7 @@ class NativeWinePipeline(private val context: Context) {
 
     /** Target of the path redirect — where the baked paths should resolve to. */
     private val imageFsMirror: String
-        get() = "$dataDir/proton11/imagefs"
+        get() = "$dataDir/proton10/imagefs"
 
     data class Result(val exitCode: Int, val stdout: String, val stderr: String) {
         override fun toString() = "exit=$exitCode\n--- stdout ---\n$stdout--- stderr ---\n$stderr"
@@ -102,7 +102,7 @@ class NativeWinePipeline(private val context: Context) {
      */
     fun refreshBinSymlinks(): Boolean {
         return try {
-            val binDir = File("$dataDir/proton11/bin")
+            val binDir = File("$dataDir/proton10/bin")
             binDir.mkdirs()
             val binTargets = mapOf(
                 "wine" to "$nativeLibDir/$WINE_LIB",
@@ -118,10 +118,10 @@ class NativeWinePipeline(private val context: Context) {
                 recreateSymlink(File(binDir, link), target)
             }
             // Vulkan loader: wine does dlopen("libvulkan.so.1"). Symlink the
-            // current-install libvulkan_loader.so in proton11/lib/ so
+            // current-install libvulkan_loader.so in proton10/lib/ so
             // LD_LIBRARY_PATH picks it up. Stale across APK reinstalls if
             // not refreshed each launch.
-            val libDir = File("$dataDir/proton11/lib")
+            val libDir = File("$dataDir/proton10/lib")
             libDir.mkdirs()
             recreateSymlink(File(libDir, "libvulkan.so.1"), "$nativeLibDir/libvulkan_loader.so")
 
@@ -157,36 +157,36 @@ class NativeWinePipeline(private val context: Context) {
 
     /**
      * Create the directory layout the baked wineserver expects, using
-     * symlinks into our real proton11 tree so no file is duplicated.
+     * symlinks into our real proton10 tree so no file is duplicated.
      *
      * After this runs, these paths resolve (via the LD_PRELOAD redirect):
      *   /data/data/app.gamenative/files/imagefs/usr/lib
-     *     → proton11/imagefs/usr → proton11/lib  (contains aarch64-unix, etc.)
+     *     → proton10/imagefs/usr → proton10/lib  (contains aarch64-unix, etc.)
      *   /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/share/wine/nls
-     *     → proton11/imagefs/opt/proton-10.0.99-arm64ec/share → proton11/share
+     *     → proton10/imagefs/opt/proton-10.0.99-arm64ec/share → proton10/share
      *   /data/data/app.gamenative/files/imagefs/opt/proton-10.0.99-arm64ec/bin
-     *     → proton11/imagefs/opt/proton-10.0.99-arm64ec/bin → proton11/bin
+     *     → proton10/imagefs/opt/proton-10.0.99-arm64ec/bin → proton10/bin
      */
     fun ensureImageFsMirror(): Boolean {
         return try {
             val mirror = File(imageFsMirror)
-            val proton11 = File("$dataDir/proton11")
-            if (!proton11.exists()) {
-                Log.e(TAG, "proton11 tree not staged at ${proton11.path}")
+            val proton10 = File("$dataDir/proton10")
+            if (!proton10.exists()) {
+                Log.e(TAG, "proton10 tree not staged at ${proton10.path}")
                 return false
             }
             // /imagefs/usr → ../lib  (wineserver expects /imagefs/usr/lib)
             val usrDir = File(mirror, "usr")
             if (!usrDir.exists()) {
                 File(mirror, "usr").parentFile?.mkdirs()
-                // Need imagefs/usr/lib to point at proton11/lib.
+                // Need imagefs/usr/lib to point at proton10/lib.
                 // Easier: make imagefs/usr a directory, imagefs/usr/lib a symlink.
                 usrDir.mkdirs()
                 val usrLib = File(usrDir, "lib")
                 if (!usrLib.exists() && !java.nio.file.Files.isSymbolicLink(usrLib.toPath())) {
                     java.nio.file.Files.createSymbolicLink(
                         usrLib.toPath(),
-                        java.nio.file.Paths.get("$dataDir/proton11/lib"),
+                        java.nio.file.Paths.get("$dataDir/proton10/lib"),
                     )
                 }
             }
@@ -197,21 +197,21 @@ class NativeWinePipeline(private val context: Context) {
             if (!shareLink.exists() && !java.nio.file.Files.isSymbolicLink(shareLink.toPath())) {
                 java.nio.file.Files.createSymbolicLink(
                     shareLink.toPath(),
-                    java.nio.file.Paths.get("$dataDir/proton11/share"),
+                    java.nio.file.Paths.get("$dataDir/proton10/share"),
                 )
             }
             val binLink = File(protonRoot, "bin")
             if (!binLink.exists() && !java.nio.file.Files.isSymbolicLink(binLink.toPath())) {
                 java.nio.file.Files.createSymbolicLink(
                     binLink.toPath(),
-                    java.nio.file.Paths.get("$dataDir/proton11/bin"),
+                    java.nio.file.Paths.get("$dataDir/proton10/bin"),
                 )
             }
             val libLink = File(protonRoot, "lib")
             if (!libLink.exists() && !java.nio.file.Files.isSymbolicLink(libLink.toPath())) {
                 java.nio.file.Files.createSymbolicLink(
                     libLink.toPath(),
-                    java.nio.file.Paths.get("$dataDir/proton11/lib"),
+                    java.nio.file.Paths.get("$dataDir/proton10/lib"),
                 )
             }
             File("$dataDir/tmp").mkdirs()
@@ -245,7 +245,7 @@ class NativeWinePipeline(private val context: Context) {
             // C:\windows to be SetCurrentDirectory-able; if drive_c doesn't
             // exist the dosdevices/c: symlink (../drive_c) dangles and
             // SetCurrentDirectoryW fails with ENOENT (error 2).
-            val driveC = File("$dataDir/proton11/prefix/.wine/drive_c")
+            val driveC = File("$dataDir/proton10/prefix/.wine/drive_c")
             driveC.mkdirs()
             File(driveC, "windows").mkdirs()
             val system32 = File(driveC, "windows/system32")
@@ -257,7 +257,7 @@ class NativeWinePipeline(private val context: Context) {
             // first; without cmd.exe/notepad.exe here ShellExecute returns
             // "File not found" even though the builtins live under
             // lib/wine/aarch64-windows/.
-            val wineBuiltinDir = "$dataDir/proton11/lib/wine/aarch64-windows"
+            val wineBuiltinDir = "$dataDir/proton10/lib/wine/aarch64-windows"
             val builtinExes = listOf(
                 "cmd.exe", "notepad.exe", "wineboot.exe", "winemenubuilder.exe",
                 "reg.exe", "rpcss.exe", "services.exe", "svchost.exe",
@@ -279,7 +279,7 @@ class NativeWinePipeline(private val context: Context) {
             }
             // Dosdevices: refresh Z: to point at the Android root — baked
             // value pointed at /data/data/app.gamenative/files/imagefs/
-            val zDev = File("$dataDir/proton11/prefix/.wine/dosdevices/z:")
+            val zDev = File("$dataDir/proton10/prefix/.wine/dosdevices/z:")
             if (java.nio.file.Files.isSymbolicLink(zDev.toPath())) {
                 val target = java.nio.file.Files.readSymbolicLink(zDev.toPath()).toString()
                 if (target.contains("app.gamenative")) {
@@ -292,7 +292,7 @@ class NativeWinePipeline(private val context: Context) {
             // Wine's Vulkan loader reads VK_ICD_FILENAMES and VK_LAYER_PATH
             // to find driver + layers. The paths here point directly at
             // nativeLibDir (app_native_lib SELinux context — exec OK).
-            val vkConfigDir = File("$dataDir/proton11/vk")
+            val vkConfigDir = File("$dataDir/proton10/vk")
             vkConfigDir.mkdirs()
             // Point at the ICD WRAPPER, not the raw Vortek client. The wrapper
             // (libvortek_icd_wrapper.so) implements vk_icdGetInstanceProcAddr
@@ -373,7 +373,7 @@ class NativeWinePipeline(private val context: Context) {
      */
     private fun ensureYs9Stubs(): Boolean {
         try {
-            val sys32 = "$dataDir/proton11/prefix/.wine/drive_c/windows/system32"
+            val sys32 = "$dataDir/proton10/prefix/.wine/drive_c/windows/system32"
             val gameDir = "$dataDir/fex-rootfs/Ubuntu_22_04/home/user/Steam/steamapps/common/Ys IX Monstrum Nox"
 
             val stubs = listOf(
@@ -428,7 +428,7 @@ class NativeWinePipeline(private val context: Context) {
             // stub doesn't actually load them. We reuse the steam_api64 stub
             // as a placeholder — its Steamworks-shaped exports satisfy wine's
             // delay-load resolver.
-            val steamclientDir = File("$dataDir/proton11/prefix/.wine/drive_c/steamclient")
+            val steamclientDir = File("$dataDir/proton10/prefix/.wine/drive_c/steamclient")
             steamclientDir.mkdirs()
             for (fn in listOf("steamclient.dll", "steamclient64.dll")) {
                 context.assets.open("steam_api64.dll").use { input ->
@@ -473,7 +473,7 @@ class NativeWinePipeline(private val context: Context) {
      */
     private fun ensurePatchedWineBinaries(): Boolean {
         try {
-            val wineWinDir = "$dataDir/proton11/lib/wine/aarch64-windows"
+            val wineWinDir = "$dataDir/proton10/lib/wine/aarch64-windows"
             File(wineWinDir).mkdirs()
             for (name in listOf("services.exe", "explorer.exe")) {
                 context.assets.open(name).use { input ->
@@ -484,7 +484,7 @@ class NativeWinePipeline(private val context: Context) {
             // our patched lib/wine tree. Without this wineboot sees the
             // existing prefix copies (possibly corrupted by a prior
             // useProton9=true test) and reuses them.
-            val sys32 = "$dataDir/proton11/prefix/.wine/drive_c/windows/system32"
+            val sys32 = "$dataDir/proton10/prefix/.wine/drive_c/windows/system32"
             for (name in listOf("services.exe", "explorer.exe")) {
                 File(sys32, name).delete()
             }
@@ -696,7 +696,7 @@ class NativeWinePipeline(private val context: Context) {
             put("REDIRECT_FROM", BAKED_ROOT)
             put("REDIRECT_TO", imageFsMirror)
             put("REDIRECT_DEBUG", "1")
-            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+            put("WINEPREFIX", "$dataDir/proton10/prefix/.wine")
         }
         Log.i(TAG, "Launching wineserver smoke: $wineServerPath -f")
 
@@ -753,7 +753,7 @@ class NativeWinePipeline(private val context: Context) {
         useProton9: Boolean = false,
     ): Result {
         val wineBinary = if (useProton9) "$dataDir/proton9/bin/wine" else winePath
-        val wineTreeDir = if (useProton9) "$dataDir/proton9" else "$dataDir/proton11"
+        val wineTreeDir = if (useProton9) "$dataDir/proton9" else "$dataDir/proton10"
         // Check the real ELF in nativeLibDir — proton9/bin/wine is a symlink
         // that refreshBinSymlinks creates below.
         val wineExecCheck =
@@ -875,7 +875,7 @@ class NativeWinePipeline(private val context: Context) {
                 put("REDIRECT_TO4",   "$dataDir/imagefs_bionic")
             } else {
                 // proton-10 / Pepelespooder: BAKED_ROOT is `app.gamenative`
-                // path; target is proton11/imagefs mirror (shaped for
+                // path; target is proton10/imagefs mirror (shaped for
                 // Pepelespooder's own baked layout).
                 put("REDIRECT_FROM", BAKED_ROOT)
                 put("REDIRECT_TO",   imageFsMirror)
@@ -890,11 +890,11 @@ class NativeWinePipeline(private val context: Context) {
                 put("REDIRECT_TO3",   "$dataDir/imagefs_bionic")
             }
             put("REDIRECT_DEBUG", "1")
-            // Keep using proton11/prefix/.wine (has DXVK DLLs + FEX DLLs
+            // Keep using proton10/prefix/.wine (has DXVK DLLs + FEX DLLs
             // in drive_c/windows/system32 already). wine 9/10 share prefix
             // format in most respects; if incompatibilities show up we'll
             // stand up a separate prefix.
-            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+            put("WINEPREFIX", "$dataDir/proton10/prefix/.wine")
             // NOTE: previously set WINEBOOTSTRAPMODE=1 here. Removed because
             // GameNative does not set it, and leaving it seems to put wine
             // services.exe into a partial-init state where it page-faults
@@ -1066,7 +1066,7 @@ class NativeWinePipeline(private val context: Context) {
 
     /**
      * Run `wine wineboot --init` with the path-redirect shim. Creates/updates
-     * the wine prefix under files/proton11/prefix/.wine. First time takes a
+     * the wine prefix under files/proton10/prefix/.wine. First time takes a
      * few seconds (registry init, fake Windows tree, etc.). Wineserver will
      * auto-start as a child, so the shim must be set up for both wine and
      * wineserver — same env vars applied.
@@ -1090,7 +1090,7 @@ class NativeWinePipeline(private val context: Context) {
             put("REDIRECT_FROM", BAKED_ROOT)
             put("REDIRECT_TO", imageFsMirror)
             put("REDIRECT_DEBUG", "1")
-            put("WINEPREFIX", "$dataDir/proton11/prefix/.wine")
+            put("WINEPREFIX", "$dataDir/proton10/prefix/.wine")
             // Quiet trace, keep errors + warns; +pid to distinguish parent/child
             put("WINEDEBUG", "err+all,warn+loader,fixme-all,trace-all,+pid,+tid")
             // Keep is_prefix_bootstrap=TRUE through the whole wine run so child
@@ -1152,7 +1152,7 @@ class NativeWinePipeline(private val context: Context) {
      * enough for the first iteration.
      */
     private fun buildEnv(useProton9: Boolean = false): Map<String, String> {
-        val wineTree = if (useProton9) "$dataDir/proton9" else "$dataDir/proton11"
+        val wineTree = if (useProton9) "$dataDir/proton9" else "$dataDir/proton10"
         // Prepend GameNative imagefs_bionic lib dir so dlopen("libvulkan.so.1")
         // resolves to the Bionic Khronos loader, and libvulkan_wrapper.so +
         // its deps (libadrenotools, libandroid-sysvshm, libxcb, libdrm, ...)

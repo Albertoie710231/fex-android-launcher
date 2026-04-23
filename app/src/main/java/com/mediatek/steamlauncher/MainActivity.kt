@@ -64,7 +64,7 @@ class MainActivity : AppCompatActivity() {
             val tag = "NativeWineProbe"
             try {
                 val nativeDir = applicationInfo.nativeLibraryDir
-                val data = "${applicationInfo.dataDir}/files/proton11"
+                val data = "${applicationInfo.dataDir}/files/proton10"
                 val wineSo = "$nativeDir/libwine_native.so"
                 if (!java.io.File(wineSo).exists()) {
                     Log.w(tag, "wine .so not present at $wineSo — skipping")

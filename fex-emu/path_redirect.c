@@ -7,7 +7,7 @@
  *
  * Config at load time via env vars:
  *   REDIRECT_FROM — absolute path prefix to match (e.g. /data/data/app.gamenative)
- *   REDIRECT_TO   — replacement prefix (e.g. /data/data/com.mediatek.steamlauncher/files/proton11)
+ *   REDIRECT_TO   — replacement prefix (e.g. /data/data/com.mediatek.steamlauncher/files/proton10)
  *
  * Single prefix rule. If a path starts with REDIRECT_FROM, its prefix is
  * replaced with REDIRECT_TO before the real syscall is invoked. All other

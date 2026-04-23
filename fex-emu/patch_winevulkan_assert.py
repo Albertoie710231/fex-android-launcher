@@ -14,7 +14,7 @@ sequence in .text that calls ucrtbase's _assert, and replaces the final
 BLR with an ARM64 NOP (0xD503201F). adrp+ldr are left as dead code; the
 call itself becomes a no-op and wine continues past the assertion.
 
-Tested on: files/proton11/lib/wine/aarch64-windows/winevulkan.dll from
+Tested on: files/proton10/lib/wine/aarch64-windows/winevulkan.dll from
 Pepelespooder's wine 10.0.99-arm64ec drop (2740224 bytes, PE machine 0xaa64).
 
 Usage: patch_winevulkan_assert.py INPUT.dll OUTPUT.dll

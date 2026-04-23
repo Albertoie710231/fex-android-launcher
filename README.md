@@ -126,7 +126,7 @@ current Ys IX vertex corruption originates).
 
 **Known-broken on the branch:**
 - `libvulkan.so.1` does not load (`err:vulkan:vulkan_init_once Failed to
-  load libvulkan.so.1`) despite the symlink in `proton11/lib/`. Until
+  load libvulkan.so.1`) despite the symlink in `proton10/lib/`. Until
   this is fixed nothing that uses Vulkan — including DXVK — can work.
 - OLE / COM subsystem: `actxprxy.dll`, `uiautomationcore.dll`,
   `IUIAutomation` all fail to init during any GUI PE startup. Likely
