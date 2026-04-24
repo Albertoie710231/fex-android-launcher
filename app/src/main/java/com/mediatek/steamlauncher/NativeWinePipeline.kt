@@ -1236,7 +1236,7 @@ class NativeWinePipeline(private val context: Context) {
             // (2026-04-22 diagnosed: MainThread parks at futex wait @0x73a4365110;
             // audio/Steam/Galaxy all ruled out; pcompiler thread profile gap
             // is the last major DXVK-level diff vs GameNative.)
-            put("DXVK_ASYNC", "1")
+            put("DXVK_ASYNC", "0")
             // Path redirect rules. ORDER MATTERS — libpathredirect uses
             // first-match-wins. Most-specific rule must come first.
             //
@@ -1341,19 +1341,30 @@ class NativeWinePipeline(private val context: Context) {
             put("ENABLE_BCN_COMPUTE", "1")
             put("ENABLE_UTIL_LAYER", "1")
             put("BCN_COMPUTE_AUTO", "1")
-            // Force CPU-side BCn texture decompression. Mali GPUs have no
-            // hardware BC1-BC7; leegao's wrapper can either compute-shader
-            // emulate (faster, but buggy in some games) or CPU-decompress
-            // (slower, more reliable). Sekiro hits c0000005 access violations
-            // with the compute-shader path during area load — `USE_CPU_BCN=all`
-            // is the documented fix from prior session experimenting with
-            // leegao v0.0.5r5. (See archive: MEDIATEK-DIRVERS-TEST 2026-04-03.)
-            put("USE_CPU_BCN", "all")
+            // Route only the problem BCn formats through CPU decompression.
+            // Mali has no hardware BC1-BC7. leegao's wrapper emulates via
+            // compute shaders by default, but the BC6H / BC7 paths trigger
+            // pipeline-object-cross-VkDevice bugs that cause c0000005
+            // access violations in Sekiro during area load (leegao#99).
+            // Setting `USE_CPU_BCN="bc6 bc7"` forces ONLY those two formats
+            // onto the CPU path; BC1/BC2/BC3/BC4/BC5 stay on the GPU compute
+            // path (smaller memory footprint, faster). `USE_CPU_BCN=all`
+            // works too but blows through swap in ~60s because every BCn
+            // texture is decompressed to ~4-8x size in RAM.
+            put("USE_CPU_BCN", "bc6 bc7")
             // Custom implicit Vulkan layer that forces dualSrcBlend,
             // logicOp, shaderStorageImageExtendedFormats to VK_TRUE in
             // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as
             // FALSE which blocks DXVK's FL11_0 check.
             put("SPOOF_FEATURES", "1")
+            // VK_GC layer: periodically vkDeviceWaitIdle to nudge Mali
+            // driver cleanup; logs VkDeviceMemory alloc/free metrics to
+            // stderr. See fex-emu/vulkan_gc_layer.c. Layer .so +
+            // manifest live in imagefs_bionic (deployed alongside the
+            // rest of the vulkan implicit layers).
+            put("VK_GC_ENABLE", "1")
+            put("VK_GC_INTERVAL", "120")       // waitIdle every 120 submits (~2s at 60 fps)
+            put("VK_GC_LOG_EVERY", "600")      // log stats every 600 submits (~10s)
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
             // DXVK_LOG_PATH is a DIRECTORY (DXVK writes <exe>_<dll>.log
@@ -1367,8 +1378,23 @@ class NativeWinePipeline(private val context: Context) {
             // a function-pointer call in their integration path sends rip
             // into unmapped FEX-cache memory (DEP exec violation at
             // 0x6FCE... with no loaded module).
+            // dxvk.maxMemoryBudget (MB): caps DXVK's reported heap budget so
+            // its chunk allocator evicts unused VkDeviceMemory chunks under
+            // pressure. Default 0 = no cap = DXVK thinks it has all 16 GB
+            // unified memory and hoards chunks indefinitely. On Mali each
+            // retained Vulkan resource accumulates small /dev/mali0
+            // mappings (driver-internal bookkeeping) until the process
+            // approaches vm.max_map_count and dies.
+            //
+            // Sekiro uses ~2 GB VRAM at 720p (GameGPU benchmarks) plus wine
+            // + DXVK + libwow64fex/libarm64ecfex JIT + Mali driver overhead.
+            // 6 GB cap gives the game its real working-set headroom while
+            // still bounding runaway growth; leaves ~10 GB for the rest of
+            // the 16 GB device. cap=3072 (previous attempt) was too tight —
+            // DXVK couldn't satisfy allocations and crashed in stress areas.
+            // See dxvk_memory.cpp:1746 (freeEmptyChunksInPool).
             put("DXVK_CONFIG",
-                "dxvk.enableOpenVR=False;dxvk.enableOpenXR=False")
+                "dxvk.enableOpenVR=False;dxvk.enableOpenXR=False;dxvk.maxMemoryBudget=6144")
             put("BOX64_MMAP32", "0")
             // Mesa/Zink
             put("MESA_DEBUG", "silent")
