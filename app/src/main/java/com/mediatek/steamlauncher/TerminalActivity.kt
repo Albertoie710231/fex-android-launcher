@@ -629,6 +629,40 @@ class TerminalActivity : AppCompatActivity() {
             val gameWindowsPath =
                 "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
             scope.launch {
+                // Strip SteamStub DRM from sekiro.exe before launch. Matches
+                // what GameNative does on game import. Without this,
+                // ColdClient + steam_api64 stubs don't satisfy the SteamStub
+                // wrapper's own auth check (seen: "Application load error
+                // 3:0000065432" dialog). Steamless produces
+                // `sekiro.exe.unpacked.exe` which is DRM-free.
+                val sekiroHostExe = java.io.File(
+                    filesDir,
+                    "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Sekiro/sekiro.exe",
+                ).absolutePath
+                val sekiroGuestExe =
+                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sekiro\\sekiro.exe"
+                val unpackedGuestExe = pipeline.unpackWithSteamless(
+                    guestExePath = sekiroGuestExe,
+                    hostExeAbs = sekiroHostExe,
+                    useProton9 = true,
+                )
+                if (unpackedGuestExe != sekiroGuestExe) {
+                    // Replace sekiro.exe with the unpacked version so the
+                    // ColdClient loader (which is configured to launch
+                    // sekiro.exe) runs the DRM-free build. Back up original.
+                    val hostUnpacked = java.io.File("$sekiroHostExe.unpacked.exe")
+                    val hostBackup = java.io.File("$sekiroHostExe.steamstub")
+                    if (hostUnpacked.exists()) {
+                        if (!hostBackup.exists()) {
+                            java.io.File(sekiroHostExe).copyTo(hostBackup, overwrite = false)
+                        }
+                        hostUnpacked.copyTo(java.io.File(sekiroHostExe), overwrite = true)
+                        handler.post { appendOutput("[Steamless: swapped sekiro.exe with unpacked]\n") }
+                    }
+                } else {
+                    handler.post { appendOutput("[Steamless: no unpacking happened, using original sekiro.exe]\n") }
+                }
+
                 val r = pipeline.wineRun(
                     args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
                     timeoutMs = 300_000,

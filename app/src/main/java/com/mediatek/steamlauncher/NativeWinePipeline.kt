@@ -374,6 +374,7 @@ class NativeWinePipeline(private val context: Context) {
             ensureLibevshimPatched()
             ensureDxvkAndLibarm64ec()
             ensureColdClient()
+            ensureSteamless()
 
             true
         } catch (t: Throwable) {
@@ -673,6 +674,115 @@ class NativeWinePipeline(private val context: Context) {
         } catch (t: Throwable) {
             Log.e(TAG, "ensureColdClient failed", t)
             return false
+        }
+    }
+
+    /**
+     * Deploy atom0s/Steamless (bundled from GameNative's imagefs) to
+     * `drive_c/Steamless/`. Steamless strips SteamStub DRM from game
+     * executables — mandatory for games like Sekiro where ColdClient +
+     * steam_api64.dll stubs aren't enough (SteamStub is a wrapper around
+     * the game exe, decrypted at runtime; removing the wrapper lets the
+     * game skip Steam auth entirely).
+     *
+     * Steamless.CLI.exe is a 32-bit .NET Framework app; it needs wine's
+     * mscoree + wine-mono to run. Size-compared per file.
+     */
+    private fun ensureSteamless(): Boolean {
+        try {
+            val prefix = File("$dataDir/proton10/prefix/.wine")
+            if (!prefix.exists()) return true
+            val dstRoot = File(prefix, "drive_c/Steamless")
+            dstRoot.mkdirs()
+            val dstPlugins = File(dstRoot, "Plugins")
+            dstPlugins.mkdirs()
+
+            val topFiles = listOf(
+                "ExamplePlugin.dll", "ExamplePlugin.zip",
+                "SharpDisasm.dll", "Steamless.API.dll",
+                "Steamless.CLI.exe", "Steamless.CLI.exe.config",
+                "Steamless.exe", "Steamless.exe.config",
+                "Steamless.Unpacker.Variant10.x86.dll",
+                "Steamless.Unpacker.Variant20.x86.dll",
+                "Steamless.Unpacker.Variant21.x86.dll",
+                "Steamless.Unpacker.Variant30.x64.dll",
+                "Steamless.Unpacker.Variant30.x86.dll",
+                "Steamless.Unpacker.Variant31.x64.dll",
+                "Steamless.Unpacker.Variant31.x86.dll",
+            )
+            val pluginFiles = listOf(
+                "ExamplePlugin.dll", "SharpDisasm.dll", "Steamless.API.dll",
+                "Steamless.Unpacker.Variant10.x86.dll",
+                "Steamless.Unpacker.Variant20.x86.dll",
+                "Steamless.Unpacker.Variant21.x86.dll",
+                "Steamless.Unpacker.Variant30.x64.dll",
+                "Steamless.Unpacker.Variant30.x86.dll",
+                "Steamless.Unpacker.Variant31.x64.dll",
+                "Steamless.Unpacker.Variant31.x86.dll",
+            )
+
+            fun deploy(assetPath: String, dst: File) {
+                context.assets.open(assetPath).use { input ->
+                    val bytes = input.readBytes()
+                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
+                        dst.writeBytes(bytes)
+                    }
+                }
+            }
+            for (f in topFiles) deploy("productize/Steamless/$f", File(dstRoot, f))
+            for (f in pluginFiles) deploy("productize/Steamless/Plugins/$f", File(dstPlugins, f))
+
+            Log.i(TAG, "Deployed Steamless (${topFiles.size} top + ${pluginFiles.size} plugins)")
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureSteamless failed", t)
+            return false
+        }
+    }
+
+    /**
+     * Strip SteamStub DRM from a game executable using Steamless. Produces
+     * `<exe>.unpacked.exe` which is the DRM-free version. Idempotent — skips
+     * if the unpacked output already exists and is newer than the wrapped
+     * source. Returns the path to the unpacked exe to launch, or the
+     * original path if Steamless didn't unpack (exe wasn't SteamStub-wrapped
+     * or Steamless failed).
+     *
+     * Runs synchronously via our wineRun (no display needed for the CLI).
+     * Typical runtime: a few seconds.
+     */
+    fun unpackWithSteamless(
+        guestExePath: String,
+        hostExeAbs: String,
+        useProton9: Boolean = true,
+    ): String {
+        val hostExe = File(hostExeAbs)
+        val hostUnpackedPath = "$hostExeAbs.unpacked.exe"
+        val hostUnpacked = File(hostUnpackedPath)
+        if (hostUnpacked.exists() && hostUnpacked.lastModified() >= hostExe.lastModified()) {
+            Log.i(TAG, "Steamless: already-unpacked exe fresh, skipping: $hostUnpackedPath")
+            return "$guestExePath.unpacked.exe"
+        }
+        Log.i(TAG, "Steamless: unpacking $guestExePath")
+        val cliExe = "C:\\Steamless\\Steamless.CLI.exe"
+        val r = wineRun(
+            args = listOf(cliExe, guestExePath),
+            timeoutMs = 120_000,
+            extraEnv = emptyMap(),
+            useProton9 = useProton9,
+        )
+        Log.i(TAG, "Steamless exit=${r.exitCode} stdout=${r.stdout.length}B stderr=${r.stderr.length}B")
+        try {
+            File(dataDir, "steamless_stdout.log").writeText(r.stdout)
+            File(dataDir, "steamless_stderr.log").writeText(r.stderr)
+        } catch (_: Throwable) {}
+        // Steamless writes the result next to the input as <original>.unpacked.exe.
+        return if (hostUnpacked.exists()) {
+            Log.i(TAG, "Steamless: produced $hostUnpackedPath (${hostUnpacked.length()} bytes)")
+            "$guestExePath.unpacked.exe"
+        } else {
+            Log.w(TAG, "Steamless: no .unpacked.exe output — using original $guestExePath")
+            guestExePath
         }
     }
 
