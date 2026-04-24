@@ -594,20 +594,48 @@ class TerminalActivity : AppCompatActivity() {
             executeCommand(protonManager.getNotepadTestCommand())
         }
 
-        // Launch Ys IX game
+        // Launch Ys IX game — OLD FEX x86-64 pipeline, but routed through
+        // the NEW XConnector X server (same server used by YsIX N). X11
+        // plumbing is architecture-agnostic, so wine-under-FEX can connect
+        // to XConnector over a unix socket just like native ARM64 wine.
+        // Expected: game launches, X11 handshake works, rendering shows
+        // the FEX thunk's VB[0] vertex corruption (exploded menu) — the
+        // point of this experiment is to validate X11 integration, not
+        // fix the corruption.
         findViewById<Button>(R.id.btnLaunchGame).setOnClickListener {
-            // Start X11 if needed (Wine needs X11 for windows and display)
-            if (x11Server?.isRunning() != true) {
-                x11Server = X11Server(this).apply {
-                    onServerStarted = { handler.post { appendOutput("[X11 started for game]\n") } }
-                    onError = { msg -> handler.post { appendOutput("[X11 error: $msg]\n") } }
-                    start()
+            if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
+                xConnectorX11 = XConnectorX11Server(this).apply {
+                    val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
+                    if (start(socketRoot)) {
+                        handler.post {
+                            appendOutput("[XConnector X11 listening on ${socketPath()}]\n")
+                        }
+                        try {
+                            val container = vulkanSurface.parent as android.widget.FrameLayout
+                            val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
+                            xServer.setRenderer(xsv.renderer)
+                            runOnUiThread {
+                                vulkanSurface.visibility = android.view.View.GONE
+                                container.addView(xsv)
+                                xServerView = xsv
+                            }
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "XServerView attach failed", t)
+                        }
+                    } else {
+                        handler.post { appendOutput("[XConnector X11 start failed]\n") }
+                    }
                 }
             }
-            // Switch to display mode to show frames on SurfaceView
-            if (!isDisplayMode) toggleDisplayMode()
+            // Tell FexExecutor to symlink /tmp/.X11-unix/X0 inside the FEX
+            // rootfs at XConnector's socket. Runs inside ensureSocketSymlinks
+            // on the very next executeCommand call.
+            val xconnSocket = "${filesDir.absolutePath}/imagefs_bionic/tmp/.X11-unix/X0"
+            app.fexExecutor.x11SocketTargetOverride = xconnSocket
+            appendOutput("[FEX X11 socket target: $xconnSocket]\n")
             executeCommand(protonManager.getLaunchCommand(
-                "/home/user/Steam/steamapps/common/Ys IX Monstrum Nox/ys9.exe"
+                "/home/user/Steam/steamapps/common/Ys IX Monstrum Nox/ys9.exe",
+                useHeadlessLayer = false,
             ))
         }
 

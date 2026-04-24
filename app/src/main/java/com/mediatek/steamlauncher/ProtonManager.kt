@@ -696,7 +696,15 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
         steamAppId: String = "1351630",
         dllOverrides: String? = null,
         useVirtualDesktop: Boolean = true,
-        loginArgs: String = ""
+        loginArgs: String = "",
+        /**
+         * When true (default), HEADLESS_LAYER=1 intercepts DXVK's presents
+         * and streams them via TCP:19850 to the Android SurfaceView. When
+         * false, DXVK uses real VK_KHR_swapchain + VK_KHR_xlib_surface so
+         * the game's Vulkan output goes through the X server (XConnector's
+         * DRI3/Present path). Set false to render via XConnector directly.
+         */
+        useHeadlessLayer: Boolean = true,
     ): String {
         // Shell-escape login credentials for Steam background process
         val steamLoginFlag = if (loginArgs.isNotBlank()) {
@@ -727,9 +735,17 @@ except: print('NOT REACHABLE: abstract socket @/tmp/.X11-unix/X0'); sys.exit(1)
             export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/fex_thunk_icd.json:$fexHomeDir/.fex-emu/vortek_host_icd.json"
             export MALI_NO_ASYNC_COMPUTE=1
 
-            # Headless frame capture → TCP 19850 → Android SurfaceView
+            # Headless frame capture → TCP 19850 → Android SurfaceView.
+            # When useHeadlessLayer=false, skip this so DXVK uses real
+            # VK_KHR_swapchain via winex11.drv → XConnector DRI3.
+            ${if (useHeadlessLayer) """
             export HEADLESS_LAYER=1
             export DISABLE_HOST_HEADLESS=1
+            """ else """
+            unset HEADLESS_LAYER
+            export DISABLE_HEADLESS_LAYER=1
+            export DISABLE_HOST_HEADLESS=1
+            """}
 
             # DXVK settings
             export DXVK_ASYNC=1

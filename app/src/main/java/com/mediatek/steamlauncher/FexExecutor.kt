@@ -29,6 +29,15 @@ class FexExecutor(private val context: Context) {
     /** FEXServer process — kept alive for the duration of the app session */
     private var fexServerProcess: Process? = null
 
+    /**
+     * Override for the X11 socket target. When set, `ensureSocketSymlinks`
+     * points the FEX rootfs `/tmp/.X11-unix/X0` symlink at this absolute path
+     * instead of the default `x11SocketDir/X0` (libXlorie). Use to route the
+     * FEX x86-64 pipeline through an alternate X server (e.g. XConnector's
+     * filesystem socket at `files/imagefs_bionic/tmp/.X11-unix/X0`).
+     */
+    var x11SocketTargetOverride: String? = null
+
     private val app: SteamLauncherApp
         get() = context.applicationContext as SteamLauncherApp
 
@@ -429,13 +438,13 @@ class FexExecutor(private val context: Context) {
             File(tmpDir, ".vortek/V0")
         )
 
-        // X11 socket: /tmp/.X11-unix/X0 → actual socket
+        // X11 socket: /tmp/.X11-unix/X0 → actual socket.
+        // Overridable per-run so alternate X servers (e.g. XConnector) can
+        // take over without rebuilding the rest of the environment.
         val x11Dir = File(rootfsTmp, ".X11-unix")
         x11Dir.mkdirs()
-        createSymlink(
-            File(x11Dir, "X0"),
-            File(x11SocketDir, "X0")
-        )
+        val x11Target = x11SocketTargetOverride?.let { File(it) } ?: File(x11SocketDir, "X0")
+        createSymlink(File(x11Dir, "X0"), x11Target)
 
         // Shared memory
         val shmDir = File(rootfsTmp, "shm")
