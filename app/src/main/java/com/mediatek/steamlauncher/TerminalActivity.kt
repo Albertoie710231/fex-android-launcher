@@ -478,6 +478,15 @@ class TerminalActivity : AppCompatActivity() {
                     }
                 }
             }
+            // Reconfigure ColdClient for Ys IX (switched back after Sekiro
+            // test). steam_appid.txt + ColdClientLoader.ini are per-game;
+            // ensureColdClient treats them as preserve-on-change.
+            reconfigureColdClient(
+                appId = "1351630",
+                exePath = "steamapps\\common\\Ys IX Monstrum Nox\\ys9.exe",
+                exeRunDir = "steamapps\\common\\Ys IX Monstrum Nox",
+            )
+
             val pipeline = NativeWinePipeline(this)
             // 2026-04-22: Launch via ColdClient Steam-emulator loader
             // (matches GameNative's architecture). The loader reads
@@ -576,6 +585,77 @@ class TerminalActivity : AppCompatActivity() {
                     if (r.exitCode == -99) {
                         appendOutput("[ys9 process still running at timeout]\n")
                     }
+                    appendOutput("===========================================\n")
+                }
+            }
+        }
+
+        // Launch Sekiro through the native Bionic chimera pipeline — parallel
+        // to btnYsIXNative, different exe + AppId. First attempt at a
+        // second game on this pipeline. DRM side: ColdClient Steam emulator
+        // bypasses Steam entirely, which means EAC never initializes either
+        // (EAC hooks through Steam's runtime; no Steam = no EAC).
+        findViewById<Button>(R.id.btnLaunchSekiroN).setOnClickListener {
+            appendOutput("=== wine sekiro.exe (native Bionic) ===\n")
+            if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
+                xConnectorX11 = XConnectorX11Server(this).apply {
+                    val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
+                    if (start(socketRoot)) {
+                        handler.post { appendOutput("[XConnector X11 listening on ${socketPath()}]\n") }
+                        try {
+                            val container = vulkanSurface.parent as android.widget.FrameLayout
+                            val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
+                            xServer.setRenderer(xsv.renderer)
+                            runOnUiThread {
+                                vulkanSurface.visibility = android.view.View.GONE
+                                container.addView(xsv)
+                                xServerView = xsv
+                            }
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "XServerView attach failed", t)
+                        }
+                    } else {
+                        handler.post { appendOutput("[XConnector X11 start failed]\n") }
+                    }
+                }
+            }
+            reconfigureColdClient(
+                appId = "814380",
+                exePath = "steamapps\\common\\Sekiro\\sekiro.exe",
+                exeRunDir = "steamapps\\common\\Sekiro",
+            )
+
+            val pipeline = NativeWinePipeline(this)
+            val gameWindowsPath =
+                "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
+            scope.launch {
+                val r = pipeline.wineRun(
+                    args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
+                    timeoutMs = 300_000,
+                    extraEnv = mapOf(
+                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
+                        // Sekiro-specific overrides: drop Galaxy64 (Sekiro is
+                        // Steam-only, no GOG). Keep DXVK on n, steam_api64 stub.
+                        // GFSDK_SSAO isn't an NVIDIA-only SSAO in Sekiro's case;
+                        // start conservative and iterate if it fails.
+                        "WINEDLLOVERRIDES" to
+                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
+                            "xaudio2_7=b;xapofx1_5=b;" +
+                            "steam_api64=n;" +
+                            "steamclient=n;steamclient64=n",
+                        "DISPLAY" to ":0",
+                    ),
+                    useProton9 = true,
+                )
+                try {
+                    java.io.File(filesDir, "sekiro_stdout.log").writeText(r.stdout)
+                    java.io.File(filesDir, "sekiro_stderr.log").writeText(r.stderr)
+                } catch (_: Throwable) {}
+                handler.post {
+                    appendOutput("sekiro exit=${r.exitCode}\n")
+                    appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
+                    appendOutput("full logs: files/sekiro_stdout.log, files/sekiro_stderr.log\n")
+                    if (r.exitCode == -99) appendOutput("[sekiro still running at timeout]\n")
                     appendOutput("===========================================\n")
                 }
             }
@@ -922,6 +1002,47 @@ class TerminalActivity : AppCompatActivity() {
         }
 
         executeCommand(text.trim())
+    }
+
+    /**
+     * Rewrite ColdClient's on-device per-game settings so steamclient_loader_x64.exe
+     * launches the requested game. Called from every game-launch handler so
+     * switching between games doesn't leave stale config.
+     *
+     * ColdClient reads:
+     *   - `steam_settings/steam_appid.txt`: one line, the AppID (e.g. "814380")
+     *   - `ColdClientLoader.ini`: [SteamClient] section with AppId= + Exe= + ExeRunDir=
+     *
+     * Both `ensureColdClient` treats as preserve-on-change, so our writes stick.
+     */
+    private fun reconfigureColdClient(appId: String, exePath: String, exeRunDir: String) {
+        try {
+            val steamDir = java.io.File(
+                filesDir, "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam"
+            )
+            java.io.File(steamDir, "steam_settings").mkdirs()
+            java.io.File(steamDir, "steam_settings/steam_appid.txt").writeText("$appId\n")
+
+            val iniContent = """
+                [SteamClient]
+
+                Exe=$exePath
+                ExeRunDir=$exeRunDir
+                ExeCommandLine=
+                AppId=$appId
+
+                SteamClientDll=steamclient.dll
+                SteamClient64Dll=steamclient64.dll
+
+
+                [Injection]
+                IgnoreLoaderArchDifference=1
+            """.trimIndent()
+            java.io.File(steamDir, "ColdClientLoader.ini").writeText(iniContent)
+            appendOutput("[ColdClient reconfigured: AppId=$appId target=$exePath]\n")
+        } catch (t: Throwable) {
+            appendOutput("[ColdClient reconfigure failed: ${t.message}]\n")
+        }
     }
 
     private fun executeCommand(command: String) {

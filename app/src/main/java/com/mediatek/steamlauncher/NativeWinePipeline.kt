@@ -622,6 +622,14 @@ class NativeWinePipeline(private val context: Context) {
             val settingsDir = File(steamDir, "steam_settings")
             settingsDir.mkdirs()
 
+            // Files that are per-game-configurable. These get created on
+            // first install but once present, user/caller can override them
+            // without ensureColdClient stomping them back on the next launch.
+            // (Callers adjust ColdClientLoader.ini + steam_appid.txt per-game
+            // — e.g. switching between Ys IX and Sekiro.)
+            val coldClientConfigurable = setOf(
+                "ColdClientLoader.ini",
+            )
             val coldClientFiles = listOf(
                 "ColdClientLoader.ini",
                 "steamclient.dll",
@@ -633,21 +641,31 @@ class NativeWinePipeline(private val context: Context) {
                 val dst = File(steamDir, name)
                 context.assets.open("productize/ColdClient/$name").use { input ->
                     val bytes = input.readBytes()
-                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
-                        dst.writeBytes(bytes)
+                    val shouldWrite = if (name in coldClientConfigurable) {
+                        !dst.exists()  // first-install only
+                    } else {
+                        !dst.exists() || dst.length() != bytes.size.toLong()
                     }
+                    if (shouldWrite) dst.writeBytes(bytes)
                 }
             }
 
+            val settingsConfigurable = setOf(
+                "steam_appid.txt",
+                "configs.app.ini",
+            )
             val settingsFiles = context.assets.list("productize/ColdClient/steam_settings")
                 ?: emptyArray()
             for (name in settingsFiles) {
                 val dst = File(settingsDir, name)
                 context.assets.open("productize/ColdClient/steam_settings/$name").use { input ->
                     val bytes = input.readBytes()
-                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
-                        dst.writeBytes(bytes)
+                    val shouldWrite = if (name in settingsConfigurable) {
+                        !dst.exists()
+                    } else {
+                        !dst.exists() || dst.length() != bytes.size.toLong()
                     }
+                    if (shouldWrite) dst.writeBytes(bytes)
                 }
             }
             Log.i(TAG, "Deployed ColdClient (${coldClientFiles.size} files + ${settingsFiles.size} settings)")
