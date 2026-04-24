@@ -15,6 +15,7 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.winlator.xserver.XKeycode as K
 import kotlinx.coroutines.*
 
 /**
@@ -113,38 +114,10 @@ class TerminalActivity : AppCompatActivity() {
             }
         })
 
-        // Route touches on the Vulkan surface into Darkside's X11 input
-        // when we're displaying the wine desktop. The game sees no Android
-        // events otherwise — our ScreenView is headless, so Darkside
-        // doesn't receive tap/motion events via the normal Android path.
-        vulkanSurface.isFocusable = true
-        vulkanSurface.isClickable = true
-        vulkanSurface.setOnTouchListener { v, event ->
-            Log.i(TAG, "vulkanSurface onTouch: action=${event.actionMasked} x=${event.x} y=${event.y} displayMode=$isDisplayMode darksideUp=${darksideX11?.isRunning()}")
-            if (!isDisplayMode) return@setOnTouchListener false
-            val srv = darksideX11 ?: return@setOnTouchListener false
-            val sv = srv.screenView() ?: return@setOnTouchListener false
-            val w = v.width
-            val h = v.height
-            if (w <= 0 || h <= 0) return@setOnTouchListener false
-            // Map view px -> X11 root coords (letterbox-free scale).
-            val x = (event.x * srv.rootWidth() / w).toInt().coerceIn(0, srv.rootWidth() - 1)
-            val y = (event.y * srv.rootHeight() / h).toInt().coerceIn(0, srv.rootHeight() - 1)
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    Log.i(TAG, "X11 pointer DOWN at ($x,$y)")
-                    sv.updatePointerPosition(x, y, 0)
-                    sv.updatePointerButtons(1, true)
-                }
-                MotionEvent.ACTION_MOVE -> sv.updatePointerPosition(x, y, 0)
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    Log.i(TAG, "X11 pointer UP at ($x,$y)")
-                    sv.updatePointerPosition(x, y, 0)
-                    sv.updatePointerButtons(1, false)
-                }
-            }
-            true
-        }
+        // Touch routing: the listener is attached to XServerView (the
+        // GLSurfaceView added on top of vulkanSurface) when it's created —
+        // see wireXServerViewInput() below. vulkanSurface itself is hidden
+        // once the X server starts.
 
         setupUI()
         showWelcome()
@@ -469,6 +442,7 @@ class TerminalActivity : AppCompatActivity() {
                                 vulkanSurface.visibility = android.view.View.GONE
                                 container.addView(xsv)
                                 xServerView = xsv
+                                wireXServerViewInput(xsv)
                             }
                         } catch (t: Throwable) {
                             Log.e(TAG, "XServerView attach failed", t)
@@ -610,6 +584,7 @@ class TerminalActivity : AppCompatActivity() {
                                 vulkanSurface.visibility = android.view.View.GONE
                                 container.addView(xsv)
                                 xServerView = xsv
+                                wireXServerViewInput(xsv)
                             }
                         } catch (t: Throwable) {
                             Log.e(TAG, "XServerView attach failed", t)
@@ -732,6 +707,7 @@ class TerminalActivity : AppCompatActivity() {
                                 vulkanSurface.visibility = android.view.View.GONE
                                 container.addView(xsv)
                                 xServerView = xsv
+                                wireXServerViewInput(xsv)
                             }
                         } catch (t: Throwable) {
                             Log.e(TAG, "XServerView attach failed", t)
@@ -1440,30 +1416,123 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        Log.i(TAG, "dispatchKeyEvent kc=${event.keyCode} action=${event.action} displayMode=$isDisplayMode etFocus=${etCommand.isFocused}")
-        // In display mode, forward keys to Darkside so the wine/game sees
-        // them. Exclude back/volume and keys that should reach the IME
-        // when the EditText is focused (the command prompt still needs
-        // to work for diagnostics).
-        if (isDisplayMode && !etCommand.isFocused) {
-            val sv = darksideX11?.screenView()
-            if (sv != null) {
-                when (event.keyCode) {
-                    KeyEvent.KEYCODE_BACK,
-                    KeyEvent.KEYCODE_VOLUME_UP,
-                    KeyEvent.KEYCODE_VOLUME_DOWN,
-                    KeyEvent.KEYCODE_MENU -> { /* let Android handle */ }
-                    else -> {
-                        Log.i(TAG, "forwarding kc=${event.keyCode} to Darkside")
-                        when (event.action) {
-                            KeyEvent.ACTION_DOWN -> { sv.onKeyDown(event.keyCode, event); return true }
-                            KeyEvent.ACTION_UP   -> { sv.onKeyUp(event.keyCode, event);   return true }
-                        }
-                    }
+        // Forward mapped keys to the X11 server while a game is running.
+        // Skip when the command EditText has focus (so the diagnostic
+        // prompt still works). Back/volume/menu keep their Android meaning.
+        val srv = xConnectorX11
+        if (srv != null && srv.isRunning() && !etCommand.isFocused) {
+            val xkc = androidKeyToXKeycode(event.keyCode) ?: return super.dispatchKeyEvent(event)
+            when (event.action) {
+                KeyEvent.ACTION_DOWN -> {
+                    Log.i(TAG, "key DOWN kc=${event.keyCode} -> X11 ${xkc.name}")
+                    srv.xServer.injectKeyPress(xkc); return true
+                }
+                KeyEvent.ACTION_UP -> {
+                    srv.xServer.injectKeyRelease(xkc); return true
                 }
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /** Wire touchscreen-as-mouse input on the XServerView (the GL surface
+     *  that overlays vulkanSurface). Touches are translated to X11 pointer
+     *  events on the wrapped XServer. */
+    private fun wireXServerViewInput(xsv: com.winlator.widget.XServerView) {
+        xsv.isFocusable = true
+        xsv.isFocusableInTouchMode = true
+        xsv.setOnTouchListener { v, event ->
+            val srv = xConnectorX11 ?: return@setOnTouchListener false
+            val w = v.width
+            val h = v.height
+            if (w <= 0 || h <= 0) return@setOnTouchListener false
+            val sw = srv.xServer.screenInfo.width
+            val sh = srv.xServer.screenInfo.height
+            val x = (event.x * sw / w).toInt().coerceIn(0, sw - 1)
+            val y = (event.y * sh / h).toInt().coerceIn(0, sh - 1)
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    Log.i(TAG, "touch DOWN -> X11 ($x,$y)")
+                    srv.xServer.injectPointerMove(x, y)
+                    srv.xServer.injectPointerButtonPress(com.winlator.xserver.Pointer.Button.BUTTON_LEFT)
+                }
+                MotionEvent.ACTION_MOVE -> srv.xServer.injectPointerMove(x, y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    Log.i(TAG, "touch UP   -> X11 ($x,$y)")
+                    srv.xServer.injectPointerMove(x, y)
+                    srv.xServer.injectPointerButtonRelease(com.winlator.xserver.Pointer.Button.BUTTON_LEFT)
+                }
+            }
+            true
+        }
+    }
+
+    /** Map common Android KeyEvent codes to X11 keycodes (XKeycode enum).
+     *  Returns null for keys we deliberately don't forward (Back, Volume,
+     *  Menu, Search, etc). Covers letters, digits, arrows, function keys,
+     *  modifiers, and common nav so menu navigation in games works
+     *  with USB/BT keyboards or remapped device keys. */
+    private fun androidKeyToXKeycode(kc: Int): com.winlator.xserver.XKeycode? {
+        return when (kc) {
+            KeyEvent.KEYCODE_A -> K.KEY_A; KeyEvent.KEYCODE_B -> K.KEY_B
+            KeyEvent.KEYCODE_C -> K.KEY_C; KeyEvent.KEYCODE_D -> K.KEY_D
+            KeyEvent.KEYCODE_E -> K.KEY_E; KeyEvent.KEYCODE_F -> K.KEY_F
+            KeyEvent.KEYCODE_G -> K.KEY_G; KeyEvent.KEYCODE_H -> K.KEY_H
+            KeyEvent.KEYCODE_I -> K.KEY_I; KeyEvent.KEYCODE_J -> K.KEY_J
+            KeyEvent.KEYCODE_K -> K.KEY_K; KeyEvent.KEYCODE_L -> K.KEY_L
+            KeyEvent.KEYCODE_M -> K.KEY_M; KeyEvent.KEYCODE_N -> K.KEY_N
+            KeyEvent.KEYCODE_O -> K.KEY_O; KeyEvent.KEYCODE_P -> K.KEY_P
+            KeyEvent.KEYCODE_Q -> K.KEY_Q; KeyEvent.KEYCODE_R -> K.KEY_R
+            KeyEvent.KEYCODE_S -> K.KEY_S; KeyEvent.KEYCODE_T -> K.KEY_T
+            KeyEvent.KEYCODE_U -> K.KEY_U; KeyEvent.KEYCODE_V -> K.KEY_V
+            KeyEvent.KEYCODE_W -> K.KEY_W; KeyEvent.KEYCODE_X -> K.KEY_X
+            KeyEvent.KEYCODE_Y -> K.KEY_Y; KeyEvent.KEYCODE_Z -> K.KEY_Z
+            KeyEvent.KEYCODE_0 -> K.KEY_0; KeyEvent.KEYCODE_1 -> K.KEY_1
+            KeyEvent.KEYCODE_2 -> K.KEY_2; KeyEvent.KEYCODE_3 -> K.KEY_3
+            KeyEvent.KEYCODE_4 -> K.KEY_4; KeyEvent.KEYCODE_5 -> K.KEY_5
+            KeyEvent.KEYCODE_6 -> K.KEY_6; KeyEvent.KEYCODE_7 -> K.KEY_7
+            KeyEvent.KEYCODE_8 -> K.KEY_8; KeyEvent.KEYCODE_9 -> K.KEY_9
+            KeyEvent.KEYCODE_DPAD_UP -> K.KEY_UP
+            KeyEvent.KEYCODE_DPAD_DOWN -> K.KEY_DOWN
+            KeyEvent.KEYCODE_DPAD_LEFT -> K.KEY_LEFT
+            KeyEvent.KEYCODE_DPAD_RIGHT -> K.KEY_RIGHT
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_NUMPAD_ENTER -> K.KEY_ENTER
+            KeyEvent.KEYCODE_ESCAPE -> K.KEY_ESC
+            KeyEvent.KEYCODE_TAB -> K.KEY_TAB
+            KeyEvent.KEYCODE_SPACE -> K.KEY_SPACE
+            KeyEvent.KEYCODE_DEL -> K.KEY_BKSP
+            KeyEvent.KEYCODE_FORWARD_DEL -> K.KEY_DEL
+            KeyEvent.KEYCODE_INSERT -> K.KEY_INSERT
+            KeyEvent.KEYCODE_MOVE_HOME -> K.KEY_HOME
+            KeyEvent.KEYCODE_MOVE_END -> K.KEY_END
+            KeyEvent.KEYCODE_PAGE_UP -> K.KEY_PRIOR
+            KeyEvent.KEYCODE_PAGE_DOWN -> K.KEY_NEXT
+            KeyEvent.KEYCODE_SHIFT_LEFT -> K.KEY_SHIFT_L
+            KeyEvent.KEYCODE_SHIFT_RIGHT -> K.KEY_SHIFT_R
+            KeyEvent.KEYCODE_CTRL_LEFT -> K.KEY_CTRL_L
+            KeyEvent.KEYCODE_CTRL_RIGHT -> K.KEY_CTRL_R
+            KeyEvent.KEYCODE_ALT_LEFT -> K.KEY_ALT_L
+            KeyEvent.KEYCODE_ALT_RIGHT -> K.KEY_ALT_R
+            KeyEvent.KEYCODE_F1 -> K.KEY_F1; KeyEvent.KEYCODE_F2 -> K.KEY_F2
+            KeyEvent.KEYCODE_F3 -> K.KEY_F3; KeyEvent.KEYCODE_F4 -> K.KEY_F4
+            KeyEvent.KEYCODE_F5 -> K.KEY_F5; KeyEvent.KEYCODE_F6 -> K.KEY_F6
+            KeyEvent.KEYCODE_F7 -> K.KEY_F7; KeyEvent.KEYCODE_F8 -> K.KEY_F8
+            KeyEvent.KEYCODE_F9 -> K.KEY_F9; KeyEvent.KEYCODE_F10 -> K.KEY_F10
+            KeyEvent.KEYCODE_F11 -> K.KEY_F11; KeyEvent.KEYCODE_F12 -> K.KEY_F12
+            KeyEvent.KEYCODE_COMMA -> K.KEY_COMMA
+            KeyEvent.KEYCODE_PERIOD -> K.KEY_PERIOD
+            KeyEvent.KEYCODE_SLASH -> K.KEY_SLASH
+            KeyEvent.KEYCODE_SEMICOLON -> K.KEY_SEMICOLON
+            KeyEvent.KEYCODE_APOSTROPHE -> K.KEY_APOSTROPHE
+            KeyEvent.KEYCODE_GRAVE -> K.KEY_GRAVE
+            KeyEvent.KEYCODE_MINUS -> K.KEY_MINUS
+            KeyEvent.KEYCODE_EQUALS -> K.KEY_EQUAL
+            KeyEvent.KEYCODE_LEFT_BRACKET -> K.KEY_BRACKET_LEFT
+            KeyEvent.KEYCODE_RIGHT_BRACKET -> K.KEY_BRACKET_RIGHT
+            KeyEvent.KEYCODE_BACKSLASH -> K.KEY_BACKSLASH
+            else -> null
+        }
     }
 
     override fun onDestroy() {
