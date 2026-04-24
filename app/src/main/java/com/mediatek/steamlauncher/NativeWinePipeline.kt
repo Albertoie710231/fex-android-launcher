@@ -741,6 +741,104 @@ class NativeWinePipeline(private val context: Context) {
     }
 
     /**
+     * Make wine able to run 32-bit .NET executables in our chimera prefix.
+     * Three pieces:
+     *   1. libwow64fex.dll in drive_c/windows/system32/ — wine's wow64 host
+     *      loads this from the prefix system32 path (not the wine lib tree)
+     *      to JIT x86 → ARM64. Without it, any 32-bit PE fails with
+     *      `wow:load_64bit_module ... c0000135`.
+     *   2. drive_c/windows/syswow64/ — populated by symlinking each wine 32-bit
+     *      DLL from proton9/lib/wine/i386-windows/. Wine looks here for
+     *      kernel32/ntdll/user32/etc when running a 32-bit PE. Symlinks (vs
+     *      copies) save 277 MB of disk; wine's PE loader follows them fine.
+     *   3. wine-mono via msiexec — Steamless.CLI.exe is .NET 4.x; wine's
+     *      mscoree.dll stub needs an actual mono runtime registered. The
+     *      wine-mono-11.0.0-x86.msi (~86 MB) installs to drive_c/windows/mono/
+     *      and registers `Wine Mono Runtime` in the prefix registry.
+     *
+     * Sentinel-gated; on first launch installs everything, then no-ops.
+     * Required only for SteamStub-DRM games that need on-tablet Steamless;
+     * regular game launches don't trigger this.
+     */
+    private fun ensureWineMonoAndWow64Bits(useProton9: Boolean): Boolean {
+        try {
+            val sentinel = File(dataDir, ".wine_mono_wow64_v1")
+            val prefixWindows = File(
+                "$dataDir/proton10/prefix/.wine/drive_c/windows"
+            )
+            if (!prefixWindows.exists()) return false
+
+            // (1) libwow64fex.dll → system32
+            val libwow64Src =
+                File("$dataDir/proton10/lib/wine/aarch64-windows/libwow64fex.dll")
+            val libwow64Dst = File(prefixWindows, "system32/libwow64fex.dll")
+            if (libwow64Src.exists() &&
+                (!libwow64Dst.exists() || libwow64Dst.length() != libwow64Src.length())
+            ) {
+                libwow64Src.copyTo(libwow64Dst, overwrite = true)
+                Log.i(TAG, "Deployed libwow64fex.dll to drive_c/windows/system32")
+            }
+
+            // (2) syswow64 symlinks
+            val syswow64 = File(prefixWindows, "syswow64")
+            val i386Lib = File(
+                if (useProton9) "$dataDir/proton9/lib/wine/i386-windows"
+                else "$dataDir/proton10/lib/wine/i386-windows"
+            )
+            if (i386Lib.exists()) {
+                syswow64.mkdirs()
+                val current = syswow64.list()?.toSet() ?: emptySet()
+                val srcFiles = i386Lib.listFiles { f -> f.isFile } ?: emptyArray()
+                if (srcFiles.size > current.size) {
+                    var made = 0
+                    for (src in srcFiles) {
+                        val dst = File(syswow64, src.name)
+                        if (dst.exists()) continue
+                        try {
+                            java.nio.file.Files.createSymbolicLink(
+                                dst.toPath(), src.toPath()
+                            )
+                            made++
+                        } catch (_: Throwable) {
+                            src.copyTo(dst, overwrite = true)
+                            made++
+                        }
+                    }
+                    if (made > 0) Log.i(TAG, "syswow64: linked $made files from i386-windows")
+                }
+            }
+
+            // (3) wine-mono via msiexec (slow — 5-10s; gate behind sentinel)
+            val monoDir = File(prefixWindows, "mono/mono-2.0")
+            if (!monoDir.exists() || !sentinel.exists()) {
+                val msiHost = File(dataDir, "wine-mono-11.0.0-x86.msi")
+                if (!msiHost.exists() || msiHost.length() != 86_029_824L) {
+                    context.assets.open("productize/wine-mono-11.0.0-x86.msi").use {
+                        msiHost.writeBytes(it.readBytes())
+                    }
+                }
+                if (!monoDir.exists()) {
+                    val msiGuest =
+                        "Z:\\data\\user\\0\\com.mediatek.steamlauncher\\files\\wine-mono-11.0.0-x86.msi"
+                    Log.i(TAG, "Installing wine-mono via msiexec (~5-10s)")
+                    val r = wineRun(
+                        args = listOf("msiexec", "/i", msiGuest, "/quiet"),
+                        timeoutMs = 300_000,
+                        useProton9 = useProton9,
+                    )
+                    Log.i(TAG, "wine-mono msiexec exit=${r.exitCode}, mono dir present: ${monoDir.exists()}")
+                    if (!monoDir.exists()) return false
+                }
+                sentinel.writeText("v1\n")
+            }
+            return true
+        } catch (t: Throwable) {
+            Log.e(TAG, "ensureWineMonoAndWow64Bits failed", t)
+            return false
+        }
+    }
+
+    /**
      * Strip SteamStub DRM from a game executable using Steamless. Produces
      * `<exe>.unpacked.exe` which is the DRM-free version. Idempotent — skips
      * if the unpacked output already exists and is newer than the wrapped
@@ -764,6 +862,9 @@ class NativeWinePipeline(private val context: Context) {
             return "$guestExePath.unpacked.exe"
         }
         Log.i(TAG, "Steamless: unpacking $guestExePath")
+        // .NET runtime + WoW64 prereqs for Steamless.CLI.exe (32-bit .NET PE).
+        // No-op once installed (sentinel-gated).
+        ensureWineMonoAndWow64Bits(useProton9)
         val cliExe = "C:\\Steamless\\Steamless.CLI.exe"
         val r = wineRun(
             args = listOf(cliExe, guestExePath),
