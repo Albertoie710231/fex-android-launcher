@@ -1341,6 +1341,14 @@ class NativeWinePipeline(private val context: Context) {
             put("ENABLE_BCN_COMPUTE", "1")
             put("ENABLE_UTIL_LAYER", "1")
             put("BCN_COMPUTE_AUTO", "1")
+            // Force CPU-side BCn texture decompression. Mali GPUs have no
+            // hardware BC1-BC7; leegao's wrapper can either compute-shader
+            // emulate (faster, but buggy in some games) or CPU-decompress
+            // (slower, more reliable). Sekiro hits c0000005 access violations
+            // with the compute-shader path during area load — `USE_CPU_BCN=all`
+            // is the documented fix from prior session experimenting with
+            // leegao v0.0.5r5. (See archive: MEDIATEK-DIRVERS-TEST 2026-04-03.)
+            put("USE_CPU_BCN", "all")
             // Custom implicit Vulkan layer that forces dualSrcBlend,
             // logicOp, shaderStorageImageExtendedFormats to VK_TRUE in
             // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as

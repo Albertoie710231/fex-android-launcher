@@ -29,8 +29,8 @@ import com.winlator.winhandler.WinHandler
  */
 class XConnectorX11Server(
     private val context: Context,
-    width: Int = 1920,
-    height: Int = 1080,
+    width: Int = 1280,
+    height: Int = 720,
 ) {
     companion object { private const val TAG = "XConnectorX11Server" }
 
