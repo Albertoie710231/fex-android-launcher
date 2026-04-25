@@ -1377,6 +1377,24 @@ class NativeWinePipeline(private val context: Context) {
             // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as
             // FALSE which blocks DXVK's FL11_0 check.
             put("SPOOF_FEATURES", "1")
+            // Phase-0 dedup probe: hashes vkUpdateDescriptorSets writes,
+            // logs duplicate-content rate periodically. Decides whether
+            // the descriptor-set deduplication direction is engineering-
+            // worthy. Logs land in ys9_stderr.live.log as "[dedup_probe]"
+            // lines. Toggle off by removing this env or DEDUP_PROBE_DISABLE=1.
+            // Phase-0 result: <0.4% dup over 70k writes — dedup direction
+            // dead. Disabled to avoid spending cycles on the hash table.
+            // put("DEDUP_PROBE", "1")
+            // mali_alloc_probe: tests whether vkAllocateDescriptorSets mmaps
+            // /dev/mali0 per call (PC=0.07/submit, tablet=234/submit). If
+            // mali0 VMA count grows linearly with allocate calls, the leegao
+            // wrapper or kbase driver is doing a per-set mmap and pooling at
+            // the descriptor-set level (not just pool level, which DXVK
+            // already does) is the lever. If mali0 stays flat, slowness is
+            // CPU work in the wrapper or sync — different fix needed.
+            // Logs as "[mali_alloc_probe]" in ys9_stderr.live.log every
+            // 1000 vkAllocateDescriptorSets calls.
+            put("MALI_ALLOC_PROBE", "1")
             // VK_GC layer: periodically vkDeviceWaitIdle to nudge Mali
             // driver cleanup; logs VkDeviceMemory alloc/free metrics to
             // stderr. See fex-emu/vulkan_gc_layer.c. Layer .so +

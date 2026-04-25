@@ -1,0 +1,21 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_MALI_ALLOC_PROBE",
+        "type": "GLOBAL",
+        "library_path": "libmali_alloc_probe.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Probe: count vkAllocateDescriptorSets calls + sample mali0 VMA growth.",
+        "functions": {
+            "vkGetInstanceProcAddr": "MaliProbe_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "MaliProbe_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "MALI_ALLOC_PROBE": "1"
+        },
+        "disable_environment": {
+            "MALI_ALLOC_PROBE_DISABLE": "1"
+        }
+    }
+}
