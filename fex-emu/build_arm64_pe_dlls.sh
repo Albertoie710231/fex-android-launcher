@@ -143,17 +143,61 @@ endian     = 'little'
 CROSS
 }
 
+# Chimera variant: produces x86_64 PE DLLs. See
+# memory/project_proton10_chimera_reproduction.md — the currently-working
+# on-device DXVK set is x86_64, not ARM64EC. Wine's WoW64 loads these and
+# FEX JIT-translates every D3D11 call. DO NOT COMMIT swapping stage_dxvk
+# to this — it's a local override for our Sekiro VkImageView leak patch.
+_meson_cross_x86_64() {
+    cat <<'CROSS'
+[binaries]
+c         = 'x86_64-w64-mingw32-clang'
+cpp       = 'x86_64-w64-mingw32-clang++'
+ar        = 'x86_64-w64-mingw32-ar'
+strip     = 'x86_64-w64-mingw32-strip'
+windres   = 'x86_64-w64-mingw32-windres'
+widl      = 'x86_64-w64-mingw32-widl'
+pkgconfig = 'pkg-config'
+
+[properties]
+needs_exe_wrapper = true
+
+[host_machine]
+system     = 'windows'
+cpu_family = 'x86_64'
+cpu        = 'x86_64'
+endian     = 'little'
+CROSS
+}
+
 stage_dxvk() {
-    echo "==> DXVK (ARM64EC)"
-    local cross; cross="$(_meson_cross_arm64ec)"
-    run_in_image "$(cat <<SH
+    # Use DXVK_SRC_OVERRIDE env to build a custom DXVK tree (e.g. DXVK-Sarek)
+    # instead of the Proton-Arm64 submodule. Path on host; mounted into the
+    # container as /src-dxvk-override:ro.
+    local src_dxvk_path
+    if [ -n "${DXVK_SRC_OVERRIDE:-}" ]; then
+        src_dxvk_path="${DXVK_SRC_OVERRIDE}"
+        echo "==> DXVK (x86_64 — chimera) [override: ${src_dxvk_path}]"
+    else
+        src_dxvk_path="${PROTON_SRC}/dxvk"
+        echo "==> DXVK (x86_64 — chimera)"
+    fi
+    local cross; cross="$(_meson_cross_x86_64)"
+    docker run --rm --platform linux/amd64 \
+        -v "${PROTON_SRC}:/src:ro" \
+        -v "${src_dxvk_path}:/src-dxvk:ro" \
+        -v "${STAGED}:/out" \
+        -w /work \
+        "${IMAGE_TAG}" \
+        bash -c "$(cat <<SH
 set -euo pipefail
-cp -a /src/dxvk /work/dxvk && cd /work/dxvk
+cp -a /src-dxvk /work/dxvk && cd /work/dxvk
 cat > /work/cross.txt <<'EOF'
 ${cross}
 EOF
 meson setup /work/dxvk-build \\
     --cross-file /work/cross.txt --buildtype release \\
+    -Denable_d3d9=false -Denable_d3d10=false \\
     --prefix /work/dxvk-install --bindir ''
 cd /work/dxvk-build
 ninja -j${JOBS}

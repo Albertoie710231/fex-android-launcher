@@ -122,6 +122,9 @@ typedef struct {
 /* Chain state. */
 static PFN_vkVoidFunction (*next_GetInstanceProcAddr)(VkInstance, const char*);
 
+/* Forward decls used by structs/helpers defined further down. */
+static int spoof_enabled(void);
+
 /* Downstream function pointers captured after instance create. */
 typedef void (*PFN_vkGetPhysicalDeviceFeatures)(VkPhysicalDevice, VkPhysicalDeviceFeatures*);
 static PFN_vkGetPhysicalDeviceFeatures next_GetPhysicalDeviceFeatures = NULL;
@@ -140,6 +143,84 @@ static PFN_vkGetPhysicalDeviceFeatures2 next_GetPhysicalDeviceFeatures2 = NULL;
 static PFN_vkGetPhysicalDeviceFeatures2 next_GetPhysicalDeviceFeatures2KHR = NULL;
 
 typedef VkResult (*PFN_vkCreateInstance)(const VkInstanceCreateInfo*, const void*, VkInstance*);
+
+/* vkGetPhysicalDeviceFormatProperties (and 2/2KHR variants) — used by DXVK
+ * 2.x to pre-flight format support before vkCreateImageView. The Mali wrapper
+ * does JIT BCn decompression on vkCreateImage but does NOT spoof BCn support
+ * in format-properties queries, so DXVK 2.x sees BCn unsupported and refuses
+ * to create SRVs ("D3D11: Cannot create shader resource view" with format
+ * 70-72=BC1, 95-99=BC7, etc). We force BCn formats to report SAMPLED_IMAGE +
+ * BLIT/TRANSFER bits so DXVK proceeds with view creation. */
+typedef struct VkFormatProperties {
+    uint32_t linearTilingFeatures;
+    uint32_t optimalTilingFeatures;
+    uint32_t bufferFeatures;
+} VkFormatProperties;
+typedef struct VkFormatProperties2 {
+    int32_t sType;       /* VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2 = 1000059002 */
+    void *pNext;
+    VkFormatProperties formatProperties;
+} VkFormatProperties2;
+typedef void (*PFN_vkGetPhysicalDeviceFormatProperties)(VkPhysicalDevice, int32_t, VkFormatProperties*);
+typedef void (*PFN_vkGetPhysicalDeviceFormatProperties2)(VkPhysicalDevice, int32_t, VkFormatProperties2*);
+static PFN_vkGetPhysicalDeviceFormatProperties next_GetPhysicalDeviceFormatProperties = NULL;
+static PFN_vkGetPhysicalDeviceFormatProperties2 next_GetPhysicalDeviceFormatProperties2 = NULL;
+static PFN_vkGetPhysicalDeviceFormatProperties2 next_GetPhysicalDeviceFormatProperties2KHR = NULL;
+
+/* VkFormatFeatureFlagBits we need DXVK to think are present. */
+#define VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT             0x00000001u
+#define VK_FORMAT_FEATURE_TRANSFER_SRC_BIT              0x00004000u
+#define VK_FORMAT_FEATURE_TRANSFER_DST_BIT              0x00008000u
+#define VK_FORMAT_FEATURE_BLIT_SRC_BIT                  0x00000400u
+#define VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT 0x00001000u
+
+/* True if format is one of the BC1..BC7 variants the wrapper emulates via
+ * JIT CPU decompression on vkCreateImage. VkFormat values from spec. */
+static int is_bcn_format(int32_t f) {
+    /* BC1_RGB_UNORM_BLOCK = 131 ... BC7_SRGB_BLOCK = 146 */
+    return f >= 131 && f <= 146;
+}
+
+/* The VkFormatFeatureFlags2 bits we want to inject are bit-compatible with the
+ * v1 32-bit flags for the low 16 bits we care about. Use uint64_t for v3. */
+#define BCN_SPOOF_BITS_V1 ( \
+    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | \
+    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | \
+    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | \
+    VK_FORMAT_FEATURE_TRANSFER_DST_BIT | \
+    VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+
+#define BCN_SPOOF_BITS_V3 ((uint64_t)BCN_SPOOF_BITS_V1)
+
+static void spoof_format_props(int32_t fmt, VkFormatProperties *fp) {
+    if (!spoof_enabled() || !fp || !is_bcn_format(fmt)) return;
+    /* Don't strip what the driver actually reports — additive only. */
+    fp->optimalTilingFeatures |= BCN_SPOOF_BITS_V1;
+}
+
+/* DXVK 2.x reads VkFormatProperties3 from the pNext chain of
+ * VkFormatProperties2 and uses THAT (not the v2-embedded v1 struct) for its
+ * format-features cache. We must walk the chain and patch v3 too. */
+typedef struct VkFormatProperties3 {
+    int32_t  sType;       /* VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 = 1000360000 */
+    void    *pNext;
+    uint64_t linearTilingFeatures;
+    uint64_t optimalTilingFeatures;
+    uint64_t bufferFeatures;
+} VkFormatProperties3;
+
+static void spoof_format_props2_chain(int32_t fmt, void *pNext) {
+    if (!spoof_enabled() || !is_bcn_format(fmt) || !pNext) return;
+    struct chain_hdr { int32_t sType; void *pNext; };
+    struct chain_hdr *h = (struct chain_hdr*)pNext;
+    while (h) {
+        if ((int32_t)h->sType == 1000360000) {
+            VkFormatProperties3 *fp3 = (VkFormatProperties3*)h;
+            fp3->optimalTilingFeatures |= BCN_SPOOF_BITS_V3;
+        }
+        h = (struct chain_hdr*)h->pNext;
+    }
+}
 
 /* vkCreateDevice intercept — log the VkDeviceCreateInfo DXVK passes (extensions,
  * feature chain) and the VkResult from the underlying driver, so we can tell
@@ -214,16 +295,71 @@ static int ext_cache_len = 0;
  * and crashes wine's UNIX_CALL unmarshal. 0 = unknown, don't touch. */
 static int sType_bool_count(int32_t sType) {
     switch (sType) {
+    case          53: return 15; /* PHYSICAL_DEVICE_VULKAN_1_3_FEATURES */
     case 1000028000: return 2; /* PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT */
     case 1000063000: return 1; /* PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES */
+    case 1000102000: return 1; /* PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT */
     case 1000207000: return 2; /* PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT */
     case 1000257000: return 3; /* PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES */
     case 1000261000: return 1; /* PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES */
     case 1000267000: return 1; /* PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES */
     case 1000276000: return 1; /* PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT */
+    case 1000286000: return 3; /* PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT */
     case 1000287002: return 2; /* PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR */
     case 1000340000: return 2; /* PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT */
+    case 1000470000: return 1; /* PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR */
     default: return 0;
+    }
+}
+
+/* Apply spoofs to feature structs in the pNext chain. Mirrors apply_spoof()
+ * but for the extension-side features that DXVK 2.x hard-requires for adapter
+ * acceptance. Forces TRUE on driver-reported FALSE; that's a lie, but DXVK
+ * uses these as gates for codepaths that the Mali driver actually IS able to
+ * fulfil through the wrapper's own emulation (or close enough that it doesn't
+ * crash). Mali's wrapper has been observed to tolerate the lie for these
+ * specific features.
+ *
+ * Without this, DXVK 2.7 rejects the adapter ("No adapters found, please
+ * check your device filter settings") because it requires:
+ *   - VK_EXT_robustness2: robustBufferAccess2 + nullDescriptor
+ *   - VK_EXT_depth_clip_enable: depthClipEnable
+ *   - Vulkan 1.3: synchronization2 + dynamicRendering (modern descriptor +
+ *     pipeline-library codepaths depend on these)
+ */
+static void apply_ext_spoof(void *pNext) {
+    if (!spoof_enabled() || !pNext) return;
+    struct chain_hdr { int32_t sType; void *pNext; };
+    struct chain_hdr *h = (struct chain_hdr*)pNext;
+    while (h) {
+        VkBool32 *body = (VkBool32*)(((char*)h) + sizeof(*h));
+        switch ((int32_t)h->sType) {
+        case 1000286000: /* VkPhysicalDeviceRobustness2FeaturesEXT */
+            body[0] = 1; /* robustBufferAccess2 */
+            body[1] = 1; /* robustImageAccess2  */
+            body[2] = 1; /* nullDescriptor      */
+            break;
+        case 1000102000: /* VkPhysicalDeviceDepthClipEnableFeaturesEXT */
+            body[0] = 1; /* depthClipEnable */
+            break;
+        case 1000470000: /* VkPhysicalDeviceMaintenance5FeaturesKHR */
+            body[0] = 1; /* maintenance5 */
+            break;
+        case 53: /* VkPhysicalDeviceVulkan13Features */
+            /* IMPORTANT: do NOT force sync2 / dynamicRendering / pipeline-
+             * cache-control TRUE here. Earlier attempt did, DXVK then
+             * generated SPIR-V using those modern paths, the Mali driver
+             * accepted the spoofed feature flag at adapter-create time but
+             * crashed in vkCreateShaderModule because it can't actually
+             * consume the new SPIR-V (`_wassert (vkCreateShaderModule)` in
+             * wine's vulkan loader thunk). Spoofing feature TRUE doesn't
+             * make the driver actually implement the feature. We need DXVK
+             * to take its LEGACY codepath, so leave whatever the driver
+             * reports unchanged.
+             */
+            break;
+        }
+        h = (struct chain_hdr*)h->pNext;
     }
 }
 
@@ -371,6 +507,7 @@ void FeatSpoof_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceF
         }
         dump_features_once(&f2->features, "2");
         apply_spoof(&f2->features);
+        apply_ext_spoof(f2->pNext);
     }
 }
 
@@ -386,6 +523,36 @@ void FeatSpoof_GetPhysicalDeviceFeatures2KHR(VkPhysicalDevice pd, VkPhysicalDevi
         }
         dump_features_once(&f2->features, "2KHR");
         apply_spoof(&f2->features);
+        apply_ext_spoof(f2->pNext);
+    }
+}
+
+__attribute__((visibility("default")))
+void FeatSpoof_GetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, int32_t fmt, VkFormatProperties *fp) {
+    if (next_GetPhysicalDeviceFormatProperties)
+        next_GetPhysicalDeviceFormatProperties(pd, fmt, fp);
+    spoof_format_props(fmt, fp);
+}
+
+__attribute__((visibility("default")))
+void FeatSpoof_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, int32_t fmt, VkFormatProperties2 *fp2) {
+    if (next_GetPhysicalDeviceFormatProperties2)
+        next_GetPhysicalDeviceFormatProperties2(pd, fmt, fp2);
+    if (fp2) {
+        spoof_format_props(fmt, &fp2->formatProperties);
+        spoof_format_props2_chain(fmt, fp2->pNext);
+    }
+}
+
+__attribute__((visibility("default")))
+void FeatSpoof_GetPhysicalDeviceFormatProperties2KHR(VkPhysicalDevice pd, int32_t fmt, VkFormatProperties2 *fp2) {
+    if (next_GetPhysicalDeviceFormatProperties2KHR)
+        next_GetPhysicalDeviceFormatProperties2KHR(pd, fmt, fp2);
+    else if (next_GetPhysicalDeviceFormatProperties2)
+        next_GetPhysicalDeviceFormatProperties2(pd, fmt, fp2);
+    if (fp2) {
+        spoof_format_props(fmt, &fp2->formatProperties);
+        spoof_format_props2_chain(fmt, fp2->pNext);
     }
 }
 
@@ -527,6 +694,13 @@ VkResult FeatSpoof_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const
     next_GetPhysicalDeviceFeatures2KHR =
         (PFN_vkGetPhysicalDeviceFeatures2)gipa(*pInstance, "vkGetPhysicalDeviceFeatures2KHR");
 
+    next_GetPhysicalDeviceFormatProperties =
+        (PFN_vkGetPhysicalDeviceFormatProperties)gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties");
+    next_GetPhysicalDeviceFormatProperties2 =
+        (PFN_vkGetPhysicalDeviceFormatProperties2)gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2");
+    next_GetPhysicalDeviceFormatProperties2KHR =
+        (PFN_vkGetPhysicalDeviceFormatProperties2)gipa(*pInstance, "vkGetPhysicalDeviceFormatProperties2KHR");
+
     if (spoof_enabled()) {
         fprintf(stderr,
                 "feature_spoof: instance created, spoofing active "
@@ -552,6 +726,12 @@ PFN_vkVoidFunction FeatSpoof_GetInstanceProcAddr(VkInstance instance, const char
         return (PFN_vkVoidFunction)FeatSpoof_GetPhysicalDeviceFeatures2;
     if (strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
         return (PFN_vkVoidFunction)FeatSpoof_GetPhysicalDeviceFeatures2KHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return (PFN_vkVoidFunction)FeatSpoof_GetPhysicalDeviceFormatProperties;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0)
+        return (PFN_vkVoidFunction)FeatSpoof_GetPhysicalDeviceFormatProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)FeatSpoof_GetPhysicalDeviceFormatProperties2KHR;
     if (strcmp(pName, "vkCreateDevice") == 0)
         return (PFN_vkVoidFunction)FeatSpoof_CreateDevice;
     if (next_GetInstanceProcAddr) return next_GetInstanceProcAddr(instance, pName);

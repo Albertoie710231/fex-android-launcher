@@ -595,7 +595,18 @@ class NativeWinePipeline(private val context: Context) {
                 context.assets.open("productize/dxvk/$name").use { input ->
                     val bytes = input.readBytes()
                     val dst = File(sys32, name)
-                    if (!dst.exists() || dst.length() != bytes.size.toLong()) {
+                    // Compare first 64 KB content; size-only is unsafe when
+                    // we iterate on DXVK and the new build happens to land at
+                    // the same stripped size as the old one (real risk for
+                    // the view-trim patch series).
+                    val needsWrite = !dst.exists()
+                            || dst.length() != bytes.size.toLong()
+                            || run {
+                                val probe = ByteArray(minOf(65536, bytes.size))
+                                java.io.FileInputStream(dst).use { it.read(probe) }
+                                !probe.contentEquals(bytes.copyOf(probe.size))
+                            }
+                    if (needsWrite) {
                         dst.writeBytes(bytes)
                     }
                 }
@@ -1349,9 +1360,18 @@ class NativeWinePipeline(private val context: Context) {
             // Setting `USE_CPU_BCN="bc6 bc7"` forces ONLY those two formats
             // onto the CPU path; BC1/BC2/BC3/BC4/BC5 stay on the GPU compute
             // path (smaller memory footprint, faster). `USE_CPU_BCN=all`
-            // works too but blows through swap in ~60s because every BCn
-            // texture is decompressed to ~4-8x size in RAM.
-            put("USE_CPU_BCN", "bc6 bc7")
+            // tested 2026-04-24 PM — 3-min lifetime vs 60+ min for "bc6 bc7"
+            // (RAM blowup from CPU-decoding every texture).
+            // White-skin cosmetic bug reproduces on GameNative + DXVK too,
+            // so it's wrapper/Mali-level — not fixable by swapping BCn config.
+            // 2026-04-24 PM late: experiment — try wrapper's pure GPU
+            // compute-shader BCn path (no USE_CPU_BCN). Historically this
+            // caused c0000005 area-load crashes (leegao#99) → "bc6 bc7"
+            // CPU fallback. With Sarek + active wrapper patches, may work
+            // now. If it does, biggest RAM/CPU win possible: zero CPU
+            // decode, no 4-8x texture blowup, GPU compute units do real
+            // work. If it crashes, immediately re-enable "bc6 bc7".
+            // put("USE_CPU_BCN", "bc6 bc7")  // disabled for the experiment
             // Custom implicit Vulkan layer that forces dualSrcBlend,
             // logicOp, shaderStorageImageExtendedFormats to VK_TRUE in
             // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as
@@ -1393,8 +1413,29 @@ class NativeWinePipeline(private val context: Context) {
             // the 16 GB device. cap=3072 (previous attempt) was too tight —
             // DXVK couldn't satisfy allocations and crashed in stress areas.
             // See dxvk_memory.cpp:1746 (freeEmptyChunksInPool).
+            // dxvk.imageViewMaxAgeFrames: caps DXVK's per-DxvkImage VkImageView
+            // cache by aging out views not accessed in N presented frames. On
+            // Mali every cached VkImageView costs one /dev/mali0 mmap + VMA
+            // entry; the upstream cache has no eviction (see dxvk_image.cpp
+            // DxvkImage::createView at ~line 259, which only emplaces into
+            // m_views). Our patch adds DxvkImage::trimIdleViews, called from
+            // DxvkMemoryAllocator::performTimedTasks every 500ms, using
+            // DxvkPagedResource::isInUse as the hazard check (EBR-style —
+            // command lists already acquire/release the use counter in
+            // lockstep with fence retirement). 120 frames ≈ 2 s @ 60 fps.
+            // 0 (default) keeps upstream behaviour.
+            // imageViewMaxAgeFrames=600 (10s) — comfortable trim threshold,
+            // catches idle slots without per-frame churn.
+            // imageViewMaxLive=15000 — pressure cap. If live VkImageView
+            // count exceeds this, trim does extra passes with shorter ages
+            // (down to 3-frame floor) until count fits or no more candidates.
+            // Targets ~half of the observed unpatched 38-45k peak — should
+            // shrink mali0 mmap count → faster page-table walks → higher fps.
             put("DXVK_CONFIG",
-                "dxvk.enableOpenVR=False;dxvk.enableOpenXR=False;dxvk.maxMemoryBudget=6144")
+                "dxvk.enableOpenVR=False;dxvk.enableOpenXR=False;" +
+                "dxvk.maxMemoryBudget=6144;" +
+                "dxvk.imageViewMaxAgeFrames=600;" +
+                "dxvk.imageViewMaxLive=15000")
             put("BOX64_MMAP32", "0")
             // Mesa/Zink
             put("MESA_DEBUG", "silent")
