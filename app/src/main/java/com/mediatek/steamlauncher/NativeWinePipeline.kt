@@ -1395,6 +1395,18 @@ class NativeWinePipeline(private val context: Context) {
             // Logs as "[mali_alloc_probe]" in ys9_stderr.live.log every
             // 1000 vkAllocateDescriptorSets calls.
             put("MALI_ALLOC_PROBE", "1")
+            // wrapper_pool_recycler: consolidates libbcn_layer's per-decode
+            // descriptor pools (~36k of them on Sekiro init, one per BCn
+            // texture) into shared real pools. Layer detects pools with the
+            // BCn signature (maxSets=32, types=STORAGE_IMAGE+STORAGE_BUFFER
+            // count=1 each, FREE_DESCRIPTOR_SET_BIT) and routes their
+            // allocations to a small set of real pools (REAL_POOL_MAX_SETS
+            // sets each). Non-matching pools (DXVK's main 8192-set pool, etc)
+            // pass through untouched. Expected impact: mali0_vmas drops from
+            // ~40k to ~10k, which should reduce kernel VMA-tree depth and
+            // speed up every mmap-touching code path.
+            // See fex-emu/wrapper_pool_recycler_layer.c.
+            put("WRAPPER_POOL_RECYCLER", "1")
             // VK_GC layer: periodically vkDeviceWaitIdle to nudge Mali
             // driver cleanup; logs VkDeviceMemory alloc/free metrics to
             // stderr. See fex-emu/vulkan_gc_layer.c. Layer .so +

@@ -1,0 +1,21 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_WRAPPER_POOL_RECYCLER",
+        "type": "GLOBAL",
+        "library_path": "libwrapper_pool_recycler.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Consolidates libbcn_layer's per-decode descriptor pools into shared real pools to cut /dev/mali0 mmap pressure.",
+        "functions": {
+            "vkGetInstanceProcAddr": "WPR_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "WPR_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "WRAPPER_POOL_RECYCLER": "1"
+        },
+        "disable_environment": {
+            "WRAPPER_POOL_RECYCLER_DISABLE": "1"
+        }
+    }
+}
