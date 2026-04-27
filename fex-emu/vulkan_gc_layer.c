@@ -127,6 +127,7 @@ typedef void     *VkSampler;
 typedef void     *VkDescriptorPool;
 typedef void     *VkDescriptorSet;
 typedef void     *VkFramebuffer;
+typedef void     *VkShaderModule;
 typedef VkResult (*PFN_vkCreateImageView)(VkDevice, const void*, const void*, VkImageView*);
 typedef void     (*PFN_vkDestroyImageView)(VkDevice, VkImageView, const void*);
 typedef VkResult (*PFN_vkCreateSampler)(VkDevice, const void*, const void*, VkSampler*);
@@ -136,6 +137,7 @@ typedef void     (*PFN_vkDestroyFramebuffer)(VkDevice, VkFramebuffer, const void
 typedef VkResult (*PFN_vkAllocateDescriptorSets)(VkDevice, const void*, VkDescriptorSet*);
 typedef VkResult (*PFN_vkFreeDescriptorSets)(VkDevice, VkDescriptorPool, uint32_t, const VkDescriptorSet*);
 typedef VkResult (*PFN_vkResetDescriptorPool)(VkDevice, VkDescriptorPool, uint32_t);
+typedef VkResult (*PFN_vkCreateShaderModule)(VkDevice, const void*, const void*, VkShaderModule*);
 
 static PFN_vkCreateDevice         next_CreateDevice = NULL;
 static PFN_vkQueueSubmit          next_QueueSubmit = NULL;
@@ -153,6 +155,7 @@ static PFN_vkDestroyFramebuffer   next_DestroyFramebuffer = NULL;
 static PFN_vkAllocateDescriptorSets next_AllocateDescriptorSets = NULL;
 static PFN_vkFreeDescriptorSets   next_FreeDescriptorSets = NULL;
 static PFN_vkResetDescriptorPool  next_ResetDescriptorPool = NULL;
+static PFN_vkCreateShaderModule   next_CreateShaderModule = NULL;
 
 /* Single-device simplification: remember the one VkDevice we wrap. DXVK in
  * this pipeline only creates one. If that ever changes, revisit. */
@@ -170,6 +173,8 @@ static _Atomic uint64_t g_iv_create = 0, g_iv_destroy = 0;
 static _Atomic uint64_t g_sampler_create = 0, g_sampler_destroy = 0;
 static _Atomic uint64_t g_fb_create = 0, g_fb_destroy = 0;
 static _Atomic uint64_t g_ds_alloc = 0, g_ds_free = 0, g_ds_pool_reset = 0;
+static _Atomic uint64_t g_sm_create = 0, g_sm_fail = 0;
+static _Atomic uint64_t g_alloc_fail = 0;
 
 static int gc_enabled(void) {
     const char *e = getenv("VK_GC_ENABLE");
@@ -193,24 +198,27 @@ static uint64_t gc_log_every(void) {
 static void gc_log_stats(const char *tag) {
     uint64_t s = atomic_load(&g_submit_count);
     uint64_t a = atomic_load(&g_alloc_count);
+    uint64_t af = atomic_load(&g_alloc_fail);
     uint64_t f = atomic_load(&g_free_count);
     uint64_t w = atomic_load(&g_waitidle_count);
     uint64_t iv_c = atomic_load(&g_iv_create), iv_d = atomic_load(&g_iv_destroy);
     uint64_t sm_c = atomic_load(&g_sampler_create), sm_d = atomic_load(&g_sampler_destroy);
     uint64_t fb_c = atomic_load(&g_fb_create), fb_d = atomic_load(&g_fb_destroy);
     uint64_t ds_a = atomic_load(&g_ds_alloc), ds_f = atomic_load(&g_ds_free), ds_r = atomic_load(&g_ds_pool_reset);
+    uint64_t shm_c = atomic_load(&g_sm_create), shm_f = atomic_load(&g_sm_fail);
     fprintf(stderr,
-            "[vk_gc %s] submit=%llu | mem(alloc=%llu free=%llu live=%lld) "
+            "[vk_gc %s] submit=%llu | mem(alloc=%llu fail=%llu free=%llu live=%lld) "
             "| IV(c=%llu d=%llu live=%lld) | Sampler(c=%llu d=%llu live=%lld) "
             "| FB(c=%llu d=%llu live=%lld) | DS(a=%llu f=%llu reset=%llu live=%lld) "
-            "| waitIdle=%llu\n",
+            "| ShM(c=%llu fail=%llu) | waitIdle=%llu\n",
             tag,
             (unsigned long long)s,
-            (unsigned long long)a, (unsigned long long)f, (long long)(a-f),
+            (unsigned long long)a, (unsigned long long)af, (unsigned long long)f, (long long)(a-f),
             (unsigned long long)iv_c, (unsigned long long)iv_d, (long long)(iv_c-iv_d),
             (unsigned long long)sm_c, (unsigned long long)sm_d, (long long)(sm_c-sm_d),
             (unsigned long long)fb_c, (unsigned long long)fb_d, (long long)(fb_c-fb_d),
             (unsigned long long)ds_a, (unsigned long long)ds_f, (unsigned long long)ds_r, (long long)(ds_a-ds_f),
+            (unsigned long long)shm_c, (unsigned long long)shm_f,
             (unsigned long long)w);
     fflush(stderr);
 }
@@ -259,7 +267,53 @@ VkResult VkGc_AllocateMemory(VkDevice device, const void *pInfo,
                              const void *pAllocator, VkDeviceMemory *pMem) {
     VkResult r = next_AllocateMemory ? next_AllocateMemory(device, pInfo, pAllocator, pMem)
                                      : (VkResult)-1;
-    if (r == 0) atomic_fetch_add(&g_alloc_count, 1);
+    if (r == 0) {
+        atomic_fetch_add(&g_alloc_count, 1);
+    } else if (pInfo) {
+        /* VkMemoryAllocateInfo on 64-bit Linux:
+         *   off  0: sType (4) | off  4: pad | off  8: pNext (8)
+         *   off 16: allocationSize (VkDeviceSize, 8) | off 24: memoryTypeIndex (4)
+         * Log every failure immediately — this is the cause hypothesis 1
+         * signal for DS3 (wrapper returns OUT_OF_HOST_MEMORY at peak). */
+        atomic_fetch_add(&g_alloc_fail, 1);
+        uint64_t sz = *((const uint64_t*)((const char*)pInfo + 16));
+        uint32_t mti = *((const uint32_t*)((const char*)pInfo + 24));
+        uint64_t s = atomic_load(&g_submit_count);
+        fprintf(stderr,
+                "[vk_gc FAIL] AllocateMemory result=%d size=%llu type=%u submit=%llu\n",
+                (int)r, (unsigned long long)sz, mti, (unsigned long long)s);
+        fflush(stderr);
+    }
+    return r;
+}
+
+__attribute__((visibility("default")))
+VkResult VkGc_CreateShaderModule(VkDevice device, const void *pInfo,
+                                 const void *pAllocator, VkShaderModule *pSm) {
+    VkResult r = next_CreateShaderModule ? next_CreateShaderModule(device, pInfo, pAllocator, pSm)
+                                         : (VkResult)-1;
+    if (r == 0) {
+        atomic_fetch_add(&g_sm_create, 1);
+    } else if (pInfo) {
+        /* VkShaderModuleCreateInfo on 64-bit Linux:
+         *   off  0: sType (4) | off  4: pad | off  8: pNext (8)
+         *   off 16: flags (4) + 4 pad | off 24: codeSize (size_t, 8) | off 32: pCode (8)
+         * DS3 _wassert is "!status && vkCreateShaderModule" — this fires
+         * exactly once per crash and tells us whether wrapper said FAIL or
+         * if winevulkan is asserting on a non-zero NTSTATUS with VkResult=0
+         * (cause hypothesis 2). */
+        atomic_fetch_add(&g_sm_fail, 1);
+        uint64_t code_size = *((const uint64_t*)((const char*)pInfo + 24));
+        uint64_t s = atomic_load(&g_submit_count);
+        uint64_t a_ok = atomic_load(&g_alloc_count);
+        uint64_t a_fail = atomic_load(&g_alloc_fail);
+        fprintf(stderr,
+                "[vk_gc FAIL] CreateShaderModule result=%d codeSize=%llu submit=%llu "
+                "alloc_ok=%llu alloc_fail=%llu\n",
+                (int)r, (unsigned long long)code_size, (unsigned long long)s,
+                (unsigned long long)a_ok, (unsigned long long)a_fail);
+        fflush(stderr);
+    }
     return r;
 }
 
@@ -373,6 +427,7 @@ VkResult VkGc_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *pCreat
     next_AllocateDescriptorSets=(PFN_vkAllocateDescriptorSets)next_gdpa(*pDevice, "vkAllocateDescriptorSets");
     next_FreeDescriptorSets=(PFN_vkFreeDescriptorSets)next_gdpa(*pDevice, "vkFreeDescriptorSets");
     next_ResetDescriptorPool=(PFN_vkResetDescriptorPool)next_gdpa(*pDevice, "vkResetDescriptorPool");
+    next_CreateShaderModule=(PFN_vkCreateShaderModule)next_gdpa(*pDevice, "vkCreateShaderModule");
 
     g_device = *pDevice;
 
@@ -437,6 +492,7 @@ PFN_vkVoidFunction VkGc_GetDeviceProcAddr(VkDevice device, const char *pName) {
     if (!strcmp(pName, "vkAllocateDescriptorSets")) return (PFN_vkVoidFunction)VkGc_AllocateDescriptorSets;
     if (!strcmp(pName, "vkFreeDescriptorSets"))     return (PFN_vkVoidFunction)VkGc_FreeDescriptorSets;
     if (!strcmp(pName, "vkResetDescriptorPool"))    return (PFN_vkVoidFunction)VkGc_ResetDescriptorPool;
+    if (!strcmp(pName, "vkCreateShaderModule"))     return (PFN_vkVoidFunction)VkGc_CreateShaderModule;
     if (!strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)VkGc_GetDeviceProcAddr;
     if (next_GetDeviceProcAddr) return next_GetDeviceProcAddr(device, pName);
     return NULL;
