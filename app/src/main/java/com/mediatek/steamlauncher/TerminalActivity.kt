@@ -677,6 +677,21 @@ class TerminalActivity : AppCompatActivity() {
         // white-screen on Mali), FORCE_OPTIMIZATION_BARRIERS + COMPOSITE.
         findViewById<Button>(R.id.btnLaunchDS3).setOnClickListener {
             appendOutput("=== wine DarkSoulsIII.exe (native Bionic) ===\n")
+            // DXVK pipeline-state cache fragility on this stack: any abnormal
+            // termination (wassert kill, force-stop, hang) leaves a partial
+            // last entry. Replay reads garbage, the 5 compiler threads NULL-
+            // deref, and subsequent runs hit a c0000005 storm at startup
+            // without ever reaching device-ready state. Wipe before each
+            // launch — cheap, costs ~30s of recompile on first frames.
+            val ds3DxvkCache = java.io.File(
+                filesDir,
+                "imagefs_bionic/home/xuser/.cache/DarkSoulsIII.dxvk-cache",
+            )
+            if (ds3DxvkCache.exists()) {
+                val sz = ds3DxvkCache.length()
+                ds3DxvkCache.delete()
+                appendOutput("[DS3 dxvk-cache wiped (${sz} bytes)]\n")
+            }
             if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
                 xConnectorX11 = XConnectorX11Server(this).apply {
                     val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"

@@ -49,9 +49,12 @@ import sys
 # guards entry. NOPing the CBNZ short-circuits the assert path.
 NOP = 0xD503201F
 SITES = [
-    (0xb9d0,  0x350000a0, 'site #1: thunk pre-asserting "!status && \\"vkCreateShaderModule\\""'),
-    (0x1b010, 0x350000a0, 'site #2: thunk pre-asserting "!status && \\"vkCreateShaderModule\\""'),
+    (0xb9d0,  0x350000a0, 'thunk pre-asserting "!status && \\"vkCreateShaderModule\\""'),
+    (0x1b010, 0x350000a0, 'thunk pre-asserting "!status && \\"vkCreateShaderModule\\""'),
 ]
+# Kept as the 2-site cause-confirmation scaffold. The full fix is in
+# patch_winevulkan_proton9_thunks_all.py (all 682 loader thunks) — see that
+# script for the production patch and state_ds3.md for the rationale.
 EXPECTED_MD5 = '82245152ee8472c8d98080e7a7c15a14'
 EXPECTED_SIZE = 610304
 
