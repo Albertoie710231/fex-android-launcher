@@ -82,6 +82,8 @@ SHIM_CPP_OBJ="/tmp/spv_instrumenter.o"
 "$CXX" \
     -I"$VULKAN_INCLUDE" \
     -I"$SPIRV_TOOLS_SRC/include" \
+    -I"$SPIRV_TOOLS_SRC" \
+    -I"$SPIRV_TOOLS_BUILD" \
     -I"$SPIRV_HEADERS_SRC/include" \
     -O2 -Wall -Wextra -fPIC -std=c++17 \
     -c "$SCRIPT_DIR/spv_instrumenter.cpp" \

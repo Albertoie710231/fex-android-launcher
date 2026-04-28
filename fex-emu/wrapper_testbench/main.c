@@ -1131,6 +1131,50 @@ static void test_null_subst_via_template(void) {
     cleanup_single_binding_set(pool, layout);
 }
 
+/* Verifies that the shim's SPIR-V pass correctly identified the OOB
+ * probe shader's SSBO loads. The probe has 1 OpLoad, and that load is
+ * through a StorageBuffer descriptor. After running the probe through
+ * the hook, the pass's descriptor-load counter must have advanced by
+ * at least 1. */
+static void test_spirv_pass_identifies_descriptor_loads(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *desc_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_descriptor_loads_seen");
+    if (!desc_cnt) {
+        SKIP("spirv_pass_identifies_descriptor_loads", "shim counter symbol not present");
+        return;
+    }
+    int before = *desc_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_probe_spv_len,
+        .pCode = (const uint32_t *)oob_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *desc_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        FAIL("spirv_pass_identifies_descriptor_loads", "vkCreateShaderModule rejected: %s", vkresult_str(r));
+        return;
+    }
+    /* The OOB probe shader has 2 SSBO loads (input[1024] AND outdata[0]
+     * referenced for store path; the store of value into outdata[0]
+     * uses an OpStore not OpLoad, so we mainly count input[1024]'s
+     * load). At minimum, 1 descriptor load should be seen. */
+    if (after - before >= 1)
+        PASS("spirv_pass_identifies_descriptor_loads",
+             "pass found %d descriptor-load(s) in OOB probe (counter %d→%d)",
+             after - before, before, after);
+    else
+        FAIL("spirv_pass_identifies_descriptor_loads",
+             "pass found 0 descriptor loads (counter stuck at %d) — pass not navigating SPIR-V correctly",
+             before);
+}
+
 /* Verifies the shim's vkCreateShaderModule hook actually routes through
  * the SPIR-V instrumenter. Counter symbol is dlsym'd from the loaded
  * shim .so; missing in PASS A. We just create a shader module from the
@@ -1507,6 +1551,7 @@ int main(int argc, char **argv) {
     test_null_subst_storage_buffer_incomplete();
     test_null_subst_via_template();
     test_spirv_hook_fires();
+    test_spirv_pass_identifies_descriptor_loads();
     test_mali_oob_ssbo_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);

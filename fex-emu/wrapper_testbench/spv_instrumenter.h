@@ -18,6 +18,8 @@ int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
 void shim_spv_free(uint32_t *code);
 
 extern volatile int shim_m5_spirv_instrument_count;
+extern volatile int shim_m5_spirv_loads_seen;
+extern volatile int shim_m5_spirv_descriptor_loads_seen;
 
 #ifdef __cplusplus
 }
