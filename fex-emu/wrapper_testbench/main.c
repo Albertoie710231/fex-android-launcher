@@ -451,6 +451,22 @@ static void test_maintenance5_record(void) {
 
 /* --- Per-entrypoint behavior tests (sharper than maintenance5_dispatch) --- */
 
+/* Helper: returns 1 if the named device extension is in the ext list. */
+static int device_ext_present(const char *want) {
+    PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties =
+        (PFN_vkEnumerateDeviceExtensionProperties)
+        g_vkGetInstanceProcAddr(g_instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, NULL);
+    VkExtensionProperties *ex = calloc(n, sizeof(*ex));
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, ex);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(ex[i].extensionName, want)) { has = 1; break; }
+    free(ex);
+    return has;
+}
+
 /* Helper: returns 1 if VK_KHR_maintenance5 is in the device ext list. */
 static int maintenance5_present(void) {
     PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties =
@@ -785,6 +801,335 @@ static void test_maintenance5_properties2(void) {
         PASS("maintenance5_properties2", "all 6 maintenance5 properties written");
 }
 
+/* DXVK 2.7.1 gates adapter acceptance on VkPhysicalDeviceRobustness2FeaturesEXT
+ * with all three bools (robustBufferAccess2 / robustImageAccess2 /
+ * nullDescriptor) set. Sentinel-pattern check that the shim wrote them
+ * all to VK_TRUE. */
+static void test_robustness2_features2(void) {
+    /* Robustness2 is injected as an extension by the shim; in PASS A
+     * (vanilla wrapper) the extension isn't present and there's nothing
+     * to test. */
+    PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties =
+        (PFN_vkEnumerateDeviceExtensionProperties)
+        g_vkGetInstanceProcAddr(g_instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, NULL);
+    VkExtensionProperties *ex = calloc(n, sizeof(*ex));
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, ex);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(ex[i].extensionName, "VK_EXT_robustness2")) { has = 1; break; }
+    free(ex);
+    if (!has) { SKIP("robustness2_features2", "VK_EXT_robustness2 not present"); return; }
+
+    PFN_vkGetPhysicalDeviceFeatures2 fn =
+        (PFN_vkGetPhysicalDeviceFeatures2)g_vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!fn) { FAIL("robustness2_features2", "vkGetPhysicalDeviceFeatures2 not exposed"); return; }
+
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+        .pNext = NULL,
+        .robustBufferAccess2 = 0xDEADBEEF,
+        .robustImageAccess2  = 0xDEADBEEF,
+        .nullDescriptor      = 0xDEADBEEF,
+    };
+    VkPhysicalDeviceFeatures2 f2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &r2,
+    };
+    fn(g_phys, &f2);
+    if (r2.robustBufferAccess2 == 0xDEADBEEF ||
+        r2.robustImageAccess2  == 0xDEADBEEF ||
+        r2.nullDescriptor      == 0xDEADBEEF) {
+        FAIL("robustness2_features2", "shim did not fill robustness2 features (sentinels persisted)");
+        return;
+    }
+    if (r2.robustBufferAccess2 == VK_TRUE &&
+        r2.robustImageAccess2  == VK_TRUE &&
+        r2.nullDescriptor      == VK_TRUE)
+        PASS("robustness2_features2", "all 3 bools = VK_TRUE (DXVK 2.7.1 adapter gate satisfied)");
+    else
+        FAIL("robustness2_features2", "values bufAcc=%u imgAcc=%u nullDesc=%u (expected all VK_TRUE)",
+             r2.robustBufferAccess2, r2.robustImageAccess2, r2.nullDescriptor);
+}
+
+/* Robustness2 properties: shim writes typical 4-byte alignments.
+ * Sentinel-check that both fields were written. */
+static void test_robustness2_properties2(void) {
+    PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties =
+        (PFN_vkEnumerateDeviceExtensionProperties)
+        g_vkGetInstanceProcAddr(g_instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, NULL);
+    VkExtensionProperties *ex = calloc(n, sizeof(*ex));
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, ex);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(ex[i].extensionName, "VK_EXT_robustness2")) { has = 1; break; }
+    free(ex);
+    if (!has) { SKIP("robustness2_properties2", "VK_EXT_robustness2 not present"); return; }
+
+    PFN_vkGetPhysicalDeviceProperties2 fn =
+        (PFN_vkGetPhysicalDeviceProperties2)g_vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceProperties2");
+    if (!fn) { FAIL("robustness2_properties2", "vkGetPhysicalDeviceProperties2 not exposed"); return; }
+
+    VkPhysicalDeviceRobustness2PropertiesEXT r2p = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT,
+        .pNext = NULL,
+        .robustStorageBufferAccessSizeAlignment = 0xDEADBEEFDEADBEEFull,
+        .robustUniformBufferAccessSizeAlignment = 0xDEADBEEFDEADBEEFull,
+    };
+    VkPhysicalDeviceProperties2 p2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &r2p,
+    };
+    fn(g_phys, &p2);
+    if (r2p.robustStorageBufferAccessSizeAlignment == 0xDEADBEEFDEADBEEFull ||
+        r2p.robustUniformBufferAccessSizeAlignment == 0xDEADBEEFDEADBEEFull)
+        FAIL("robustness2_properties2", "shim did not fill alignments (sentinels persisted)");
+    else
+        PASS("robustness2_properties2", "alignments storageBuf=%llu uniformBuf=%llu",
+             (unsigned long long)r2p.robustStorageBufferAccessSizeAlignment,
+             (unsigned long long)r2p.robustUniformBufferAccessSizeAlignment);
+}
+
+/* nullDescriptor real-impl tests. The shim substitutes VK_NULL_HANDLE
+ * descriptor handles with per-device standin resources at
+ * vkUpdateDescriptorSets / template-update time. We dlsym
+ * shim_m5_null_subst_count out of the .so to prove a substitution
+ * actually fired (the wrapper might silently accept null handles in
+ * some configurations, which is the lax case we don't want passing
+ * silently). */
+
+/* Helper: build a tiny single-binding descriptor pool/layout/set for
+ * the given descriptor type. Returns 0 on failure. Caller must destroy
+ * pool + layout. */
+static int build_single_binding_set(VkDescriptorType type, VkShaderStageFlags stages,
+                                    VkDescriptorPool *outPool,
+                                    VkDescriptorSetLayout *outLayout,
+                                    VkDescriptorSet *outSet) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateDescriptorPool);
+    LOAD_DEV(vkCreateDescriptorSetLayout);
+    LOAD_DEV(vkAllocateDescriptorSets);
+    VkDescriptorPoolSize ps = { .type = type, .descriptorCount = 1 };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps,
+    };
+    if (vkCreateDescriptorPool(g_device, &dpci, NULL, outPool) != VK_SUCCESS) return 0;
+    VkDescriptorSetLayoutBinding b = {
+        .binding = 0, .descriptorType = type, .descriptorCount = 1, .stageFlags = stages,
+    };
+    VkDescriptorSetLayoutCreateInfo dsli = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &b,
+    };
+    if (vkCreateDescriptorSetLayout(g_device, &dsli, NULL, outLayout) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = *outPool, .descriptorSetCount = 1, .pSetLayouts = outLayout,
+    };
+    return vkAllocateDescriptorSets(g_device, &dsai, outSet) == VK_SUCCESS;
+}
+
+static void cleanup_single_binding_set(VkDescriptorPool pool, VkDescriptorSetLayout layout) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkDestroyDescriptorPool);
+    LOAD_DEV(vkDestroyDescriptorSetLayout);
+    if (pool   != VK_NULL_HANDLE) vkDestroyDescriptorPool(g_device, pool, NULL);
+    if (layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(g_device, layout, NULL);
+}
+
+/* Test: write a UNIFORM_BUFFER descriptor with VkBuffer = VK_NULL_HANDLE.
+ * Counter must advance. */
+static void test_null_subst_uniform_buffer(void) {
+    if (!device_ext_present("VK_EXT_robustness2")) {
+        SKIP("null_subst_uniform_buffer", "VK_EXT_robustness2 not present"); return;
+    }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkUpdateDescriptorSets);
+
+    volatile int *cnt = (volatile int *)dlsym(g_lib, "shim_m5_null_subst_count");
+    if (!cnt) { INCOMPLETE("null_subst_uniform_buffer", "shim counter symbol missing — cannot prove subst fired"); return; }
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!build_single_binding_set(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                  VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  &pool, &layout, &set)) {
+        FAIL("null_subst_uniform_buffer", "descriptor set setup failed");
+        cleanup_single_binding_set(pool, layout); return;
+    }
+
+    int before = *cnt;
+    VkDescriptorBufferInfo bi = { .buffer = VK_NULL_HANDLE, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set, .dstBinding = 0, .dstArrayElement = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &bi,
+    };
+    vkUpdateDescriptorSets(g_device, 1, &w, 0, NULL);
+    int after = *cnt;
+    if (after > before) PASS("null_subst_uniform_buffer", "shim substituted standin (counter %d→%d)", before, after);
+    else FAIL("null_subst_uniform_buffer", "counter did not advance (stuck at %d) — substitution did not fire", before);
+
+    cleanup_single_binding_set(pool, layout);
+}
+
+/* Test: write a SAMPLED_IMAGE descriptor with VkImageView = VK_NULL_HANDLE. */
+static void test_null_subst_sampled_image(void) {
+    if (!device_ext_present("VK_EXT_robustness2")) {
+        SKIP("null_subst_sampled_image", "VK_EXT_robustness2 not present"); return;
+    }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkUpdateDescriptorSets);
+    volatile int *cnt = (volatile int *)dlsym(g_lib, "shim_m5_null_subst_count");
+    if (!cnt) { INCOMPLETE("null_subst_sampled_image", "shim counter symbol missing"); return; }
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!build_single_binding_set(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                  VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  &pool, &layout, &set)) {
+        FAIL("null_subst_sampled_image", "descriptor set setup failed");
+        cleanup_single_binding_set(pool, layout); return;
+    }
+    int before = *cnt;
+    VkDescriptorImageInfo ii = {
+        .sampler = VK_NULL_HANDLE,
+        .imageView = VK_NULL_HANDLE,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set, .dstBinding = 0, .dstArrayElement = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .pImageInfo = &ii,
+    };
+    vkUpdateDescriptorSets(g_device, 1, &w, 0, NULL);
+    int after = *cnt;
+    if (after > before) PASS("null_subst_sampled_image", "shim substituted standin imageView (counter %d→%d)", before, after);
+    else FAIL("null_subst_sampled_image", "counter did not advance (stuck at %d)", before);
+
+    cleanup_single_binding_set(pool, layout);
+}
+
+/* Test: storage descriptor type — substitution still fires, but the
+ * shim's write-discard semantics are not spec-correct (shared standin).
+ * Test reports both counters: subst_count must advance (substitution
+ * fired) AND null_storage_subst_count must advance (it was a storage
+ * type). Result is reported as INCOMPLETE because the lie persists in
+ * the write-discard contract. */
+static void test_null_subst_storage_buffer_incomplete(void) {
+    if (!device_ext_present("VK_EXT_robustness2")) {
+        SKIP("null_subst_storage_buffer_incomplete", "VK_EXT_robustness2 not present"); return;
+    }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkUpdateDescriptorSets);
+    volatile int *cnt   = (volatile int *)dlsym(g_lib, "shim_m5_null_subst_count");
+    volatile int *cnt_s = (volatile int *)dlsym(g_lib, "shim_m5_null_storage_subst_count");
+    if (!cnt || !cnt_s) { INCOMPLETE("null_subst_storage_buffer_incomplete", "shim counter symbols missing"); return; }
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!build_single_binding_set(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  VK_SHADER_STAGE_COMPUTE_BIT,
+                                  &pool, &layout, &set)) {
+        FAIL("null_subst_storage_buffer_incomplete", "descriptor set setup failed");
+        cleanup_single_binding_set(pool, layout); return;
+    }
+    int before   = *cnt;
+    int before_s = *cnt_s;
+    VkDescriptorBufferInfo bi = { .buffer = VK_NULL_HANDLE, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set, .dstBinding = 0, .dstArrayElement = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .pBufferInfo = &bi,
+    };
+    vkUpdateDescriptorSets(g_device, 1, &w, 0, NULL);
+    int after   = *cnt;
+    int after_s = *cnt_s;
+    if (after > before && after_s > before_s)
+        INCOMPLETE("null_subst_storage_buffer_incomplete",
+                   "subst fired (subst %d→%d, storage %d→%d) but write-discard semantics share the standin (needs SPIR-V instrumentation)",
+                   before, after, before_s, after_s);
+    else
+        FAIL("null_subst_storage_buffer_incomplete",
+             "counters did not advance (subst %d→%d, storage %d→%d)", before, after, before_s, after_s);
+
+    cleanup_single_binding_set(pool, layout);
+}
+
+/* Test: descriptor update template with a null descriptor.
+ * vkCreateDescriptorUpdateTemplate must be hooked, the entries must be
+ * mirrored, and vkUpdateDescriptorSetWithTemplate must walk the data
+ * blob and substitute. Counter must advance. */
+static void test_null_subst_via_template(void) {
+    if (!device_ext_present("VK_EXT_robustness2")) {
+        SKIP("null_subst_via_template", "VK_EXT_robustness2 not present"); return;
+    }
+    /* Templates are core 1.1 — no separate extension gate. */
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateDescriptorUpdateTemplate);
+    LOAD_DEV(vkDestroyDescriptorUpdateTemplate);
+    LOAD_DEV(vkUpdateDescriptorSetWithTemplate);
+    volatile int *cnt = (volatile int *)dlsym(g_lib, "shim_m5_null_subst_count");
+    if (!cnt) { INCOMPLETE("null_subst_via_template", "shim counter symbol missing"); return; }
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!build_single_binding_set(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                  VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  &pool, &layout, &set)) {
+        FAIL("null_subst_via_template", "descriptor set setup failed");
+        cleanup_single_binding_set(pool, layout); return;
+    }
+    /* Single-entry template: at offset 0, one VkDescriptorBufferInfo. */
+    VkDescriptorUpdateTemplateEntry tpl_entry = {
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .offset = 0,
+        .stride = sizeof(VkDescriptorBufferInfo),
+    };
+    VkDescriptorUpdateTemplateCreateInfo tci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+        .descriptorUpdateEntryCount = 1,
+        .pDescriptorUpdateEntries = &tpl_entry,
+        .templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+        .descriptorSetLayout = layout,
+    };
+    VkDescriptorUpdateTemplate tpl = VK_NULL_HANDLE;
+    VkResult r = vkCreateDescriptorUpdateTemplate(g_device, &tci, NULL, &tpl);
+    if (r != VK_SUCCESS) {
+        FAIL("null_subst_via_template", "vkCreateDescriptorUpdateTemplate: %s", vkresult_str(r));
+        cleanup_single_binding_set(pool, layout); return;
+    }
+    int before = *cnt;
+    VkDescriptorBufferInfo bi = { .buffer = VK_NULL_HANDLE, .offset = 0, .range = VK_WHOLE_SIZE };
+    vkUpdateDescriptorSetWithTemplate(g_device, set, tpl, &bi);
+    int after = *cnt;
+    if (after > before) PASS("null_subst_via_template", "template-mediated subst fired (counter %d→%d)", before, after);
+    else FAIL("null_subst_via_template", "counter did not advance (stuck at %d)", before);
+
+    vkDestroyDescriptorUpdateTemplate(g_device, tpl, NULL);
+    cleanup_single_binding_set(pool, layout);
+}
+
 /* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
  * VUID-VkBufferCreateInfo-usage-parameter, usage must be non-zero. If
  * the wrapper rejects this, the partner _fold test's PASS is meaningful
@@ -891,8 +1236,14 @@ int main(int argc, char **argv) {
     test_maintenance5_dev_isl_stub();
     test_maintenance5_features2();
     test_maintenance5_properties2();
+    test_robustness2_features2();
+    test_robustness2_properties2();
     test_wrapper_usage_zero_strictness();
     test_maintenance5_buffer_usage_flags2_fold();
+    test_null_subst_uniform_buffer();
+    test_null_subst_sampled_image();
+    test_null_subst_storage_buffer_incomplete();
+    test_null_subst_via_template();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)
