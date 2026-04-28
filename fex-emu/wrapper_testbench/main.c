@@ -37,6 +37,7 @@
 #include "oob_probe_spv.h"
 #include "oob_image_probe_spv.h"
 #include "oob_fetch_probe_spv.h"
+#include "oob_sample_probe_spv.h"
 
 /* Counters shared across tests. */
 static int g_pass = 0;
@@ -1747,6 +1748,111 @@ static void test_spirv_pass_clamps_image_fetches(void) {
          before, after, image_query_size_lod, select_count);
 }
 
+/* A5 normalized sampling classification: OpImageSample* is deliberately
+ * not rewritten. Vulkan defines out-of-range normalized coordinates via
+ * sampler wrapping, so the pass should count the sample ops while emitting
+ * no extra OpSelect clamps for them. */
+static void test_spirv_pass_classifies_image_samples(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *sample_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_sample_ops_seen");
+    volatile int *clamped_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_ops_clamped");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!sample_cnt || !clamped_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_classifies_image_samples", "shim symbols not present (PASS A or pre-A5 sample build)");
+        return;
+    }
+
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+    int samples_before = *sample_cnt;
+    int clamps_before = *clamped_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_sample_probe_spv_len,
+        .pCode = (const uint32_t *)oob_sample_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int samples_after = *sample_cnt;
+    int clamps_after = *clamped_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_classifies_image_samples", "vkCreateShaderModule rejected sample module: %s", vkresult_str(r));
+        return;
+    }
+    if (samples_after - samples_before < 2) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_classifies_image_samples",
+             "sample counter advanced by %d, expected at least 2 texture() ops",
+             samples_after - samples_before);
+        return;
+    }
+    if (clamps_after != clamps_before) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_classifies_image_samples",
+             "sample module unexpectedly emitted image clamps (%d→%d)",
+             clamps_before, clamps_after);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t out_size = 0;
+    int ok = instrument((const uint32_t *)oob_sample_probe_spv, oob_sample_probe_spv_len,
+                        &out_code, &out_size);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_classifies_image_samples", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_classifies_image_samples", "spirv-val rejected sample module: %s", vmsg);
+        return;
+    }
+
+    int sample_ops = 0, select_count = 0, query_size = 0;
+    size_t total_words = out_size / 4;
+    for (size_t i = 5; i < total_words;) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        if (op == 87 || op == 88) sample_ops++; /* OpImageSample*Lod */
+        if (op == 169) select_count++;
+        if (op == 103 || op == 104) query_size++;
+        i += len;
+    }
+    freefn(out_code);
+
+    if (sample_ops < 2 || select_count != 0 || query_size != 0) {
+        FAIL("spirv_pass_classifies_image_samples",
+             "unexpected sample transform: samples=%d OpSelect=%d OpImageQuerySize*=%d",
+             sample_ops, select_count, query_size);
+        return;
+    }
+    PASS("spirv_pass_classifies_image_samples",
+         "classified %d normalized sample op(s) without rewriting; counter %d→%d, spirv-val OK",
+         samples_after - samples_before, samples_before, samples_after);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -2669,6 +2775,7 @@ int main(int argc, char **argv) {
     test_spirv_pass_clamps_descriptor_loads();
     test_spirv_pass_clamps_image_reads();
     test_spirv_pass_clamps_image_fetches();
+    test_spirv_pass_classifies_image_samples();
     test_mali_oob_ssbo_probe();
     test_mali_oob_storage_image_probe();
     test_mali_oob_texel_fetch_probe();

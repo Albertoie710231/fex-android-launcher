@@ -1,0 +1,14 @@
+#version 450
+/*
+ * Normalized sampling probe for A5. Vulkan defines coordinates outside
+ * image dimensions through the sampler wrapping operation, so A5 should
+ * classify OpImageSample* but not rewrite it to OpSelect-zero.
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform usampler2D tex;
+layout(set = 0, binding = 1) buffer OutBuf { uint outdata[]; };
+
+void main() {
+    outdata[0] = texture(tex, vec2(0.5, 0.5)).x;
+    outdata[1] = texture(tex, vec2(2.0, 0.5)).x;
+}

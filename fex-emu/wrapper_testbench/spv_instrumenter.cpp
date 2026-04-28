@@ -58,6 +58,7 @@ extern volatile int shim_m5_spirv_loads_skipped_no_array;
 extern volatile int shim_m5_spirv_image_ops_seen;
 extern volatile int shim_m5_spirv_image_ops_clamped;
 extern volatile int shim_m5_spirv_image_ops_skipped;
+extern volatile int shim_m5_spirv_image_sample_ops_seen;
 }
 
 // Metadata buffer logical layout: bucket = set * kShimMetadataMaxBindings + binding.
@@ -430,6 +431,22 @@ static uint32_t ResolveImageTypeId(spvtools::opt::analysis::DefUseManager* du,
   return 0;
 }
 
+static bool IsNormalizedImageSampleOp(spv::Op op) {
+  switch (op) {
+  case spv::Op::OpImageSampleImplicitLod:
+  case spv::Op::OpImageSampleExplicitLod:
+  case spv::Op::OpImageSampleDrefImplicitLod:
+  case spv::Op::OpImageSampleDrefExplicitLod:
+  case spv::Op::OpImageSampleProjImplicitLod:
+  case spv::Op::OpImageSampleProjExplicitLod:
+  case spv::Op::OpImageSampleProjDrefImplicitLod:
+  case spv::Op::OpImageSampleProjDrefExplicitLod:
+    return true;
+  default:
+    return false;
+  }
+}
+
 // Phase A3 pass: rewrite each descriptor-mediated OpLoad whose pointer
 // is a single OpAccessChain with ≥ 2 indices into a clamped form:
 //
@@ -660,9 +677,12 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
 //
 // This deliberately does not allocate or bind any per-image state: image
 // extents come from the image object itself, and zero values use
-// OpConstantNull of the image result type. Image writes, sampled
-// normalized-coordinate operations, sparse residency, and format-specific
-// non-zero defaults are still out of scope.
+// OpConstantNull of the image result type. Normalized OpImageSample* ops
+// are explicitly counted but not transformed: Vulkan says sampling
+// coordinates outside descriptor dimensions are defined by the sampler
+// wrapping operation, so forcing zero here would break repeat/mirror/etc.
+// Image writes, sparse residency, and format-specific non-zero defaults
+// are still out of scope.
 class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
  public:
   const char* name() const override { return "shim-m5-bounds-check-image-reads"; }
@@ -690,9 +710,14 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
     std::vector<Candidate> candidates;
     int seen = 0;
     int skipped = 0;
+    int normalized_samples = 0;
 
     for (auto& fn : *mod) {
       fn.ForEachInst([&](opt::Instruction* inst) {
+        if (IsNormalizedImageSampleOp(inst->opcode())) {
+          normalized_samples++;
+          return;
+        }
         if (inst->opcode() != Op::OpImageRead &&
             inst->opcode() != Op::OpImageFetch) return;
         seen++;
@@ -729,6 +754,8 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
     }
 
     __atomic_add_fetch(&shim_m5_spirv_image_ops_seen, seen, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_image_sample_ops_seen, normalized_samples,
+                       __ATOMIC_RELAXED);
     if (candidates.empty()) {
       __atomic_add_fetch(&shim_m5_spirv_image_ops_skipped, skipped, __ATOMIC_RELAXED);
       return Status::SuccessWithoutChange;
@@ -875,8 +902,8 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
     if (consumer()) {
       char buf[200];
       std::snprintf(buf, sizeof(buf),
-                    "[shim-spv] A5: clamped %d image read/fetch op(s); seen=%d skipped=%d",
-                    clamped, seen, skipped);
+                    "[shim-spv] A5: clamped %d image read/fetch op(s); seen=%d skipped=%d normalized_samples=%d",
+                    clamped, seen, skipped, normalized_samples);
       spv_position_t pos = {};
       consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
     }
@@ -913,6 +940,8 @@ __attribute__((visibility("default")))
 volatile int shim_m5_spirv_image_ops_clamped = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_image_ops_skipped = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_sample_ops_seen = 0;
 
 __attribute__((visibility("default")))
 int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
