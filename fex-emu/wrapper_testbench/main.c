@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "oob_probe_spv.h"
 
 /* Counters shared across tests. */
 static int g_pass = 0;
@@ -1130,6 +1131,229 @@ static void test_null_subst_via_template(void) {
     cleanup_single_binding_set(pool, layout);
 }
 
+/* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
+ * index 1024 through a descriptor whose range covers only 1 element
+ * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
+ * with 0xDEADBEEF, so byte-offset 4096 (= index 1024 × sizeof(uint))
+ * exists in memory but is outside the descriptor's declared range.
+ * Result tells us how Mali / leegao handle OOB descriptor access:
+ *
+ *   result == 0          → Mali zeros OOB at descriptor level (free SSBO robustness2)
+ *   result == 0xDEADBEEF → Mali ignored descriptor range (instrumentation needed)
+ *   anything else        → garbage / fault (instrumentation needed)
+ *
+ * This is a wrapper-behavior test, not a shim-correctness test — it
+ * gives the same answer in PASS A and PASS B. The point is to inform
+ * whether real robustBufferAccess2 needs SPIR-V instrumentation or
+ * whether Mali already delivers it. */
+static void test_mali_oob_ssbo_probe(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkMapMemory);
+    LOAD_DEV(vkUnmapMemory);
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+    LOAD_DEV(vkCreateDescriptorSetLayout);
+    LOAD_DEV(vkDestroyDescriptorSetLayout);
+    LOAD_DEV(vkCreateDescriptorPool);
+    LOAD_DEV(vkDestroyDescriptorPool);
+    LOAD_DEV(vkAllocateDescriptorSets);
+    LOAD_DEV(vkUpdateDescriptorSets);
+    LOAD_DEV(vkCreatePipelineLayout);
+    LOAD_DEV(vkDestroyPipelineLayout);
+    LOAD_DEV(vkCreateComputePipelines);
+    LOAD_DEV(vkDestroyPipeline);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_DEV(vkCmdBindPipeline);
+    LOAD_DEV(vkCmdBindDescriptorSets);
+    LOAD_DEV(vkCmdDispatch);
+    LOAD_DEV(vkCreateFence);
+    LOAD_DEV(vkDestroyFence);
+    LOAD_DEV(vkWaitForFences);
+    LOAD_DEV(vkGetDeviceQueue);
+    LOAD_DEV(vkQueueSubmit);
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+
+    /* Buffers — 16 KiB host-visible. */
+    const VkDeviceSize BUF_SZ = 16 * 1024;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = BUF_SZ, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer in_buf = VK_NULL_HANDLE, out_buf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(g_device, &bci, NULL, &in_buf);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_ssbo_probe", "vkCreateBuffer in: %s", vkresult_str(r)); return; }
+    r = vkCreateBuffer(g_device, &bci, NULL, &out_buf);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_ssbo_probe", "vkCreateBuffer out: %s", vkresult_str(r));
+        vkDestroyBuffer(g_device, in_buf, NULL); return; }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_device, in_buf, &req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    int mt = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (!(req.memoryTypeBits & (1u << i))) continue;
+        VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if ((mp.memoryTypes[i].propertyFlags & want) == want) { mt = (int)i; break; }
+    }
+    if (mt < 0) { FAIL("mali_oob_ssbo_probe", "no host-visible+coherent memory"); return; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkDeviceMemory in_mem = VK_NULL_HANDLE, out_mem = VK_NULL_HANDLE;
+    vkAllocateMemory(g_device, &mai, NULL, &in_mem);
+    vkAllocateMemory(g_device, &mai, NULL, &out_mem);
+    vkBindBufferMemory(g_device, in_buf,  in_mem,  0);
+    vkBindBufferMemory(g_device, out_buf, out_mem, 0);
+
+    /* Pre-fill input with 0xDEADBEEF so OOB reads against the underlying
+     * allocation produce a recognizable marker. Output starts zeroed. */
+    void *p = NULL;
+    vkMapMemory(g_device, in_mem, 0, BUF_SZ, 0, &p);
+    for (size_t i = 0; i < BUF_SZ / 4; i++) ((uint32_t *)p)[i] = 0xDEADBEEFu;
+    vkUnmapMemory(g_device, in_mem);
+    vkMapMemory(g_device, out_mem, 0, BUF_SZ, 0, &p);
+    memset(p, 0, BUF_SZ);
+    vkUnmapMemory(g_device, out_mem);
+
+    /* Compute pipeline. */
+    VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_probe_spv_len, .pCode = (const uint32_t *)oob_probe_spv };
+    VkShaderModule shader = VK_NULL_HANDLE;
+    r = vkCreateShaderModule(g_device, &smci, NULL, &shader);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_ssbo_probe", "vkCreateShaderModule: %s", vkresult_str(r));
+        goto cleanup_buffers; }
+
+    VkDescriptorSetLayoutBinding dslb[2] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+    VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2, .pBindings = dslb };
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    r = vkCreateDescriptorSetLayout(g_device, &dslci, NULL, &dsl);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_ssbo_probe", "vkCreateDescriptorSetLayout: %s", vkresult_str(r));
+        vkDestroyShaderModule(g_device, shader, NULL); goto cleanup_buffers; }
+
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl };
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(g_device, &plci, NULL, &pl);
+
+    VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+        .layout = pl };
+    VkPipeline pipe = VK_NULL_HANDLE;
+    r = vkCreateComputePipelines(g_device, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_ssbo_probe", "vkCreateComputePipelines: %s", vkresult_str(r));
+        vkDestroyPipelineLayout(g_device, pl, NULL); vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+        vkDestroyShaderModule(g_device, shader, NULL); goto cleanup_buffers; }
+
+    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
+    VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    vkCreateDescriptorPool(g_device, &dpci, NULL, &dpool);
+    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    vkAllocateDescriptorSets(g_device, &dsai, &dset);
+
+    /* The crux: input descriptor RANGE = 4 bytes. Underlying allocation
+     * has 16 KiB of 0xDEADBEEF, so byte-offset 4096 is real memory but
+     * outside the descriptor's declared range. */
+    VkDescriptorBufferInfo bi_in  = { .buffer = in_buf,  .offset = 0, .range = 4 };
+    VkDescriptorBufferInfo bi_out = { .buffer = out_buf, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet writes[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi_in },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi_out },
+    };
+    vkUpdateDescriptorSets(g_device, 2, writes, 0, NULL);
+
+    /* Record + submit. */
+    VkCommandPoolCreateInfo cpci2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = g_gfx_qfam };
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    vkCreateCommandPool(g_device, &cpci2, NULL, &cpool);
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &cbbi);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, NULL);
+    vkCmdDispatch(cb, 1, 1, 1);
+    vkEndCommandBuffer(cb);
+
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g_device, g_gfx_qfam, 0, &queue);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    vkCreateFence(g_device, &fci, NULL, &fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    r = vkQueueSubmit(queue, 1, &si, fence);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_ssbo_probe", "vkQueueSubmit: %s (Mali rejected the dispatch)", vkresult_str(r));
+        goto cleanup_all;
+    }
+    r = vkWaitForFences(g_device, 1, &fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_ssbo_probe",
+             "vkWaitForFences: %s (Mali likely faulted on OOB read — instrumentation REQUIRED for robustness2)",
+             vkresult_str(r));
+        goto cleanup_all;
+    }
+
+    /* Read result. */
+    uint32_t result = 0xCAFEBABEu;
+    void *outp = NULL;
+    vkMapMemory(g_device, out_mem, 0, BUF_SZ, 0, &outp);
+    if (outp) result = *(uint32_t *)outp;
+    vkUnmapMemory(g_device, out_mem);
+
+    if (result == 0u) {
+        PASS("mali_oob_ssbo_probe",
+             "result=0 → Mali zeros OOB at descriptor-range level (real robustness2 for SSBOs comes free, no SPIR-V instrumentation needed for buffer reads)");
+    } else if (result == 0xDEADBEEFu) {
+        INCOMPLETE("mali_oob_ssbo_probe",
+                   "result=0xDEADBEEF → Mali read past descriptor range into underlying allocation; spec-correct robustness2 requires SPIR-V instrumentation");
+    } else {
+        INCOMPLETE("mali_oob_ssbo_probe",
+                   "result=0x%08x → unexpected (neither zero nor marker); behavior is implementation-defined garbage, instrumentation required",
+                   result);
+    }
+
+cleanup_all:
+    vkDestroyFence(g_device, fence, NULL);
+    vkDestroyCommandPool(g_device, cpool, NULL);
+    vkDestroyDescriptorPool(g_device, dpool, NULL);
+    vkDestroyPipeline(g_device, pipe, NULL);
+    vkDestroyPipelineLayout(g_device, pl, NULL);
+    vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+    vkDestroyShaderModule(g_device, shader, NULL);
+cleanup_buffers:
+    vkFreeMemory(g_device, in_mem, NULL);
+    vkFreeMemory(g_device, out_mem, NULL);
+    vkDestroyBuffer(g_device, in_buf, NULL);
+    vkDestroyBuffer(g_device, out_buf, NULL);
+}
+
 /* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
  * VUID-VkBufferCreateInfo-usage-parameter, usage must be non-zero. If
  * the wrapper rejects this, the partner _fold test's PASS is meaningful
@@ -1244,6 +1468,7 @@ int main(int argc, char **argv) {
     test_null_subst_sampled_image();
     test_null_subst_storage_buffer_incomplete();
     test_null_subst_via_template();
+    test_mali_oob_ssbo_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)

@@ -1,0 +1,23 @@
+#version 450
+/*
+ * OOB SSBO probe for Mali / leegao wrapper.
+ *
+ * Bound at descriptor-write time with input range=4 (one uint at offset
+ * 0), but the shader reads index 1024 — well outside the descriptor's
+ * declared range. The underlying buffer ALLOCATION is larger and
+ * contains a recognizable marker. Reading the result tells us how
+ * Mali handles OOB access against the descriptor range:
+ *
+ *   result == 0          → Mali zeros OOB → free robustness2 for SSBOs
+ *   result == 0xDEADBEEF → Mali ignored descriptor range → instrumentation needed
+ *   anything else / hang → Mali faulted or returned garbage → instrumentation needed
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer InBuf  { uint indata[];  };
+layout(set = 0, binding = 1)          buffer OutBuf { uint outdata[]; };
+
+void main() {
+    /* Read at the byte-offset 4 * 1024 = 4096 — far outside the
+     * descriptor range of 4 bytes. */
+    outdata[0] = indata[1024];
+}

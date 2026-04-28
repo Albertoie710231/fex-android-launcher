@@ -8,8 +8,23 @@ set -euo pipefail
 
 NDK="${NDK:-$HOME/Android/Sdk/ndk/27.3.13750724}"
 CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
+GLSLC="$NDK/shader-tools/linux-x86_64/glslc"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VULKAN_INCLUDE="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+
+# Compile the OOB probe compute shader into a C header. Generated each
+# build so editing the .comp invalidates correctly.
+SPV_OUT="/tmp/oob_probe.spv"
+"$GLSLC" --target-env=vulkan1.3 -o "$SPV_OUT" "$SCRIPT_DIR/oob_probe.comp"
+HDR_OUT="$SCRIPT_DIR/oob_probe_spv.h"
+{
+    printf '/* Auto-generated from oob_probe.comp by build.sh — do not edit. */\n'
+    printf 'static const unsigned char oob_probe_spv[] = {\n'
+    od -An -v -tx1 "$SPV_OUT" | sed -E 's/[[:space:]]+/ /g; s/ ([0-9a-f]{2})/0x\1,/g; s/^ //'
+    printf '};\n'
+    printf 'static const unsigned int oob_probe_spv_len = sizeof(oob_probe_spv);\n'
+} > "$HDR_OUT"
+echo "compiled: $SPV_OUT ($(stat -c '%s bytes' "$SPV_OUT")) → $HDR_OUT"
 
 OUT="/tmp/wrapper_testbench"
 "$CC" \
