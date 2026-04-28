@@ -66,6 +66,7 @@ compile_spv_header "oob_probe.comp" "oob_probe_spv"
 compile_spv_header "oob_image_probe.comp" "oob_image_probe_spv"
 compile_spv_header "oob_fetch_probe.comp" "oob_fetch_probe_spv"
 compile_spv_header "oob_sample_probe.comp" "oob_sample_probe_spv"
+compile_spv_header "oob_image_write_probe.comp" "oob_image_write_probe_spv"
 
 OUT="/tmp/wrapper_testbench"
 "$CC" \

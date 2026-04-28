@@ -38,6 +38,7 @@
 #include "oob_image_probe_spv.h"
 #include "oob_fetch_probe_spv.h"
 #include "oob_sample_probe_spv.h"
+#include "oob_image_write_probe_spv.h"
 
 /* Counters shared across tests. */
 static int g_pass = 0;
@@ -1853,6 +1854,119 @@ static void test_spirv_pass_classifies_image_samples(void) {
          samples_after - samples_before, samples_before, samples_after);
 }
 
+/* Phase A5 image-write slice: OpImageWrite has no result type, so
+ * A3/A5-read's OpSelect-zero pattern is unusable; the pass must wrap the
+ * write in OpSelectionMerge + OpBranchConditional + a separate do_write
+ * basic block so out-of-extent invocations skip the write entirely.
+ * This unit test exercises the SPIR-V pass directly: the output must
+ * carry OpImageQuerySize, OpSelectionMerge, OpBranchConditional, and
+ * OpBranch around each OpImageWrite, and spirv-val must accept the
+ * transformed module. */
+static void test_spirv_pass_clamps_image_writes(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *clamped_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_writes_clamped");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!clamped_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_clamps_image_writes", "shim symbols not present (PASS A or pre-A5W build)");
+        return;
+    }
+
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+
+    int before = *clamped_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_image_write_probe_spv_len,
+        .pCode = (const uint32_t *)oob_image_write_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *clamped_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_writes", "vkCreateShaderModule rejected A5W module: %s", vkresult_str(r));
+        return;
+    }
+    if (after - before < 2) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_writes",
+             "image-write clamp counter advanced by %d, expected at least 2 imageStore ops",
+             after - before);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t out_size = 0;
+    int ok = instrument((const uint32_t *)oob_image_write_probe_spv, oob_image_write_probe_spv_len,
+                        &out_code, &out_size);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_clamps_image_writes", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_clamps_image_writes", "spirv-val rejected A5W module: %s", vmsg);
+        return;
+    }
+
+    int op_image_write = 0, op_selection_merge = 0, op_branch_conditional = 0,
+        op_branch = 0, op_image_query_size = 0;
+    size_t total_words = out_size / 4;
+    for (size_t i = 5; i < total_words;) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        if (op == 99)  op_image_write++;        /* OpImageWrite */
+        if (op == 247) op_selection_merge++;    /* OpSelectionMerge */
+        if (op == 249) op_branch++;             /* OpBranch */
+        if (op == 250) op_branch_conditional++; /* OpBranchConditional */
+        if (op == 104) op_image_query_size++;   /* OpImageQuerySize */
+        i += len;
+    }
+    freefn(out_code);
+
+    /* The probe has 2 OpImageWrites; each gets its own diamond. So we
+     * expect ≥ 2 OpSelectionMerge, ≥ 2 OpBranchConditional, ≥ 2 OpBranch
+     * (the do_write→merge edge), and ≥ 2 OpImageQuerySize for the
+     * coordinate bounds. The reads in the probe (4 of them) also each
+     * get an OpImageQuerySize from the existing read pass, so the
+     * total OpImageQuerySize count will actually be ≥ 6 — the lower
+     * bound here is only a sanity check. */
+    if (op_image_write < 2 || op_selection_merge < 2 ||
+        op_branch_conditional < 2 || op_branch < 2 || op_image_query_size < 2) {
+        FAIL("spirv_pass_clamps_image_writes",
+             "A5W scaffolding missing: OpImageWrite=%d OpSelectionMerge=%d "
+             "OpBranchConditional=%d OpBranch=%d OpImageQuerySize=%d",
+             op_image_write, op_selection_merge, op_branch_conditional,
+             op_branch, op_image_query_size);
+        return;
+    }
+    PASS("spirv_pass_clamps_image_writes",
+         "A5W emitted image-write clamps; counter %d→%d, OpSelectionMerge=%d "
+         "OpBranchConditional=%d OpBranch=%d, spirv-val OK",
+         before, after, op_selection_merge, op_branch_conditional, op_branch);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -2655,6 +2769,289 @@ cleanup:
     a4_refresh();
 }
 
+/* End-to-end A5 image-write probe: pre-clear a 4x1 R32_UINT storage
+ * image to 0xDEADBEEF, dispatch a compute shader that does one
+ * in-bounds imageStore at (0,0) and one OOB imageStore at (100,0), then
+ * reads back all four texels into a host-visible output buffer. With
+ * SHIM_INSTRUMENT_ENABLE=1 the OOB OpImageWrite is wrapped in a
+ * structured-control-flow guard and skipped at runtime — outdata[0]
+ * carries the in-bounds write, outdata[1..3] retain the pre-clear
+ * marker. The image-writes-clamped counter must advance by at least 2
+ * (one per OpImageWrite in the probe), and the A4 metadata bind
+ * counter must also advance (the layout grows to include slot 6). */
+static void test_mali_oob_image_write_probe(void) {
+    volatile int *a5w_clamped = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_writes_clamped");
+    volatile int *a4_binds_cnt = (volatile int *)dlsym(g_lib, "shim_m5_a4_binds_extended");
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh a4_refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+    if (!a5w_clamped || !a4_binds_cnt || !a4_refresh) {
+        SKIP("mali_oob_image_write_probe", "shim A5W/A4 symbols not present (PASS A or pre-A5W build)");
+        return;
+    }
+
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateImage);
+    LOAD_DEV(vkDestroyImage);
+    LOAD_DEV(vkGetImageMemoryRequirements);
+    LOAD_DEV(vkBindImageMemory);
+    LOAD_DEV(vkCreateImageView);
+    LOAD_DEV(vkDestroyImageView);
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkMapMemory);
+    LOAD_DEV(vkUnmapMemory);
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+    LOAD_DEV(vkCreateDescriptorSetLayout);
+    LOAD_DEV(vkDestroyDescriptorSetLayout);
+    LOAD_DEV(vkCreateDescriptorPool);
+    LOAD_DEV(vkDestroyDescriptorPool);
+    LOAD_DEV(vkAllocateDescriptorSets);
+    LOAD_DEV(vkUpdateDescriptorSets);
+    LOAD_DEV(vkCreatePipelineLayout);
+    LOAD_DEV(vkDestroyPipelineLayout);
+    LOAD_DEV(vkCreateComputePipelines);
+    LOAD_DEV(vkDestroyPipeline);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_DEV(vkCmdPipelineBarrier);
+    LOAD_DEV(vkCmdClearColorImage);
+    LOAD_DEV(vkCmdBindPipeline);
+    LOAD_DEV(vkCmdBindDescriptorSets);
+    LOAD_DEV(vkCmdDispatch);
+    LOAD_DEV(vkCreateFence);
+    LOAD_DEV(vkDestroyFence);
+    LOAD_DEV(vkWaitForFences);
+    LOAD_DEV(vkGetDeviceQueue);
+    LOAD_DEV(vkQueueSubmit);
+
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    a4_refresh();
+    int a5w_before = *a5w_clamped;
+    int binds_before = *a4_binds_cnt;
+
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory img_mem = VK_NULL_HANDLE;
+    VkImageView img_view = VK_NULL_HANDLE;
+    VkBuffer out_buf = VK_NULL_HANDLE;
+    VkDeviceMemory out_mem = VK_NULL_HANDLE;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R32_UINT,
+        .extent = { 4, 1, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkResult r = vkCreateImage(g_device, &ici, NULL, &img);
+    if (r != VK_SUCCESS) { SKIP("mali_oob_image_write_probe", "vkCreateImage(R32_UINT 4x1 storage): %s", vkresult_str(r)); goto cleanup; }
+    VkMemoryRequirements ireq;
+    vkGetImageMemoryRequirements(g_device, img, &ireq);
+    int imt = pick_memory_type(ireq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (imt < 0) { FAIL("mali_oob_image_write_probe", "no memory type for storage image"); goto cleanup; }
+    VkMemoryAllocateInfo imai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = ireq.size, .memoryTypeIndex = (uint32_t)imt };
+    r = vkAllocateMemory(g_device, &imai, NULL, &img_mem);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkAllocateMemory image: %s", vkresult_str(r)); goto cleanup; }
+    vkBindImageMemory(g_device, img, img_mem, 0);
+
+    VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R32_UINT,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    r = vkCreateImageView(g_device, &ivci, NULL, &img_view);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateImageView: %s", vkresult_str(r)); goto cleanup; }
+
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 16, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    r = vkCreateBuffer(g_device, &bci, NULL, &out_buf);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateBuffer out: %s", vkresult_str(r)); goto cleanup; }
+    VkMemoryRequirements breq;
+    vkGetBufferMemoryRequirements(g_device, out_buf, &breq);
+    int bmt = pick_memory_type(breq.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (bmt < 0) { FAIL("mali_oob_image_write_probe", "no host-visible buffer memory"); goto cleanup; }
+    VkMemoryAllocateInfo bmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = breq.size, .memoryTypeIndex = (uint32_t)bmt };
+    r = vkAllocateMemory(g_device, &bmai, NULL, &out_mem);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkAllocateMemory out: %s", vkresult_str(r)); goto cleanup; }
+    vkBindBufferMemory(g_device, out_buf, out_mem, 0);
+    void *p = NULL;
+    vkMapMemory(g_device, out_mem, 0, 16, 0, &p);
+    if (p) memset(p, 0, 16);
+    vkUnmapMemory(g_device, out_mem);
+
+    VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_image_write_probe_spv_len, .pCode = (const uint32_t *)oob_image_write_probe_spv };
+    r = vkCreateShaderModule(g_device, &smci, NULL, &shader);
+    int a5w_after_shader = *a5w_clamped;
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateShaderModule: %s", vkresult_str(r)); goto cleanup; }
+    if (a5w_after_shader - a5w_before < 2) {
+        FAIL("mali_oob_image_write_probe", "A5W counter advanced by %d, expected at least 2",
+             a5w_after_shader - a5w_before);
+        goto cleanup;
+    }
+
+    VkDescriptorSetLayoutBinding dslb[2] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+    VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2, .pBindings = dslb };
+    r = vkCreateDescriptorSetLayout(g_device, &dslci, NULL, &dsl);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateDescriptorSetLayout: %s", vkresult_str(r)); goto cleanup; }
+
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl };
+    r = vkCreatePipelineLayout(g_device, &plci, NULL, &pl);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreatePipelineLayout: %s", vkresult_str(r)); goto cleanup; }
+
+    VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+        .layout = pl };
+    r = vkCreateComputePipelines(g_device, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateComputePipelines: %s", vkresult_str(r)); goto cleanup; }
+
+    VkDescriptorPoolSize ps[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1 },
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
+    };
+    VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps };
+    r = vkCreateDescriptorPool(g_device, &dpci, NULL, &dpool);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateDescriptorPool: %s", vkresult_str(r)); goto cleanup; }
+    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    r = vkAllocateDescriptorSets(g_device, &dsai, &dset);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkAllocateDescriptorSets: %s", vkresult_str(r)); goto cleanup; }
+
+    VkDescriptorImageInfo ii = { .imageView = img_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorBufferInfo bi = { .buffer = out_buf, .offset = 0, .range = 16 };
+    VkWriteDescriptorSet writes[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi },
+    };
+    vkUpdateDescriptorSets(g_device, 2, writes, 0, NULL);
+
+    VkCommandPoolCreateInfo cpci2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = g_gfx_qfam };
+    r = vkCreateCommandPool(g_device, &cpci2, NULL, &cpool);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkCreateCommandPool: %s", vkresult_str(r)); goto cleanup; }
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &cbbi);
+
+    /* Pre-clear the image to 0xDEADBEEF so we can detect any
+     * unintended write spillover. UNDEFINED -> TRANSFER_DST -> GENERAL. */
+    VkImageMemoryBarrier to_clear = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_clear);
+    VkClearColorValue clear = { .uint32 = { 0xDEADBEEFu, 0u, 0u, 0u } };
+    VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    VkImageMemoryBarrier to_general = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_general);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, NULL);
+    vkCmdDispatch(cb, 1, 1, 1);
+    vkEndCommandBuffer(cb);
+
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g_device, g_gfx_qfam, 0, &queue);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    vkCreateFence(g_device, &fci, NULL, &fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    r = vkQueueSubmit(queue, 1, &si, fence);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkQueueSubmit: %s", vkresult_str(r)); goto cleanup; }
+    r = vkWaitForFences(g_device, 1, &fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_image_write_probe", "vkWaitForFences: %s", vkresult_str(r)); goto cleanup; }
+
+    uint32_t result[4] = { 0xCAFEBABEu, 0xCAFEBABEu, 0xCAFEBABEu, 0xCAFEBABEu };
+    vkMapMemory(g_device, out_mem, 0, 16, 0, &p);
+    if (p) memcpy(result, p, 16);
+    vkUnmapMemory(g_device, out_mem);
+    int binds_after = *a4_binds_cnt;
+    if (binds_after <= binds_before) {
+        FAIL("mali_oob_image_write_probe", "A4 metadata bind counter did not advance (%d→%d)", binds_before, binds_after);
+    } else if (result[0] == 0xCAFEBABEu &&
+               result[1] == 0xDEADBEEFu &&
+               result[2] == 0xDEADBEEFu &&
+               result[3] == 0xDEADBEEFu) {
+        PASS("mali_oob_image_write_probe",
+             "in-bounds imageStore landed (texel0=0x%08x), OOB imageStore did not corrupt texel[1..3] (0x%08x,0x%08x,0x%08x); A5W counter %d→%d, A4 binds %d→%d",
+             result[0], result[1], result[2], result[3], a5w_before, a5w_after_shader, binds_before, binds_after);
+    } else {
+        FAIL("mali_oob_image_write_probe",
+             "unexpected results: texel[0..3]=0x%08x,0x%08x,0x%08x,0x%08x (expected 0xCAFEBABE,0xDEADBEEF,0xDEADBEEF,0xDEADBEEF)",
+             result[0], result[1], result[2], result[3]);
+    }
+
+cleanup:
+    if (fence) vkDestroyFence(g_device, fence, NULL);
+    if (cpool) vkDestroyCommandPool(g_device, cpool, NULL);
+    if (dpool) vkDestroyDescriptorPool(g_device, dpool, NULL);
+    if (pipe) vkDestroyPipeline(g_device, pipe, NULL);
+    if (pl) vkDestroyPipelineLayout(g_device, pl, NULL);
+    if (dsl) vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+    if (shader) vkDestroyShaderModule(g_device, shader, NULL);
+    if (out_mem) vkFreeMemory(g_device, out_mem, NULL);
+    if (out_buf) vkDestroyBuffer(g_device, out_buf, NULL);
+    if (img_view) vkDestroyImageView(g_device, img_view, NULL);
+    if (img_mem) vkFreeMemory(g_device, img_mem, NULL);
+    if (img) vkDestroyImage(g_device, img, NULL);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    a4_refresh();
+}
+
 /* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
  * VUID-VkBufferCreateInfo-usage-parameter, usage must be non-zero. If
  * the wrapper rejects this, the partner _fold test's PASS is meaningful
@@ -2776,9 +3173,11 @@ int main(int argc, char **argv) {
     test_spirv_pass_clamps_image_reads();
     test_spirv_pass_clamps_image_fetches();
     test_spirv_pass_classifies_image_samples();
+    test_spirv_pass_clamps_image_writes();
     test_mali_oob_ssbo_probe();
     test_mali_oob_storage_image_probe();
     test_mali_oob_texel_fetch_probe();
+    test_mali_oob_image_write_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)

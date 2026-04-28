@@ -34,9 +34,11 @@
 #include <memory>
 #include <vector>
 
+#include "source/opt/basic_block.h"
 #include "source/opt/build_module.h"
 #include "source/opt/constants.h"
 #include "source/opt/def_use_manager.h"
+#include "source/opt/function.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_context.h"
 #include "source/opt/module.h"
@@ -59,6 +61,9 @@ extern volatile int shim_m5_spirv_image_ops_seen;
 extern volatile int shim_m5_spirv_image_ops_clamped;
 extern volatile int shim_m5_spirv_image_ops_skipped;
 extern volatile int shim_m5_spirv_image_sample_ops_seen;
+extern volatile int shim_m5_spirv_image_writes_seen;
+extern volatile int shim_m5_spirv_image_writes_clamped;
+extern volatile int shim_m5_spirv_image_writes_skipped;
 }
 
 // Metadata buffer logical layout: bucket = set * kShimMetadataMaxBindings + binding.
@@ -915,6 +920,330 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
   }
 };
 
+// Phase A5 image-write slice: robustImageAccess2 for OpImageWrite. The
+// write opcode produces no result, so A3/A5-read's OpSelect-zero pattern
+// does not apply — we must wrap the write in structured control flow so
+// out-of-extent invocations skip the OpImageWrite entirely. For each
+// candidate write the pass synthesizes:
+//
+//   %size = OpImageQuerySize %coord_type %image
+//   %ok_x = OpULessThan %bool %coord_x %size_x   ; OpSGreaterThanEqual+
+//                                                  OpSLessThan for signed
+//                                                  coords
+//   ... per-component AND-reduction → %in_bounds ...
+//   OpSelectionMerge %merge None
+//   OpBranchConditional %in_bounds %do_write %merge
+//   %do_write = OpLabel
+//     OpImageWrite %image %coord %texel ...
+//     OpBranch %merge
+//   %merge = OpLabel
+//
+// Block split: the original block is partitioned at the OpImageWrite into
+// header (pre-write instructions), do_write (the write alone), and merge
+// (post-write instructions and the original terminator). Skip rule:
+// candidates whose containing block has OpSelectionMerge or OpLoopMerge
+// (always after the OpImageWrite by spec, since both must precede the
+// terminator) are passed through untouched — splitting would migrate the
+// structured-merge declaration into the new merge_bb, which would change
+// which block is the construct/loop header and is structurally fragile in
+// loops. Counted in shim_m5_spirv_image_writes_skipped.
+class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
+ public:
+  const char* name() const override { return "shim-m5-bounds-check-image-writes"; }
+
+  Status Process() override {
+    using spv::Op;
+    namespace opt = spvtools::opt;
+    opt::IRContext* ctx = context();
+    opt::Module* mod = ctx->module();
+
+    opt::analysis::DefUseManager* du = ctx->get_def_use_mgr();
+    opt::analysis::TypeManager* tm = ctx->get_type_mgr();
+    opt::analysis::ConstantManager* cm = ctx->get_constant_mgr();
+
+    const uint32_t bool_id = tm->GetBoolTypeId();
+    if (!bool_id) return Status::Failure;
+
+    // Collect candidates first (raw Instruction* + extracted operands +
+    // resolved coord type) so the rewrite loop below can mutate the IR
+    // freely. Each candidate's containing block is looked up dynamically
+    // at rewrite time via ctx->get_instr_block — earlier splits in the
+    // same loop are fine because SplitBasicBlock keeps that mapping
+    // current.
+    struct Candidate {
+      opt::Instruction* image_write;
+      uint32_t image_id;
+      uint32_t coord_id;
+      IntCoordType coord_type;
+    };
+    std::vector<Candidate> candidates;
+    int seen = 0;
+    int skipped = 0;
+
+    for (auto& fn : *mod) {
+      for (auto& bb : fn) {
+        // Pre-scan the block for structured merges. If we find one,
+        // every OpImageWrite in the block is unsafe to split (the merge
+        // instruction is by spec right before the terminator and would
+        // migrate into our merge_bb after the split).
+        bool has_structured_merge = false;
+        for (auto& inst : bb) {
+          if (inst.opcode() == Op::OpSelectionMerge ||
+              inst.opcode() == Op::OpLoopMerge) {
+            has_structured_merge = true;
+            break;
+          }
+        }
+
+        for (auto& inst : bb) {
+          if (inst.opcode() != Op::OpImageWrite) continue;
+          seen++;
+          if (has_structured_merge) { skipped++; continue; }
+          if (inst.NumInOperands() < 3) { skipped++; continue; }
+
+          // OpImageWrite layout: image, coord, texel, [image_operands_mask,
+          // operand_args...]. Glslc emits ZeroExtend (or SignExtend) for
+          // every storage-image write, so an ImageOperands word is the
+          // norm — accept it if the mask only carries
+          // texel-encoding/coherency/temporal flags. Reject masks that
+          // carry Bias / Lod / Grad / *Offset* / Sample / MinLod /
+          // Offsets — those change the indexing semantics and would
+          // require a different size-query than OpImageQuerySize.
+          if (inst.NumInOperands() > 3) {
+            const uint32_t mask = inst.GetSingleWordInOperand(3);
+            constexpr uint32_t kIndexingMask =
+                uint32_t(spv::ImageOperandsMask::Bias) |
+                uint32_t(spv::ImageOperandsMask::Lod) |
+                uint32_t(spv::ImageOperandsMask::Grad) |
+                uint32_t(spv::ImageOperandsMask::ConstOffset) |
+                uint32_t(spv::ImageOperandsMask::Offset) |
+                uint32_t(spv::ImageOperandsMask::ConstOffsets) |
+                uint32_t(spv::ImageOperandsMask::Sample) |
+                uint32_t(spv::ImageOperandsMask::MinLod) |
+                uint32_t(spv::ImageOperandsMask::Offsets);
+            if (mask & kIndexingMask) { skipped++; continue; }
+          }
+
+          const uint32_t image_id = inst.GetSingleWordInOperand(0);
+          const uint32_t coord_id = inst.GetSingleWordInOperand(1);
+
+          opt::Instruction* coord_def = du->GetDef(coord_id);
+          if (!coord_def) { skipped++; continue; }
+
+          IntCoordType coord_type;
+          if (!GetIntCoordType(du, coord_def->type_id(), &coord_type)) {
+            skipped++;
+            continue;
+          }
+
+          const uint32_t image_type_id = ResolveImageTypeId(du, image_id);
+          opt::Instruction* image_type = du->GetDef(image_type_id);
+          const uint32_t needed_components = ImageCoordComponentCount(image_type);
+          if (needed_components == 0 ||
+              needed_components != coord_type.component_count) {
+            skipped++;
+            continue;
+          }
+
+          candidates.push_back({&inst, image_id, coord_id, coord_type});
+        }
+      }
+    }
+
+    __atomic_add_fetch(&shim_m5_spirv_image_writes_seen, seen, __ATOMIC_RELAXED);
+    if (candidates.empty()) {
+      __atomic_add_fetch(&shim_m5_spirv_image_writes_skipped, skipped,
+                         __ATOMIC_RELAXED);
+      return Status::SuccessWithoutChange;
+    }
+
+    EnsureCapability(ctx, spv::Capability::ImageQuery);
+
+    int clamped = 0;
+    for (const Candidate& c : candidates) {
+      opt::Instruction* write = c.image_write;
+      opt::analysis::Type* scalar_coord_t = tm->GetType(c.coord_type.scalar_type_id);
+      if (!scalar_coord_t) { skipped++; continue; }
+      const uint32_t zero_coord_id = cm->GetNullConstId(scalar_coord_t);
+      if (!zero_coord_id) { skipped++; continue; }
+
+      opt::BasicBlock* old_bb = ctx->get_instr_block(write);
+      if (!old_bb) { skipped++; continue; }
+
+      // Locate the OpImageWrite's iterator within its (current) block.
+      auto write_iter = old_bb->begin();
+      while (write_iter != old_bb->end() && &*write_iter != write) ++write_iter;
+      if (write_iter == old_bb->end()) { skipped++; continue; }
+
+      // Build the bounds-check instructions but defer insertion until
+      // after the splits — we need the merge label to be allocated before
+      // we add OpSelectionMerge to old_bb.
+      const uint32_t size_id = ctx->TakeNextId();
+      std::unique_ptr<opt::Instruction> size_inst =
+          std::make_unique<opt::Instruction>(
+              ctx, Op::OpImageQuerySize, c.coord_type.type_id, size_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {c.image_id}}});
+
+      std::vector<std::unique_ptr<opt::Instruction>> prelude;
+      prelude.push_back(std::move(size_inst));
+
+      uint32_t combined_cond_id = 0;
+      for (uint32_t i = 0; i < c.coord_type.component_count; i++) {
+        uint32_t coord_comp_id = c.coord_id;
+        uint32_t size_comp_id = size_id;
+
+        if (c.coord_type.component_count > 1) {
+          coord_comp_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpCompositeExtract, c.coord_type.scalar_type_id,
+              coord_comp_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {c.coord_id}},
+                  {SPV_OPERAND_TYPE_LITERAL_INTEGER, {i}}}));
+
+          size_comp_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpCompositeExtract, c.coord_type.scalar_type_id,
+              size_comp_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {size_id}},
+                  {SPV_OPERAND_TYPE_LITERAL_INTEGER, {i}}}));
+        }
+
+        uint32_t comp_ok_id = 0;
+        if (c.coord_type.is_signed) {
+          const uint32_t ge_zero_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpSGreaterThanEqual, bool_id, ge_zero_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {zero_coord_id}}}));
+
+          const uint32_t lt_size_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpSLessThan, bool_id, lt_size_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {size_comp_id}}}));
+
+          comp_ok_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpLogicalAnd, bool_id, comp_ok_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {ge_zero_id}},
+                  {SPV_OPERAND_TYPE_ID, {lt_size_id}}}));
+        } else {
+          comp_ok_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpULessThan, bool_id, comp_ok_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {size_comp_id}}}));
+        }
+
+        if (combined_cond_id == 0) {
+          combined_cond_id = comp_ok_id;
+        } else {
+          const uint32_t and_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpLogicalAnd, bool_id, and_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {combined_cond_id}},
+                  {SPV_OPERAND_TYPE_ID, {comp_ok_id}}}));
+          combined_cond_id = and_id;
+        }
+      }
+
+      if (combined_cond_id == 0) { skipped++; continue; }
+
+      // Allocate labels for do_write_bb and merge_bb. The first split
+      // moves [OpImageWrite, ..., terminator] to a new block "tail_bb"
+      // (we name it do_write_bb here, but it still contains the original
+      // post-write instructions until the second split factors them off).
+      const uint32_t do_write_label_id = ctx->TakeNextId();
+      const uint32_t merge_label_id = ctx->TakeNextId();
+
+      opt::BasicBlock* do_write_bb =
+          old_bb->SplitBasicBlock(ctx, do_write_label_id, write_iter);
+
+      // After the first split, do_write_bb starts with the OpImageWrite.
+      // Split again at the instruction immediately following it so
+      // do_write_bb contains the write alone, and merge_bb gets the
+      // original post-write instructions and the terminator.
+      auto post_write_iter = do_write_bb->begin();
+      ++post_write_iter;  // past the OpImageWrite
+      opt::BasicBlock* merge_bb =
+          do_write_bb->SplitBasicBlock(ctx, merge_label_id, post_write_iter);
+      (void)merge_bb;  // referenced via merge_label_id
+
+      // Emit the prelude + structured-merge + conditional branch as the
+      // new terminator of old_bb. BasicBlock::AddInstruction returns
+      // void, so grab the raw pointer before moving the unique_ptr.
+      auto append_to = [&](opt::BasicBlock* bb,
+                           std::unique_ptr<opt::Instruction> inst) {
+        opt::Instruction* raw = inst.get();
+        bb->AddInstruction(std::move(inst));
+        du->AnalyzeInstDefUse(raw);
+        ctx->set_instr_block(raw, bb);
+      };
+
+      for (auto& inst : prelude) {
+        append_to(old_bb, std::move(inst));
+      }
+      append_to(old_bb, std::make_unique<opt::Instruction>(
+          ctx, Op::OpSelectionMerge, 0, 0,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {merge_label_id}},
+              {SPV_OPERAND_TYPE_SELECTION_CONTROL,
+               {static_cast<uint32_t>(spv::SelectionControlMask::MaskNone)}}}));
+      append_to(old_bb, std::make_unique<opt::Instruction>(
+          ctx, Op::OpBranchConditional, 0, 0,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {combined_cond_id}},
+              {SPV_OPERAND_TYPE_ID, {do_write_label_id}},
+              {SPV_OPERAND_TYPE_ID, {merge_label_id}}}));
+
+      // Terminate do_write_bb with OpBranch to merge_bb.
+      append_to(do_write_bb, std::make_unique<opt::Instruction>(
+          ctx, Op::OpBranch, 0, 0,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {merge_label_id}}}));
+
+      clamped++;
+    }
+
+    if (consumer()) {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "[shim-spv] A5W: clamped %d image-write op(s); seen=%d skipped=%d",
+                    clamped, seen, skipped);
+      spv_position_t pos = {};
+      consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
+    }
+
+    __atomic_add_fetch(&shim_m5_spirv_image_writes_clamped, clamped,
+                       __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_image_writes_skipped, skipped,
+                       __ATOMIC_RELAXED);
+
+    if (clamped > 0) {
+      // CFG / dominator / structured-CFG analyses are stale after our
+      // block splits. DefUse and InstrToBlockMapping have been kept
+      // current via per-instruction updates and SplitBasicBlock's own
+      // mapping fix-up. Invalidate the rest defensively; the driver
+      // doesn't need them after this pass, but it's cheap insurance
+      // against future passes being chained in.
+      ctx->InvalidateAnalysesExceptFor(
+          opt::IRContext::Analysis::kAnalysisDefUse |
+          opt::IRContext::Analysis::kAnalysisInstrToBlockMapping);
+    }
+
+    return clamped > 0 ? Status::SuccessWithChange
+                       : Status::SuccessWithoutChange;
+  }
+};
+
 }  // namespace
 
 extern "C" {
@@ -942,6 +1271,12 @@ __attribute__((visibility("default")))
 volatile int shim_m5_spirv_image_ops_skipped = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_image_sample_ops_seen = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_writes_seen = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_writes_clamped = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_writes_skipped = 0;
 
 __attribute__((visibility("default")))
 int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
@@ -985,6 +1320,10 @@ int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
     BoundsCheckImageReadsPass a5;
     a5.SetMessageConsumer(consumer);
     if (a5.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
+
+    BoundsCheckImageWritesPass a5w;
+    a5w.SetMessageConsumer(consumer);
+    if (a5w.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
   }
 
   std::vector<uint32_t> output;

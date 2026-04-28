@@ -1,0 +1,30 @@
+#version 450
+/*
+ * OOB storage-image WRITE probe for A5 robustImageAccess2 instrumentation
+ * (image-write slice). The shader writes one in-bounds and one OOB texel
+ * to a 4x1 R32_UINT storage image, then reads back all four texels into
+ * an output SSBO. After A5 image-write clamp:
+ *   outdata[0] = 0xCAFEBABE   (in-bounds write took effect)
+ *   outdata[1..3] = 0xDEADBEEF (image was pre-cleared to 0xDEADBEEF and
+ *                                the OOB write did not corrupt it)
+ *
+ * The pre-clear is done host-side via vkCmdClearColorImage. The OOB
+ * write at (100,0) would, without instrumentation, either no-op (Mali
+ * silently ignoring the OOB store) or corrupt the underlying image
+ * memory at an undefined offset. With instrumentation, the OpImageWrite
+ * is wrapped in a structured-control-flow guard and skipped when the
+ * coordinate is outside the image extent.
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D img;
+layout(set = 0, binding = 1) buffer OutBuf { uint outdata[]; };
+
+void main() {
+    imageStore(img, ivec2(0,   0), uvec4(0xCAFEBABEu, 0u, 0u, 0u));
+    imageStore(img, ivec2(100, 0), uvec4(0xC0FFEE00u, 0u, 0u, 0u));
+    memoryBarrierImage();
+    outdata[0] = imageLoad(img, ivec2(0, 0)).x;
+    outdata[1] = imageLoad(img, ivec2(1, 0)).x;
+    outdata[2] = imageLoad(img, ivec2(2, 0)).x;
+    outdata[3] = imageLoad(img, ivec2(3, 0)).x;
+}
