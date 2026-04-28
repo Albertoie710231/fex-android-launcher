@@ -35,6 +35,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "oob_probe_spv.h"
+#include "oob_image_probe_spv.h"
+#include "oob_fetch_probe_spv.h"
 
 /* Counters shared across tests. */
 static int g_pass = 0;
@@ -193,6 +195,20 @@ static int setup_vulkan(void) {
 }
 
 /* ----- tests ----- */
+
+static int pick_memory_type(uint32_t type_bits, VkMemoryPropertyFlags want) {
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (!(type_bits & (1u << i))) continue;
+        if ((mp.memoryTypes[i].propertyFlags & want) == want) return (int)i;
+    }
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (type_bits & (1u << i)) return (int)i;
+    }
+    return -1;
+}
 
 /* Dump apiVersion + driver info + every reported device extension. Useful
  * baseline so future runs can diff against this. */
@@ -1542,6 +1558,195 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
          access_into_metadata, ulessthan_count, select_count);
 }
 
+/* Phase A5 verification: image-read instrumentation should wrap
+ * OpImageRead with OpImageQuerySize + bounds predicates + OpSelect-zero.
+ * This is SPIR-V-only; the storage-image dispatch test below checks the
+ * runtime behavior on Mali. */
+static void test_spirv_pass_clamps_image_reads(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *clamped_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_ops_clamped");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!clamped_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_clamps_image_reads", "shim symbols not present (PASS A or pre-A5 build)");
+        return;
+    }
+
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+
+    int before = *clamped_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_image_probe_spv_len,
+        .pCode = (const uint32_t *)oob_image_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *clamped_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_reads", "vkCreateShaderModule rejected A5 module: %s", vkresult_str(r));
+        return;
+    }
+    if (after - before < 2) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_reads",
+             "image clamp counter advanced by %d, expected at least 2 imageLoad ops",
+             after - before);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t out_size = 0;
+    int ok = instrument((const uint32_t *)oob_image_probe_spv, oob_image_probe_spv_len,
+                        &out_code, &out_size);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_clamps_image_reads", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_clamps_image_reads", "spirv-val rejected A5 module: %s", vmsg);
+        return;
+    }
+
+    int image_query_size = 0, select_count = 0, logical_and = 0;
+    size_t total_words = out_size / 4;
+    for (size_t i = 5; i < total_words;) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        if (op == 104) image_query_size++; /* OpImageQuerySize */
+        if (op == 169) select_count++;     /* OpSelect */
+        if (op == 167) logical_and++;      /* OpLogicalAnd */
+        i += len;
+    }
+    freefn(out_code);
+
+    if (image_query_size < 2 || select_count < 2 || logical_and < 2) {
+        FAIL("spirv_pass_clamps_image_reads",
+             "A5 scaffolding missing: OpImageQuerySize=%d OpSelect=%d OpLogicalAnd=%d",
+             image_query_size, select_count, logical_and);
+        return;
+    }
+    PASS("spirv_pass_clamps_image_reads",
+         "A5 emitted image-read clamps; counter %d→%d, OpImageQuerySize=%d OpSelect=%d, spirv-val OK",
+         before, after, image_query_size, select_count);
+}
+
+/* A5 sampled-image fetch slice: texelFetch lowers to OpImageFetch with a
+ * Lod image operand. The pass should use OpImageQuerySizeLod so mip-level
+ * coordinates are checked against the correct dimensions. */
+static void test_spirv_pass_clamps_image_fetches(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *clamped_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_ops_clamped");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!clamped_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_clamps_image_fetches", "shim symbols not present (PASS A or pre-A5 build)");
+        return;
+    }
+
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+
+    int before = *clamped_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_fetch_probe_spv_len,
+        .pCode = (const uint32_t *)oob_fetch_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *clamped_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_fetches", "vkCreateShaderModule rejected A5 fetch module: %s", vkresult_str(r));
+        return;
+    }
+    if (after - before < 2) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_clamps_image_fetches",
+             "image clamp counter advanced by %d, expected at least 2 texelFetch ops",
+             after - before);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t out_size = 0;
+    int ok = instrument((const uint32_t *)oob_fetch_probe_spv, oob_fetch_probe_spv_len,
+                        &out_code, &out_size);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_clamps_image_fetches", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_clamps_image_fetches", "spirv-val rejected A5 fetch module: %s", vmsg);
+        return;
+    }
+
+    int image_query_size_lod = 0, image_fetch = 0, select_count = 0;
+    size_t total_words = out_size / 4;
+    for (size_t i = 5; i < total_words;) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        if (op == 103) image_query_size_lod++; /* OpImageQuerySizeLod */
+        if (op == 95) image_fetch++;           /* OpImageFetch */
+        if (op == 169) select_count++;         /* OpSelect */
+        i += len;
+    }
+    freefn(out_code);
+
+    if (image_query_size_lod < 2 || image_fetch < 2 || select_count < 2) {
+        FAIL("spirv_pass_clamps_image_fetches",
+             "A5 fetch scaffolding missing: OpImageQuerySizeLod=%d OpImageFetch=%d OpSelect=%d",
+             image_query_size_lod, image_fetch, select_count);
+        return;
+    }
+    PASS("spirv_pass_clamps_image_fetches",
+         "A5 emitted texelFetch clamps; counter %d→%d, OpImageQuerySizeLod=%d OpSelect=%d, spirv-val OK",
+         before, after, image_query_size_lod, select_count);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -1569,6 +1774,10 @@ static void test_mali_oob_ssbo_probe(void) {
      * vkCmdBindDescriptorSets refreshes the metadata buffer + binds
      * our meta set at slot 6. */
     int a4_active = ((volatile int *)dlsym(g_lib, "shim_m5_a4_pipeline_layouts_extended")) != NULL;
+    volatile int *a4_binds_cnt = a4_active
+        ? (volatile int *)dlsym(g_lib, "shim_m5_a4_binds_extended")
+        : NULL;
+    int a4_binds_before = a4_binds_cnt ? *a4_binds_cnt : -1;
     typedef void (*pfn_refresh)(void);
     pfn_refresh a4_refresh = a4_active ? (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env") : NULL;
     if (a4_active) {
@@ -1752,11 +1961,19 @@ static void test_mali_oob_ssbo_probe(void) {
     vkMapMemory(g_device, out_mem, 0, BUF_SZ, 0, &outp);
     if (outp) result = *(uint32_t *)outp;
     vkUnmapMemory(g_device, out_mem);
+    int a4_binds_after = a4_binds_cnt ? *a4_binds_cnt : -1;
 
     if (result == 0u) {
         if (a4_active) {
+            if (!a4_binds_cnt || a4_binds_after <= a4_binds_before) {
+                FAIL("mali_oob_ssbo_probe",
+                     "result=0 but A4 bind counter did not advance (%d→%d) — metadata path was not proven",
+                     a4_binds_before, a4_binds_after);
+                goto cleanup_all;
+            }
             PASS("mali_oob_ssbo_probe",
-                 "result=0 with A3+A4 active → SPIR-V instrumentation clamped the OOB read; real robustBufferAccess2 delivered (not just spoofed)");
+                 "result=0 with A3+A4 active → SPIR-V instrumentation clamped the OOB read; metadata bind counter %d→%d",
+                 a4_binds_before, a4_binds_after);
         } else {
             PASS("mali_oob_ssbo_probe",
                  "result=0 → Mali zeros OOB at descriptor-range level (real robustness2 for SSBOs comes free, no SPIR-V instrumentation needed for buffer reads)");
@@ -1792,6 +2009,260 @@ cleanup_buffers:
         unsetenv("SHIM_INSTRUMENT_ENABLE");
         if (a4_refresh) a4_refresh();
     }
+}
+
+/* End-to-end A5 probe: a compute shader reads one in-bounds texel and one
+ * out-of-bounds texel from a 1x1 R32_UINT storage image. A5 should preserve
+ * the in-bounds marker and select zero for the OOB imageLoad. */
+static void test_mali_oob_storage_image_probe(void) {
+    volatile int *a5_clamped = (volatile int *)dlsym(g_lib, "shim_m5_spirv_image_ops_clamped");
+    volatile int *a4_binds_cnt = (volatile int *)dlsym(g_lib, "shim_m5_a4_binds_extended");
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh a4_refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+    if (!a5_clamped || !a4_binds_cnt || !a4_refresh) {
+        SKIP("mali_oob_storage_image_probe", "shim A5/A4 symbols not present (PASS A or pre-A5 build)");
+        return;
+    }
+
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateImage);
+    LOAD_DEV(vkDestroyImage);
+    LOAD_DEV(vkGetImageMemoryRequirements);
+    LOAD_DEV(vkBindImageMemory);
+    LOAD_DEV(vkCreateImageView);
+    LOAD_DEV(vkDestroyImageView);
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkMapMemory);
+    LOAD_DEV(vkUnmapMemory);
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+    LOAD_DEV(vkCreateDescriptorSetLayout);
+    LOAD_DEV(vkDestroyDescriptorSetLayout);
+    LOAD_DEV(vkCreateDescriptorPool);
+    LOAD_DEV(vkDestroyDescriptorPool);
+    LOAD_DEV(vkAllocateDescriptorSets);
+    LOAD_DEV(vkUpdateDescriptorSets);
+    LOAD_DEV(vkCreatePipelineLayout);
+    LOAD_DEV(vkDestroyPipelineLayout);
+    LOAD_DEV(vkCreateComputePipelines);
+    LOAD_DEV(vkDestroyPipeline);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_DEV(vkCmdPipelineBarrier);
+    LOAD_DEV(vkCmdBindPipeline);
+    LOAD_DEV(vkCmdBindDescriptorSets);
+    LOAD_DEV(vkCmdDispatch);
+    LOAD_DEV(vkCreateFence);
+    LOAD_DEV(vkDestroyFence);
+    LOAD_DEV(vkWaitForFences);
+    LOAD_DEV(vkGetDeviceQueue);
+    LOAD_DEV(vkQueueSubmit);
+
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    a4_refresh();
+    int a5_before = *a5_clamped;
+    int binds_before = *a4_binds_cnt;
+
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory img_mem = VK_NULL_HANDLE;
+    VkImageView img_view = VK_NULL_HANDLE;
+    VkBuffer out_buf = VK_NULL_HANDLE;
+    VkDeviceMemory out_mem = VK_NULL_HANDLE;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R32_UINT,
+        .extent = { 1, 1, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkResult r = vkCreateImage(g_device, &ici, NULL, &img);
+    if (r != VK_SUCCESS) { SKIP("mali_oob_storage_image_probe", "vkCreateImage(R32_UINT storage): %s", vkresult_str(r)); goto cleanup; }
+    VkMemoryRequirements ireq;
+    vkGetImageMemoryRequirements(g_device, img, &ireq);
+    int imt = pick_memory_type(ireq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (imt < 0) { FAIL("mali_oob_storage_image_probe", "no memory type for storage image"); goto cleanup; }
+    VkMemoryAllocateInfo imai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = ireq.size, .memoryTypeIndex = (uint32_t)imt };
+    r = vkAllocateMemory(g_device, &imai, NULL, &img_mem);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkAllocateMemory image: %s", vkresult_str(r)); goto cleanup; }
+    vkBindImageMemory(g_device, img, img_mem, 0);
+
+    VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R32_UINT,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    r = vkCreateImageView(g_device, &ivci, NULL, &img_view);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateImageView: %s", vkresult_str(r)); goto cleanup; }
+
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 8, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    r = vkCreateBuffer(g_device, &bci, NULL, &out_buf);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateBuffer out: %s", vkresult_str(r)); goto cleanup; }
+    VkMemoryRequirements breq;
+    vkGetBufferMemoryRequirements(g_device, out_buf, &breq);
+    int bmt = pick_memory_type(breq.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (bmt < 0) { FAIL("mali_oob_storage_image_probe", "no host-visible buffer memory"); goto cleanup; }
+    VkMemoryAllocateInfo bmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = breq.size, .memoryTypeIndex = (uint32_t)bmt };
+    r = vkAllocateMemory(g_device, &bmai, NULL, &out_mem);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkAllocateMemory out: %s", vkresult_str(r)); goto cleanup; }
+    vkBindBufferMemory(g_device, out_buf, out_mem, 0);
+    void *p = NULL;
+    vkMapMemory(g_device, out_mem, 0, 8, 0, &p);
+    if (p) memset(p, 0, 8);
+    vkUnmapMemory(g_device, out_mem);
+
+    VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_image_probe_spv_len, .pCode = (const uint32_t *)oob_image_probe_spv };
+    r = vkCreateShaderModule(g_device, &smci, NULL, &shader);
+    int a5_after_shader = *a5_clamped;
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateShaderModule: %s", vkresult_str(r)); goto cleanup; }
+    if (a5_after_shader - a5_before < 2) {
+        FAIL("mali_oob_storage_image_probe", "A5 counter advanced by %d, expected at least 2", a5_after_shader - a5_before);
+        goto cleanup;
+    }
+
+    VkDescriptorSetLayoutBinding dslb[2] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+    VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2, .pBindings = dslb };
+    r = vkCreateDescriptorSetLayout(g_device, &dslci, NULL, &dsl);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateDescriptorSetLayout: %s", vkresult_str(r)); goto cleanup; }
+
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl };
+    r = vkCreatePipelineLayout(g_device, &plci, NULL, &pl);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreatePipelineLayout: %s", vkresult_str(r)); goto cleanup; }
+
+    VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+        .layout = pl };
+    r = vkCreateComputePipelines(g_device, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateComputePipelines: %s", vkresult_str(r)); goto cleanup; }
+
+    VkDescriptorPoolSize ps[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1 },
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
+    };
+    VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps };
+    r = vkCreateDescriptorPool(g_device, &dpci, NULL, &dpool);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateDescriptorPool: %s", vkresult_str(r)); goto cleanup; }
+    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    r = vkAllocateDescriptorSets(g_device, &dsai, &dset);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkAllocateDescriptorSets: %s", vkresult_str(r)); goto cleanup; }
+
+    VkDescriptorImageInfo ii = { .imageView = img_view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorBufferInfo bi = { .buffer = out_buf, .offset = 0, .range = 8 };
+    VkWriteDescriptorSet writes[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi },
+    };
+    vkUpdateDescriptorSets(g_device, 2, writes, 0, NULL);
+
+    VkCommandPoolCreateInfo cpci2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = g_gfx_qfam };
+    r = vkCreateCommandPool(g_device, &cpci2, NULL, &cpool);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkCreateCommandPool: %s", vkresult_str(r)); goto cleanup; }
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &cbbi);
+    VkImageMemoryBarrier imb = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &imb);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, NULL);
+    vkCmdDispatch(cb, 1, 1, 1);
+    vkEndCommandBuffer(cb);
+
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g_device, g_gfx_qfam, 0, &queue);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    vkCreateFence(g_device, &fci, NULL, &fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    r = vkQueueSubmit(queue, 1, &si, fence);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkQueueSubmit: %s", vkresult_str(r)); goto cleanup; }
+    r = vkWaitForFences(g_device, 1, &fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000);
+    if (r != VK_SUCCESS) { FAIL("mali_oob_storage_image_probe", "vkWaitForFences: %s", vkresult_str(r)); goto cleanup; }
+
+    uint32_t result[2] = { 0xCAFEBABEu, 0xCAFEBABEu };
+    vkMapMemory(g_device, out_mem, 0, 8, 0, &p);
+    if (p) memcpy(result, p, 8);
+    vkUnmapMemory(g_device, out_mem);
+    int binds_after = *a4_binds_cnt;
+    if (binds_after <= binds_before) {
+        FAIL("mali_oob_storage_image_probe", "A4 metadata bind counter did not advance (%d→%d)", binds_before, binds_after);
+    } else if (result[0] == 0xDEADBEEFu && result[1] == 0u) {
+        PASS("mali_oob_storage_image_probe",
+             "in-bounds imageLoad preserved 0x%08x and OOB imageLoad zeroed; A5 counter %d→%d, A4 binds %d→%d",
+             result[0], a5_before, a5_after_shader, binds_before, binds_after);
+    } else {
+        FAIL("mali_oob_storage_image_probe",
+             "unexpected results: in_bounds=0x%08x oob=0x%08x (expected 0xDEADBEEF,0)",
+             result[0], result[1]);
+    }
+
+cleanup:
+    if (fence) vkDestroyFence(g_device, fence, NULL);
+    if (cpool) vkDestroyCommandPool(g_device, cpool, NULL);
+    if (dpool) vkDestroyDescriptorPool(g_device, dpool, NULL);
+    if (pipe) vkDestroyPipeline(g_device, pipe, NULL);
+    if (pl) vkDestroyPipelineLayout(g_device, pl, NULL);
+    if (dsl) vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+    if (shader) vkDestroyShaderModule(g_device, shader, NULL);
+    if (out_mem) vkFreeMemory(g_device, out_mem, NULL);
+    if (out_buf) vkDestroyBuffer(g_device, out_buf, NULL);
+    if (img_view) vkDestroyImageView(g_device, img_view, NULL);
+    if (img_mem) vkFreeMemory(g_device, img_mem, NULL);
+    if (img) vkDestroyImage(g_device, img, NULL);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    a4_refresh();
 }
 
 /* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
@@ -1912,7 +2383,10 @@ int main(int argc, char **argv) {
     test_spirv_pass_identifies_descriptor_loads();
     test_spirv_pass_injects_metadata_binding();
     test_spirv_pass_clamps_descriptor_loads();
+    test_spirv_pass_clamps_image_reads();
+    test_spirv_pass_clamps_image_fetches();
     test_mali_oob_ssbo_probe();
+    test_mali_oob_storage_image_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)

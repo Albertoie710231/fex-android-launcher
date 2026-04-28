@@ -1352,6 +1352,7 @@ static VkResult VKAPI_PTR shim_CreatePipelineLayout_full(
     VkResult r = g_real_create_pipeline_layout(device, &modified, pAllocator, pPipelineLayout);
     if (r == VK_SUCCESS)
         __atomic_fetch_add(&shim_m5_a4_pipeline_layouts_extended, 1, __ATOMIC_RELAXED);
+    free(extended);
     return r;
 }
 
@@ -1426,10 +1427,6 @@ static void shim_CmdBindDescriptorSets_full(
     uint32_t              descriptorSetCount,
     const VkDescriptorSet *pDescriptorSets)
 {
-    /* DEBUG: short-circuit */
-    (void)commandBuffer; (void)pipelineBindPoint; (void)layout;
-    (void)firstSet; (void)descriptorSetCount; (void)pDescriptorSets;
-    return;
     pthread_mutex_lock(&g_a4_sets_mutex);
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
         uint32_t slot = firstSet + i;

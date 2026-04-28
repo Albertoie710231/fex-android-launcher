@@ -55,6 +55,9 @@ extern volatile int shim_m5_spirv_metadata_injected;
 extern volatile int shim_m5_spirv_metadata_skipped_pre_1_3;
 extern volatile int shim_m5_spirv_loads_clamped;
 extern volatile int shim_m5_spirv_loads_skipped_no_array;
+extern volatile int shim_m5_spirv_image_ops_seen;
+extern volatile int shim_m5_spirv_image_ops_clamped;
+extern volatile int shim_m5_spirv_image_ops_skipped;
 }
 
 // Metadata buffer logical layout: bucket = set * kShimMetadataMaxBindings + binding.
@@ -339,6 +342,94 @@ static uint32_t FindMetadataVarId(spvtools::opt::Module* mod) {
   return 0;
 }
 
+static bool HasCapability(spvtools::opt::IRContext* ctx, spv::Capability cap) {
+  for (auto& c : ctx->capabilities()) {
+    if (c.opcode() == spv::Op::OpCapability &&
+        c.GetSingleWordInOperand(0) == static_cast<uint32_t>(cap)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void EnsureCapability(spvtools::opt::IRContext* ctx, spv::Capability cap) {
+  if (HasCapability(ctx, cap)) return;
+  ctx->AddCapability(std::make_unique<spvtools::opt::Instruction>(
+      ctx, spv::Op::OpCapability, 0, 0,
+      std::initializer_list<spvtools::opt::Operand>{
+          {SPV_OPERAND_TYPE_CAPABILITY, {static_cast<uint32_t>(cap)}}}));
+}
+
+struct IntCoordType {
+  uint32_t type_id = 0;
+  uint32_t scalar_type_id = 0;
+  uint32_t component_count = 0;
+  bool is_signed = false;
+};
+
+static bool GetIntCoordType(spvtools::opt::analysis::DefUseManager* du,
+                            uint32_t type_id, IntCoordType* out) {
+  using spv::Op;
+  spvtools::opt::Instruction* type = du->GetDef(type_id);
+  if (!type) return false;
+
+  uint32_t scalar_type_id = type_id;
+  uint32_t component_count = 1;
+  if (type->opcode() == Op::OpTypeVector) {
+    scalar_type_id = type->GetSingleWordInOperand(0);
+    component_count = type->GetSingleWordInOperand(1);
+    type = du->GetDef(scalar_type_id);
+    if (!type) return false;
+  }
+
+  if (type->opcode() != Op::OpTypeInt || type->NumInOperands() < 2) return false;
+  if (type->GetSingleWordInOperand(0) != 32) return false;
+
+  out->type_id = type_id;
+  out->scalar_type_id = scalar_type_id;
+  out->component_count = component_count;
+  out->is_signed = type->GetSingleWordInOperand(1) != 0;
+  return true;
+}
+
+static uint32_t ImageCoordComponentCount(spvtools::opt::Instruction* image_type) {
+  if (!image_type || image_type->opcode() != spv::Op::OpTypeImage ||
+      image_type->NumInOperands() < 6) {
+    return 0;
+  }
+
+  uint32_t dims = 0;
+  switch (static_cast<spv::Dim>(image_type->GetSingleWordInOperand(1))) {
+  case spv::Dim::Dim1D: dims = 1; break;
+  case spv::Dim::Dim2D: dims = 2; break;
+  case spv::Dim::Dim3D: dims = 3; break;
+  case spv::Dim::Rect: dims = 2; break;
+  case spv::Dim::Buffer: dims = 1; break;
+  case spv::Dim::SubpassData: dims = 2; break;
+  default: return 0;
+  }
+
+  const uint32_t arrayed = image_type->GetSingleWordInOperand(3);
+  if (arrayed) dims++;
+  return dims;
+}
+
+static uint32_t ResolveImageTypeId(spvtools::opt::analysis::DefUseManager* du,
+                                   uint32_t image_value_id) {
+  spvtools::opt::Instruction* image_def = du->GetDef(image_value_id);
+  if (!image_def) return 0;
+  uint32_t type_id = image_def->type_id();
+  spvtools::opt::Instruction* type = du->GetDef(type_id);
+  if (!type) return 0;
+  if (type->opcode() == spv::Op::OpTypeSampledImage) {
+    return type->GetSingleWordInOperand(0);
+  }
+  if (type->opcode() == spv::Op::OpTypeImage) {
+    return type_id;
+  }
+  return 0;
+}
+
 // Phase A3 pass: rewrite each descriptor-mediated OpLoad whose pointer
 // is a single OpAccessChain with ≥ 2 indices into a clamped form:
 //
@@ -558,6 +649,245 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
   }
 };
 
+// Phase A5: robustImageAccess2 for integer-coordinate image reads/fetches.
+// For OpImageRead / OpImageFetch on 1D/2D/3D-style images, emit:
+//
+//   %size = OpImageQuerySize[ Lod ] %coord_type %image [ %lod ]
+//   %ok   = all(coord >= 0 && coord < size)  ; signed coords
+//        or all(coord < size)                 ; unsigned coords
+//   %orig = OpImageRead/Fetch %T %image %coord ...
+//   %sel  = OpSelect %T %ok %orig %null_T
+//
+// This deliberately does not allocate or bind any per-image state: image
+// extents come from the image object itself, and zero values use
+// OpConstantNull of the image result type. Image writes, sampled
+// normalized-coordinate operations, sparse residency, and format-specific
+// non-zero defaults are still out of scope.
+class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
+ public:
+  const char* name() const override { return "shim-m5-bounds-check-image-reads"; }
+
+  Status Process() override {
+    using spv::Op;
+    namespace opt = spvtools::opt;
+    opt::IRContext* ctx = context();
+    opt::Module* mod = ctx->module();
+
+    opt::analysis::DefUseManager* du = ctx->get_def_use_mgr();
+    opt::analysis::TypeManager* tm = ctx->get_type_mgr();
+    opt::analysis::ConstantManager* cm = ctx->get_constant_mgr();
+
+    const uint32_t bool_id = tm->GetBoolTypeId();
+    if (!bool_id) return Status::Failure;
+
+    struct Candidate {
+      opt::Instruction* image_read;
+      uint32_t image_id;
+      uint32_t coord_id;
+      uint32_t lod_id;
+      IntCoordType coord_type;
+    };
+    std::vector<Candidate> candidates;
+    int seen = 0;
+    int skipped = 0;
+
+    for (auto& fn : *mod) {
+      fn.ForEachInst([&](opt::Instruction* inst) {
+        if (inst->opcode() != Op::OpImageRead &&
+            inst->opcode() != Op::OpImageFetch) return;
+        seen++;
+        if (inst->NumInOperands() < 2) { skipped++; return; }
+
+        const uint32_t image_id = inst->GetSingleWordInOperand(0);
+        const uint32_t coord_id = inst->GetSingleWordInOperand(1);
+        uint32_t lod_id = 0;
+        if (inst->opcode() == Op::OpImageFetch && inst->NumInOperands() >= 4) {
+          const uint32_t image_operands = inst->GetSingleWordInOperand(2);
+          if (image_operands & uint32_t(spv::ImageOperandsMask::Lod)) {
+            lod_id = inst->GetSingleWordInOperand(3);
+          }
+        }
+        opt::Instruction* coord_def = du->GetDef(coord_id);
+        if (!coord_def) { skipped++; return; }
+
+        IntCoordType coord_type;
+        if (!GetIntCoordType(du, coord_def->type_id(), &coord_type)) {
+          skipped++;
+          return;
+        }
+
+        const uint32_t image_type_id = ResolveImageTypeId(du, image_id);
+        opt::Instruction* image_type = du->GetDef(image_type_id);
+        const uint32_t needed_components = ImageCoordComponentCount(image_type);
+        if (needed_components == 0 || needed_components != coord_type.component_count) {
+          skipped++;
+          return;
+        }
+
+        candidates.push_back({inst, image_id, coord_id, lod_id, coord_type});
+      });
+    }
+
+    __atomic_add_fetch(&shim_m5_spirv_image_ops_seen, seen, __ATOMIC_RELAXED);
+    if (candidates.empty()) {
+      __atomic_add_fetch(&shim_m5_spirv_image_ops_skipped, skipped, __ATOMIC_RELAXED);
+      return Status::SuccessWithoutChange;
+    }
+
+    EnsureCapability(ctx, spv::Capability::ImageQuery);
+
+    int clamped = 0;
+    for (const Candidate& c : candidates) {
+      opt::Instruction* read = c.image_read;
+      const uint32_t result_type = read->type_id();
+      const uint32_t orig_read_id = read->result_id();
+
+      opt::analysis::Type* result_t = tm->GetType(result_type);
+      opt::analysis::Type* scalar_coord_t = tm->GetType(c.coord_type.scalar_type_id);
+      if (!result_t || !scalar_coord_t) { skipped++; continue; }
+      const uint32_t null_result_id = cm->GetNullConstId(result_t);
+      const uint32_t zero_coord_id = cm->GetNullConstId(scalar_coord_t);
+      if (!null_result_id || !zero_coord_id) { skipped++; continue; }
+
+      const uint32_t size_id = ctx->TakeNextId();
+      std::unique_ptr<opt::Instruction> size_inst;
+      if (c.lod_id != 0) {
+        size_inst = std::make_unique<opt::Instruction>(
+            ctx, Op::OpImageQuerySizeLod, c.coord_type.type_id, size_id,
+            std::initializer_list<opt::Operand>{
+                {SPV_OPERAND_TYPE_ID, {c.image_id}},
+                {SPV_OPERAND_TYPE_ID, {c.lod_id}}});
+      } else {
+        size_inst = std::make_unique<opt::Instruction>(
+            ctx, Op::OpImageQuerySize, c.coord_type.type_id, size_id,
+            std::initializer_list<opt::Operand>{
+                {SPV_OPERAND_TYPE_ID, {c.image_id}}});
+      }
+
+      std::vector<std::unique_ptr<opt::Instruction>> prelude;
+      prelude.push_back(std::move(size_inst));
+
+      uint32_t combined_cond_id = 0;
+      for (uint32_t i = 0; i < c.coord_type.component_count; i++) {
+        uint32_t coord_comp_id = c.coord_id;
+        uint32_t size_comp_id = size_id;
+
+        if (c.coord_type.component_count > 1) {
+          coord_comp_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpCompositeExtract, c.coord_type.scalar_type_id,
+              coord_comp_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {c.coord_id}},
+                  {SPV_OPERAND_TYPE_LITERAL_INTEGER, {i}}}));
+
+          size_comp_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpCompositeExtract, c.coord_type.scalar_type_id,
+              size_comp_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {size_id}},
+                  {SPV_OPERAND_TYPE_LITERAL_INTEGER, {i}}}));
+        }
+
+        uint32_t comp_ok_id = 0;
+        if (c.coord_type.is_signed) {
+          const uint32_t ge_zero_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpSGreaterThanEqual, bool_id, ge_zero_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {zero_coord_id}}}));
+
+          const uint32_t lt_size_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpSLessThan, bool_id, lt_size_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {size_comp_id}}}));
+
+          comp_ok_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpLogicalAnd, bool_id, comp_ok_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {ge_zero_id}},
+                  {SPV_OPERAND_TYPE_ID, {lt_size_id}}}));
+        } else {
+          comp_ok_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpULessThan, bool_id, comp_ok_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {coord_comp_id}},
+                  {SPV_OPERAND_TYPE_ID, {size_comp_id}}}));
+        }
+
+        if (combined_cond_id == 0) {
+          combined_cond_id = comp_ok_id;
+        } else {
+          const uint32_t and_id = ctx->TakeNextId();
+          prelude.push_back(std::make_unique<opt::Instruction>(
+              ctx, Op::OpLogicalAnd, bool_id, and_id,
+              std::initializer_list<opt::Operand>{
+                  {SPV_OPERAND_TYPE_ID, {combined_cond_id}},
+                  {SPV_OPERAND_TYPE_ID, {comp_ok_id}}}));
+          combined_cond_id = and_id;
+        }
+      }
+
+      if (combined_cond_id == 0) { skipped++; continue; }
+
+      // Capture existing users before adding the OpSelect, so the select's
+      // own use of the original image-read id is not redirected.
+      std::vector<std::pair<opt::Instruction*, uint32_t>> uses_to_redirect;
+      du->ForEachUse(orig_read_id,
+                     [&](opt::Instruction* user, uint32_t op_idx) {
+                       uses_to_redirect.push_back({user, op_idx});
+                     });
+
+      for (auto& inst : prelude) {
+        opt::Instruction* raw = read->InsertBefore(std::move(inst));
+        du->AnalyzeInstDefUse(raw);
+      }
+
+      const uint32_t sel_id = ctx->TakeNextId();
+      opt::Instruction* sel_inst = new opt::Instruction(
+          ctx, Op::OpSelect, result_type, sel_id,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {combined_cond_id}},
+              {SPV_OPERAND_TYPE_ID, {orig_read_id}},
+              {SPV_OPERAND_TYPE_ID, {null_result_id}}});
+      sel_inst->InsertAfter(read);
+      du->AnalyzeInstDefUse(sel_inst);
+
+      for (auto& u : uses_to_redirect) {
+        opt::Instruction* user = u.first;
+        uint32_t op_idx = u.second;
+        opt::Operand& o = *(user->begin() + op_idx);
+        if (o.words.size() == 1 && o.words[0] == orig_read_id) {
+          o.words[0] = sel_id;
+        }
+        du->AnalyzeInstUse(user);
+      }
+
+      clamped++;
+    }
+
+    if (consumer()) {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "[shim-spv] A5: clamped %d image read/fetch op(s); seen=%d skipped=%d",
+                    clamped, seen, skipped);
+      spv_position_t pos = {};
+      consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
+    }
+
+    __atomic_add_fetch(&shim_m5_spirv_image_ops_clamped, clamped, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_image_ops_skipped, skipped, __ATOMIC_RELAXED);
+    return clamped > 0 ? Status::SuccessWithChange
+                       : Status::SuccessWithoutChange;
+  }
+};
+
 }  // namespace
 
 extern "C" {
@@ -577,6 +907,12 @@ __attribute__((visibility("default")))
 volatile int shim_m5_spirv_loads_clamped = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_loads_skipped_no_array = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_ops_seen = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_ops_clamped = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_image_ops_skipped = 0;
 
 __attribute__((visibility("default")))
 int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
@@ -616,6 +952,10 @@ int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
     BoundsCheckDescriptorLoadsPass a3;
     a3.SetMessageConsumer(consumer);
     if (a3.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
+
+    BoundsCheckImageReadsPass a5;
+    a5.SetMessageConsumer(consumer);
+    if (a5.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
   }
 
   std::vector<uint32_t> output;

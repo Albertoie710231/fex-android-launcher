@@ -1,0 +1,18 @@
+#version 450
+/*
+ * OOB storage-image probe for A5 robustImageAccess2 instrumentation.
+ *
+ * The shader writes a known marker to texel (0,0), reads that in-bounds
+ * texel back, then reads far outside the 1x1 image. A5 should preserve
+ * the in-bounds read and select zero for the out-of-bounds read.
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D img;
+layout(set = 0, binding = 1) buffer OutBuf { uint outdata[]; };
+
+void main() {
+    imageStore(img, ivec2(0, 0), uvec4(0xDEADBEEFu, 0u, 0u, 0u));
+    memoryBarrierImage();
+    outdata[0] = imageLoad(img, ivec2(0, 0)).x;
+    outdata[1] = imageLoad(img, ivec2(1024, 0)).x;
+}

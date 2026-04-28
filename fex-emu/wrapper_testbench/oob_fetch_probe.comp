@@ -1,0 +1,18 @@
+#version 450
+/*
+ * OOB texelFetch probe for A5 robustImageAccess2 instrumentation.
+ * Same 1x1 image is bound as storage image and sampled image. The shader
+ * writes a marker, then texelFetches one in-bounds and one OOB texel.
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D img;
+layout(set = 0, binding = 1) uniform usampler2D tex;
+layout(set = 0, binding = 2) buffer OutBuf { uint outdata[]; };
+
+void main() {
+    imageStore(img, ivec2(0, 0), uvec4(0xDEADBEEFu, 0u, 0u, 0u));
+    memoryBarrierImage();
+    barrier();
+    outdata[0] = texelFetch(tex, ivec2(0, 0), 0).x;
+    outdata[1] = texelFetch(tex, ivec2(1024, 0), 0).x;
+}

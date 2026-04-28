@@ -44,19 +44,27 @@ if [ ! -f "$SPIRV_TOOLS_LIB" ] || [ ! -f "$SPIRV_TOOLS_OPT_LIB" ]; then
 fi
 echo "SPIRV-Tools libs: $(stat -c '%s' "$SPIRV_TOOLS_LIB") + $(stat -c '%s' "$SPIRV_TOOLS_OPT_LIB") bytes"
 
-# Compile the OOB probe compute shader into a C header. Generated each
-# build so editing the .comp invalidates correctly.
-SPV_OUT="/tmp/oob_probe.spv"
-"$GLSLC" --target-env=vulkan1.3 -o "$SPV_OUT" "$SCRIPT_DIR/oob_probe.comp"
-HDR_OUT="$SCRIPT_DIR/oob_probe_spv.h"
-{
-    printf '/* Auto-generated from oob_probe.comp by build.sh — do not edit. */\n'
-    printf 'static const unsigned char oob_probe_spv[] = {\n'
-    od -An -v -tx1 "$SPV_OUT" | sed -E 's/[[:space:]]+/ /g; s/ ([0-9a-f]{2})/0x\1,/g; s/^ //'
-    printf '};\n'
-    printf 'static const unsigned int oob_probe_spv_len = sizeof(oob_probe_spv);\n'
-} > "$HDR_OUT"
-echo "compiled: $SPV_OUT ($(stat -c '%s bytes' "$SPV_OUT")) → $HDR_OUT"
+# Compile probe compute shaders into C headers. Generated each build so
+# editing a .comp invalidates correctly.
+compile_spv_header() {
+    local src="$1"
+    local var="$2"
+    local spv_out="/tmp/${var}.spv"
+    local hdr_out="$SCRIPT_DIR/${var}.h"
+    "$GLSLC" --target-env=vulkan1.3 -o "$spv_out" "$SCRIPT_DIR/$src"
+    {
+        printf '/* Auto-generated from %s by build.sh — do not edit. */\n' "$src"
+        printf 'static const unsigned char %s[] = {\n' "$var"
+        od -An -v -tx1 "$spv_out" | sed -E 's/[[:space:]]+/ /g; s/ ([0-9a-f]{2})/0x\1,/g; s/^ //'
+        printf '};\n'
+        printf 'static const unsigned int %s_len = sizeof(%s);\n' "$var" "$var"
+    } > "$hdr_out"
+    echo "compiled: $spv_out ($(stat -c '%s bytes' "$spv_out")) → $hdr_out"
+}
+
+compile_spv_header "oob_probe.comp" "oob_probe_spv"
+compile_spv_header "oob_image_probe.comp" "oob_image_probe_spv"
+compile_spv_header "oob_fetch_probe.comp" "oob_fetch_probe_spv"
 
 OUT="/tmp/wrapper_testbench"
 "$CC" \
