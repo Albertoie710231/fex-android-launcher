@@ -90,6 +90,14 @@ static PFN_vkCreateShaderModule                         g_real_create_shader_mod
  * nullDescriptor real-implementation"). */
 static VkPhysicalDevice                                 g_pdev_for_standins = VK_NULL_HANDLE;
 
+/* Forward declarations for the A4 (runtime metadata buffer) section
+ * defined later in the file. The cache flag is read directly (single
+ * volatile load) so the dispatcher trampolines stay tiny — see
+ * "stack-canary sensitivity to body size" comment in the A4 block. */
+extern volatile int g_a4_instrument_enabled_cache;
+static void instrument_refresh_env(void);
+static void a4_record_writes(uint32_t writeCount, const VkWriteDescriptorSet *writes);
+
 /* Exposed counters so the testbench can prove a fold actually fired,
  * not just that vkCreateBuffer happened to succeed (the wrapper is lax
  * about usage=0, so success-on-create is not a fold-correctness signal
@@ -742,6 +750,8 @@ static void VKAPI_PTR shim_UpdateDescriptorSets(
     if (!any_null) {
         g_real_update_descriptor_sets(device, descriptorWriteCount, pDescriptorWrites,
                                        descriptorCopyCount, pDescriptorCopies);
+        if (g_a4_instrument_enabled_cache)
+            a4_record_writes(descriptorWriteCount, pDescriptorWrites);
         return;
     }
     ShimStandins *s = get_standins(device);
@@ -815,6 +825,8 @@ static void VKAPI_PTR shim_UpdateDescriptorSets(
 
     g_real_update_descriptor_sets(device, descriptorWriteCount, writes,
                                   descriptorCopyCount, pDescriptorCopies);
+    if (g_a4_instrument_enabled_cache)
+        a4_record_writes(descriptorWriteCount, writes);
 
     for (uint32_t w = 0; w < descriptorWriteCount; w++) free(owned[w]);
     free(owned);
@@ -983,6 +995,479 @@ static void VKAPI_PTR shim_UpdateDescriptorSetWithTemplate(
     free(blob);
 }
 
+/* ===========================================================================
+ * Phase A4 — runtime metadata-buffer plumbing for SPIR-V instrumentation
+ *
+ * A3 makes shaders read uint counts at (set=7, binding=0) before each
+ * descriptor-mediated load. Without this section, those reads dereference
+ * an unbound descriptor — vkCreateComputePipelines would reject the
+ * pipeline. A4's job is to expose the metadata buffer to the application's
+ * pipelines without the application knowing.
+ *
+ * Strategy (all inside the shim — see plan project_spirv_instrumentation_plan_2026_04_28.md
+ * "Bisect finding worth keeping" for why we don't do this in user code):
+ *
+ *   - One per-device A4Meta: VkBuffer (1024 B HOST_COHERENT) +
+ *     VkDescriptorSetLayout (binding 0 = SSBO, all stages) +
+ *     empty VkDescriptorSetLayout (for slots 1..6 padding) +
+ *     dedicated VkDescriptorPool (1 set, 1 SSBO) +
+ *     pre-bound VkDescriptorSet. Allocated lazily on first
+ *     shim_CreatePipelineLayout when SHIM_INSTRUMENT_ENABLE=1.
+ *     Lives until device destruction.
+ *
+ *   - Per-VkDescriptorSet shadow: 32 uints, one per binding slot, host-side.
+ *     Captured in shim_AllocateDescriptorSets (zeros) and updated in
+ *     shim_UpdateDescriptorSets (count = range_bytes / 4 for SSBO/UBO).
+ *     Cleared in shim_FreeDescriptorSets / shim_ResetDescriptorPool /
+ *     shim_DestroyDescriptorPool — see state_stack_wrapper.md:17 (pool
+ *     reset is the only memory-bounding mechanism on this wrapper; we
+ *     MUST drop refs at reset, not hold them).
+ *
+ *   - shim_CreatePipelineLayout: copy create-info; if setLayoutCount < 8,
+ *     expand to 8 with empty in [N..6] and meta in [7]. ≥8 inputs are
+ *     out of scope for now (counter logged).
+ *
+ *   - shim_CmdBindDescriptorSets: for each set bound at slot S, emit
+ *     vkCmdUpdateBuffer copying the host shadow's 32 uints into the
+ *     metadata buffer at offset S*128. Then bind the meta descriptor set
+ *     at slot 7 (using the same VkPipelineLayout).
+ *
+ * vkCmdUpdateBuffer is restricted to outside-renderpass — fine for the
+ * compute-only OOB probe; will need a different path (host-mapped writes
+ * + memory barriers) for inside-renderpass binds in DXVK proper. */
+
+#define A4_MAX_BINDINGS_PER_SET   32
+#define A4_MAX_SETS               8
+#define A4_BYTES_PER_SET          (A4_MAX_BINDINGS_PER_SET * 4)
+#define A4_TOTAL_BUFFER_BYTES     (A4_MAX_SETS * A4_BYTES_PER_SET)
+
+typedef struct {
+    VkDevice               device;
+    VkBuffer               buffer;
+    VkDeviceMemory         buffer_mem;
+    void                  *mapped;
+    VkDescriptorSetLayout  meta_layout;   /* binding 0: SSBO, all stages */
+    VkDescriptorSetLayout  empty_layout;  /* zero-binding layout for slots 1..6 padding */
+    VkDescriptorPool       pool;
+    VkDescriptorSet        meta_set;
+    int                    ready;
+} A4Meta;
+
+static A4Meta g_a4_meta[MAX_DEVICES];
+static uint32_t g_a4_meta_count = 0;
+static pthread_mutex_t g_a4_meta_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct A4SetEntry {
+    VkDescriptorSet     set;
+    VkDescriptorPool    pool;
+    uint32_t            binding_counts[A4_MAX_BINDINGS_PER_SET];
+    struct A4SetEntry  *next;
+} A4SetEntry;
+
+static A4SetEntry *g_a4_sets = NULL;  /* singly-linked, head insertion */
+static pthread_mutex_t g_a4_sets_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Real fn pointers needed for A4. Captured in shim_GetDeviceProcAddr like
+ * the rest. */
+static PFN_vkCreatePipelineLayout       g_real_create_pipeline_layout = NULL;
+static PFN_vkCreateDescriptorSetLayout  g_real_create_desc_set_layout = NULL;
+static PFN_vkCreateDescriptorPool       g_real_create_desc_pool = NULL;
+static PFN_vkAllocateDescriptorSets     g_real_alloc_desc_sets = NULL;
+static PFN_vkFreeDescriptorSets         g_real_free_desc_sets = NULL;
+static PFN_vkResetDescriptorPool        g_real_reset_desc_pool = NULL;
+static PFN_vkDestroyDescriptorPool      g_real_destroy_desc_pool = NULL;
+static PFN_vkCmdBindDescriptorSets      g_real_cmd_bind_desc_sets = NULL;
+static PFN_vkCmdUpdateBuffer            g_real_cmd_update_buffer = NULL;
+
+/* Public entry: tests setenv("SHIM_INSTRUMENT_ENABLE", ...) and then
+ * dlsym + call this once to push the new value into the shim's cache.
+ * The cache flag gates the A4 trampolines — keeps getenv off the
+ * wrapper-internal call paths (BC6/BC7/S3TC compute decoders go
+ * through shim_CreateShaderModule etc. at device init; calling
+ * getenv on those paths trips a stack-protector canary in
+ * dxvk2_extensions_present's later printf — uncharacterised but
+ * repeatable, see plan memory bisect note). */
+__attribute__((visibility("default")))
+void shim_a4_refresh_env(void) {
+    instrument_refresh_env();
+}
+__attribute__((visibility("default"))) volatile int shim_m5_a4_pipeline_layouts_extended = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_a4_pipeline_layouts_skipped_overfull = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_a4_descriptor_sets_tracked = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_a4_descriptor_sets_dropped = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_a4_writes_recorded = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_a4_binds_extended = 0;
+
+/* Cached env state. Set by instrument_refresh_env (called once per
+ * shim_CreateShaderModule, which is the natural beat for tests that
+ * setenv right before that call). Reading the cached flag is a single
+ * volatile load — keeps the dispatcher trampolines small enough that
+ * the compiler doesn't add a stack-protector canary that conflicts with
+ * the wrapper's internal call patterns. */
+volatile int g_a4_instrument_enabled_cache = 0;
+
+static void instrument_refresh_env(void) {
+    const char *e = getenv("SHIM_INSTRUMENT_ENABLE");
+    g_a4_instrument_enabled_cache = (e && e[0] == '1') ? 1 : 0;
+}
+
+static A4Meta *find_or_create_a4_meta_slot(VkDevice device) {
+    for (uint32_t i = 0; i < g_a4_meta_count; i++)
+        if (g_a4_meta[i].device == device) return &g_a4_meta[i];
+    if (g_a4_meta_count >= MAX_DEVICES) return NULL;
+    A4Meta *m = &g_a4_meta[g_a4_meta_count++];
+    memset(m, 0, sizeof(*m));
+    m->device = device;
+    return m;
+}
+
+static int build_a4_meta(A4Meta *m) {
+    /* Caller holds g_a4_meta_mutex. */
+    VkPhysicalDevice phys = g_pdev_for_standins;
+    if (phys == VK_NULL_HANDLE || !g_real_create_buffer || !g_real_alloc_memory ||
+        !g_real_bind_buffer_memory || !g_real_get_buffer_mreq ||
+        !g_real_create_desc_set_layout || !g_real_create_desc_pool ||
+        !g_real_alloc_desc_sets || !g_real_update_descriptor_sets ||
+        !g_real_map_memory) {
+        fprintf(stderr, "[shim_a4] missing real fn pointers\n");
+        return 0;
+    }
+    VkDevice device = m->device;
+
+    /* Buffer: host-coherent, mappable, large enough for 8*32*4 bytes. */
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = A4_TOTAL_BUFFER_BYTES,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (g_real_create_buffer(device, &bci, NULL, &m->buffer) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] vkCreateBuffer failed\n"); return 0;
+    }
+    VkMemoryRequirements mreq;
+    g_real_get_buffer_mreq(device, m->buffer, &mreq);
+    int mt = find_memory_type(phys, mreq.memoryTypeBits,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0) { fprintf(stderr, "[shim_a4] no host-coherent mem\n"); return 0; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mreq.size, .memoryTypeIndex = (uint32_t)mt };
+    if (g_real_alloc_memory(device, &mai, NULL, &m->buffer_mem) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] vkAllocateMemory failed\n"); return 0;
+    }
+    g_real_bind_buffer_memory(device, m->buffer, m->buffer_mem, 0);
+    if (g_real_map_memory(device, m->buffer_mem, 0, VK_WHOLE_SIZE, 0, &m->mapped) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] vkMapMemory failed\n"); return 0;
+    }
+    memset(m->mapped, 0, A4_TOTAL_BUFFER_BYTES);
+
+    /* Empty descriptor set layout (slots 1..6 padding). */
+    VkDescriptorSetLayoutCreateInfo dslci_empty = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    if (g_real_create_desc_set_layout(device, &dslci_empty, NULL, &m->empty_layout) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] empty DSL create failed\n"); return 0;
+    }
+
+    /* Meta descriptor set layout: binding 0 = SSBO, all stages. */
+    VkDescriptorSetLayoutBinding meta_b = {
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL,
+    };
+    VkDescriptorSetLayoutCreateInfo dslci_meta = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &meta_b,
+    };
+    if (g_real_create_desc_set_layout(device, &dslci_meta, NULL, &m->meta_layout) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] meta DSL create failed\n"); return 0;
+    }
+
+    /* Dedicated pool for our single set. */
+    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps,
+    };
+    if (g_real_create_desc_pool(device, &dpci, NULL, &m->pool) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] descriptor pool create failed\n"); return 0;
+    }
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = m->pool, .descriptorSetCount = 1, .pSetLayouts = &m->meta_layout,
+    };
+    if (g_real_alloc_desc_sets(device, &dsai, &m->meta_set) != VK_SUCCESS) {
+        fprintf(stderr, "[shim_a4] meta set alloc failed\n"); return 0;
+    }
+
+    VkDescriptorBufferInfo bi = { .buffer = m->buffer, .offset = 0, .range = A4_TOTAL_BUFFER_BYTES };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = m->meta_set, .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi,
+    };
+    g_real_update_descriptor_sets(device, 1, &w, 0, NULL);
+
+    m->ready = 1;
+    return 1;
+}
+
+static A4Meta *get_a4_meta(VkDevice device) {
+    pthread_mutex_lock(&g_a4_meta_mutex);
+    A4Meta *m = find_or_create_a4_meta_slot(device);
+    if (m && !m->ready) build_a4_meta(m);
+    pthread_mutex_unlock(&g_a4_meta_mutex);
+    return (m && m->ready) ? m : NULL;
+}
+
+/* Linked-list helpers. Locked by caller. */
+static A4SetEntry *a4_find_set_locked(VkDescriptorSet set) {
+    for (A4SetEntry *e = g_a4_sets; e; e = e->next) if (e->set == set) return e;
+    return NULL;
+}
+
+static void a4_track_set(VkDescriptorSet set, VkDescriptorPool pool) {
+    pthread_mutex_lock(&g_a4_sets_mutex);
+    A4SetEntry *e = a4_find_set_locked(set);
+    if (!e) {
+        e = (A4SetEntry *)calloc(1, sizeof(*e));
+        if (!e) { pthread_mutex_unlock(&g_a4_sets_mutex); return; }
+        e->set = set;
+        e->pool = pool;
+        e->next = g_a4_sets;
+        g_a4_sets = e;
+        __atomic_fetch_add(&shim_m5_a4_descriptor_sets_tracked, 1, __ATOMIC_RELAXED);
+    } else {
+        e->pool = pool;
+        memset(e->binding_counts, 0, sizeof(e->binding_counts));
+    }
+    pthread_mutex_unlock(&g_a4_sets_mutex);
+}
+
+static void a4_drop_sets_for_pool(VkDescriptorPool pool) {
+    pthread_mutex_lock(&g_a4_sets_mutex);
+    A4SetEntry **pp = &g_a4_sets;
+    while (*pp) {
+        A4SetEntry *e = *pp;
+        if (e->pool == pool) {
+            *pp = e->next;
+            free(e);
+            __atomic_fetch_add(&shim_m5_a4_descriptor_sets_dropped, 1, __ATOMIC_RELAXED);
+        } else {
+            pp = &e->next;
+        }
+    }
+    pthread_mutex_unlock(&g_a4_sets_mutex);
+}
+
+static void a4_drop_set(VkDescriptorSet set) {
+    pthread_mutex_lock(&g_a4_sets_mutex);
+    A4SetEntry **pp = &g_a4_sets;
+    while (*pp) {
+        A4SetEntry *e = *pp;
+        if (e->set == set) {
+            *pp = e->next;
+            free(e);
+            __atomic_fetch_add(&shim_m5_a4_descriptor_sets_dropped, 1, __ATOMIC_RELAXED);
+            break;
+        }
+        pp = &e->next;
+    }
+    pthread_mutex_unlock(&g_a4_sets_mutex);
+}
+
+static int a4_desc_type_records_size(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+           t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+           t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+           t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+}
+
+/* Called from shim_UpdateDescriptorSets after the wrapper has accepted
+ * the writes. For SSBO/UBO writes, record the per-element count into
+ * the per-set host shadow. */
+static void a4_record_writes(uint32_t writeCount, const VkWriteDescriptorSet *writes) {
+    if (writeCount == 0 || !writes) return;
+    pthread_mutex_lock(&g_a4_sets_mutex);
+    for (uint32_t w = 0; w < writeCount; w++) {
+        const VkWriteDescriptorSet *write = &writes[w];
+        if (!a4_desc_type_records_size(write->descriptorType)) continue;
+        if (!write->pBufferInfo) continue;
+        if (write->dstBinding >= A4_MAX_BINDINGS_PER_SET) continue;
+        A4SetEntry *e = a4_find_set_locked(write->dstSet);
+        if (!e) continue;
+        /* For arrayed bindings the spec lets a write span multiple
+         * elements; A4-minimum tracks the count of element 0 only.
+         * Bindless / large-arrays are out of scope (see plan §"careful
+         * attention"). */
+        VkDeviceSize range = write->pBufferInfo[0].range;
+        uint32_t count;
+        if (range == VK_WHOLE_SIZE) count = 0xFFFFFFFFu;
+        else if (range >= 0xFFFFFFFCull) count = 0xFFFFFFFFu;
+        else count = (uint32_t)(range / 4u);
+        e->binding_counts[write->dstBinding] = count;
+        __atomic_fetch_add(&shim_m5_a4_writes_recorded, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&g_a4_sets_mutex);
+}
+
+/* --- A4 hooks --- */
+
+/* The full A4 body lives in shim_CreatePipelineLayout_full. The dispatcher
+ * routes through shim_CreatePipelineLayout (a thin trampoline) so the
+ * full body's larger frame doesn't bloat the path the wrapper takes
+ * during device init when the env gate is off — see "stack-canary
+ * sensitivity to body size" note above. */
+static VkResult VKAPI_PTR shim_CreatePipelineLayout_full(
+    VkDevice                          device,
+    const VkPipelineLayoutCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks      *pAllocator,
+    VkPipelineLayout                 *pPipelineLayout)
+{
+    if (pCreateInfo->setLayoutCount >= A4_MAX_SETS) {
+        __atomic_fetch_add(&shim_m5_a4_pipeline_layouts_skipped_overfull, 1, __ATOMIC_RELAXED);
+        return g_real_create_pipeline_layout(device, pCreateInfo, pAllocator, pPipelineLayout);
+    }
+    A4Meta *m = get_a4_meta(device);
+    if (!m) {
+        fprintf(stderr, "[shim_a4] CreatePipelineLayout: A4Meta unavailable; passing through\n");
+        return g_real_create_pipeline_layout(device, pCreateInfo, pAllocator, pPipelineLayout);
+    }
+    VkDescriptorSetLayout extended[A4_MAX_SETS];
+    uint32_t i = 0;
+    for (; i < pCreateInfo->setLayoutCount; i++) extended[i] = pCreateInfo->pSetLayouts[i];
+    for (; i < A4_MAX_SETS - 1; i++) extended[i] = m->empty_layout;
+    extended[A4_MAX_SETS - 1] = m->meta_layout;
+    VkPipelineLayoutCreateInfo modified = *pCreateInfo;
+    modified.setLayoutCount = A4_MAX_SETS;
+    modified.pSetLayouts = extended;
+    VkResult r = g_real_create_pipeline_layout(device, &modified, pAllocator, pPipelineLayout);
+    if (r == VK_SUCCESS)
+        __atomic_fetch_add(&shim_m5_a4_pipeline_layouts_extended, 1, __ATOMIC_RELAXED);
+    return r;
+}
+
+static VkResult VKAPI_PTR shim_CreatePipelineLayout(
+    VkDevice                          device,
+    const VkPipelineLayoutCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks      *pAllocator,
+    VkPipelineLayout                 *pPipelineLayout)
+{
+    if (!g_real_create_pipeline_layout || !pCreateInfo)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!g_a4_instrument_enabled_cache) {
+        return g_real_create_pipeline_layout(device, pCreateInfo, pAllocator, pPipelineLayout);
+    }
+    return shim_CreatePipelineLayout_full(device, pCreateInfo, pAllocator, pPipelineLayout);
+}
+
+static VkResult VKAPI_PTR shim_AllocateDescriptorSets(
+    VkDevice                              device,
+    const VkDescriptorSetAllocateInfo    *pAllocateInfo,
+    VkDescriptorSet                      *pDescriptorSets)
+{
+    if (!g_real_alloc_desc_sets) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = g_real_alloc_desc_sets(device, pAllocateInfo, pDescriptorSets);
+    if (r != VK_SUCCESS || !g_a4_instrument_enabled_cache || !pAllocateInfo) return r;
+    for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
+        a4_track_set(pDescriptorSets[i], pAllocateInfo->descriptorPool);
+    }
+    return r;
+}
+
+static VkResult VKAPI_PTR shim_FreeDescriptorSets(
+    VkDevice            device,
+    VkDescriptorPool    descriptorPool,
+    uint32_t            descriptorSetCount,
+    const VkDescriptorSet *pDescriptorSets)
+{
+    if (!g_real_free_desc_sets) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < descriptorSetCount; i++) a4_drop_set(pDescriptorSets[i]);
+    return g_real_free_desc_sets(device, descriptorPool, descriptorSetCount, pDescriptorSets);
+}
+
+static VkResult VKAPI_PTR shim_ResetDescriptorPool(
+    VkDevice                  device,
+    VkDescriptorPool          descriptorPool,
+    VkDescriptorPoolResetFlags flags)
+{
+    if (!g_real_reset_desc_pool) return VK_ERROR_INITIALIZATION_FAILED;
+    a4_drop_sets_for_pool(descriptorPool);
+    return g_real_reset_desc_pool(device, descriptorPool, flags);
+}
+
+static void VKAPI_PTR shim_DestroyDescriptorPool(
+    VkDevice                      device,
+    VkDescriptorPool              descriptorPool,
+    const VkAllocationCallbacks  *pAllocator)
+{
+    if (!g_real_destroy_desc_pool) return;
+    a4_drop_sets_for_pool(descriptorPool);
+    g_real_destroy_desc_pool(device, descriptorPool, pAllocator);
+}
+
+/* Heavy body kept out of the dispatcher trampoline so the hook the
+ * wrapper-internal init path takes (env-off → tiny forward) doesn't
+ * grow large enough to require a stack-protector canary. See "stack-canary
+ * sensitivity" note above. */
+static void shim_CmdBindDescriptorSets_full(
+    VkCommandBuffer       commandBuffer,
+    VkPipelineBindPoint   pipelineBindPoint,
+    VkPipelineLayout      layout,
+    uint32_t              firstSet,
+    uint32_t              descriptorSetCount,
+    const VkDescriptorSet *pDescriptorSets)
+{
+    pthread_mutex_lock(&g_a4_sets_mutex);
+    for (uint32_t i = 0; i < descriptorSetCount; i++) {
+        uint32_t slot = firstSet + i;
+        if (slot >= A4_MAX_SETS - 1) continue;
+        A4SetEntry *e = a4_find_set_locked(pDescriptorSets[i]);
+        if (!e) continue;
+        A4Meta *m = NULL;
+        pthread_mutex_lock(&g_a4_meta_mutex);
+        for (uint32_t k = 0; k < g_a4_meta_count; k++) {
+            if (g_a4_meta[k].ready) { m = &g_a4_meta[k]; break; }
+        }
+        pthread_mutex_unlock(&g_a4_meta_mutex);
+        if (!m) continue;
+        g_real_cmd_update_buffer(commandBuffer, m->buffer,
+                                 (VkDeviceSize)slot * A4_BYTES_PER_SET,
+                                 A4_BYTES_PER_SET, e->binding_counts);
+    }
+    pthread_mutex_unlock(&g_a4_sets_mutex);
+
+    A4Meta *m = NULL;
+    pthread_mutex_lock(&g_a4_meta_mutex);
+    for (uint32_t k = 0; k < g_a4_meta_count; k++) {
+        if (g_a4_meta[k].ready) { m = &g_a4_meta[k]; break; }
+    }
+    pthread_mutex_unlock(&g_a4_meta_mutex);
+    if (m) {
+        g_real_cmd_bind_desc_sets(commandBuffer, pipelineBindPoint, layout,
+                                  A4_MAX_SETS - 1, 1, &m->meta_set, 0, NULL);
+        __atomic_fetch_add(&shim_m5_a4_binds_extended, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static void VKAPI_PTR shim_CmdBindDescriptorSets(
+    VkCommandBuffer       commandBuffer,
+    VkPipelineBindPoint   pipelineBindPoint,
+    VkPipelineLayout      layout,
+    uint32_t              firstSet,
+    uint32_t              descriptorSetCount,
+    const VkDescriptorSet *pDescriptorSets,
+    uint32_t              dynamicOffsetCount,
+    const uint32_t       *pDynamicOffsets)
+{
+    if (!g_real_cmd_bind_desc_sets) return;
+    g_real_cmd_bind_desc_sets(commandBuffer, pipelineBindPoint, layout,
+                              firstSet, descriptorSetCount, pDescriptorSets,
+                              dynamicOffsetCount, pDynamicOffsets);
+    if (!g_a4_instrument_enabled_cache || !g_real_cmd_update_buffer) return;
+    shim_CmdBindDescriptorSets_full(commandBuffer, pipelineBindPoint, layout,
+                                    firstSet, descriptorSetCount, pDescriptorSets);
+}
+
 /* --- enumeration intercept (unchanged from earlier demo) --- */
 
 static VkResult VKAPI_PTR shim_EnumerateDeviceExtensionProperties(
@@ -1081,6 +1566,34 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
     if (!g_real_update_desc_with_template)
         g_real_update_desc_with_template = (PFN_vkUpdateDescriptorSetWithTemplate)
             g_real_gdpa(device, "vkUpdateDescriptorSetWithTemplate");
+    /* A4 real fn pointers. */
+    if (!g_real_create_pipeline_layout)
+        g_real_create_pipeline_layout = (PFN_vkCreatePipelineLayout)
+            g_real_gdpa(device, "vkCreatePipelineLayout");
+    if (!g_real_create_desc_set_layout)
+        g_real_create_desc_set_layout = (PFN_vkCreateDescriptorSetLayout)
+            g_real_gdpa(device, "vkCreateDescriptorSetLayout");
+    if (!g_real_create_desc_pool)
+        g_real_create_desc_pool = (PFN_vkCreateDescriptorPool)
+            g_real_gdpa(device, "vkCreateDescriptorPool");
+    if (!g_real_alloc_desc_sets)
+        g_real_alloc_desc_sets = (PFN_vkAllocateDescriptorSets)
+            g_real_gdpa(device, "vkAllocateDescriptorSets");
+    if (!g_real_free_desc_sets)
+        g_real_free_desc_sets = (PFN_vkFreeDescriptorSets)
+            g_real_gdpa(device, "vkFreeDescriptorSets");
+    if (!g_real_reset_desc_pool)
+        g_real_reset_desc_pool = (PFN_vkResetDescriptorPool)
+            g_real_gdpa(device, "vkResetDescriptorPool");
+    if (!g_real_destroy_desc_pool)
+        g_real_destroy_desc_pool = (PFN_vkDestroyDescriptorPool)
+            g_real_gdpa(device, "vkDestroyDescriptorPool");
+    if (!g_real_cmd_bind_desc_sets)
+        g_real_cmd_bind_desc_sets = (PFN_vkCmdBindDescriptorSets)
+            g_real_gdpa(device, "vkCmdBindDescriptorSets");
+    if (!g_real_cmd_update_buffer)
+        g_real_cmd_update_buffer = (PFN_vkCmdUpdateBuffer)
+            g_real_gdpa(device, "vkCmdUpdateBuffer");
 
     if (!strcmp(pName, "vkCmdBindIndexBuffer2KHR"))
         return (PFN_vkVoidFunction)shim_CmdBindIndexBuffer2KHR;
@@ -1109,6 +1622,18 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
     if (!strcmp(pName, "vkUpdateDescriptorSetWithTemplate") ||
         !strcmp(pName, "vkUpdateDescriptorSetWithTemplateKHR"))
         return (PFN_vkVoidFunction)shim_UpdateDescriptorSetWithTemplate;
+    if (!strcmp(pName, "vkCreatePipelineLayout"))
+        return (PFN_vkVoidFunction)shim_CreatePipelineLayout;
+    if (!strcmp(pName, "vkAllocateDescriptorSets"))
+        return (PFN_vkVoidFunction)shim_AllocateDescriptorSets;
+    if (!strcmp(pName, "vkFreeDescriptorSets"))
+        return (PFN_vkVoidFunction)shim_FreeDescriptorSets;
+    if (!strcmp(pName, "vkResetDescriptorPool"))
+        return (PFN_vkVoidFunction)shim_ResetDescriptorPool;
+    if (!strcmp(pName, "vkDestroyDescriptorPool"))
+        return (PFN_vkVoidFunction)shim_DestroyDescriptorPool;
+    if (!strcmp(pName, "vkCmdBindDescriptorSets"))
+        return (PFN_vkVoidFunction)shim_CmdBindDescriptorSets;
 
     return g_real_gdpa(device, pName);
 }

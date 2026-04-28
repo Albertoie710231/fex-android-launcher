@@ -603,21 +603,14 @@ int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
   a2.SetMessageConsumer(consumer);
   if (a2.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
 
-  // A3 is env-gated until A4 (runtime metadata buffer plumbing) lands.
-  // Reasons:
-  //   1. A3 makes the SPIR-V actively reference set=7 binding=0 (via
-  //      OpAccessChain into the metadata var). Without a matching
-  //      pipeline layout, vkCreateComputePipelines rejects. Every
-  //      shader the shim sees — including the wrapper's internal
-  //      BC6/BC7/S3TC compute decoders at device init — would fail.
-  //   2. There is also an uncharacterised stack-corruption regression
-  //      that surfaces during wrapper-internal shader compile when
-  //      A3 is unconditionally on. Until isolated, restrict A3 to
-  //      tests that opt in.
-  // Tests exercising A3 setenv this gate around their vkCreateShaderModule
-  // call, then unsetenv to keep the rest of the run clean.
-  const char *a3_enable = std::getenv("SHIM_A3_DEBUG_ENABLE");
-  if (a3_enable && a3_enable[0] == '1') {
+  // A3 is env-gated by SHIM_INSTRUMENT_ENABLE — the same gate that
+  // turns on A4 (runtime metadata-buffer plumbing in shim_maintenance5.c).
+  // The two phases must be ON together: A3 emits OpAccessChain references
+  // to set=7 binding=0; A4 extends the pipeline layout and binds the
+  // metadata buffer at slot 7. With only A3, vkCreateComputePipelines
+  // rejects. With only A4, the layout has an unused slot 7 (harmless).
+  const char *enable = std::getenv("SHIM_INSTRUMENT_ENABLE");
+  if (enable && enable[0] == '1') {
     BoundsCheckDescriptorLoadsPass a3;
     a3.SetMessageConsumer(consumer);
     if (a3.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;

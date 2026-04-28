@@ -1396,7 +1396,7 @@ check:
  *   (3) byte-scan finds an OpAccessChain into the metadata var
  *       (set=7, binding=0), then OpULessThan, and OpSelect.
  *
- * A3 is gated behind SHIM_A3_DEBUG_ENABLE — set just around this
+ * A3 is gated behind SHIM_INSTRUMENT_ENABLE — set just around this
  * test's own vkCreateShaderModule. */
 static void test_spirv_pass_clamps_descriptor_loads(void) {
     PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
@@ -1416,6 +1416,9 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
         return;
     }
 
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+
     int before = *clamped_cnt;
     VkShaderModuleCreateInfo smci = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -1423,19 +1426,22 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
         .pCode = (const uint32_t *)oob_probe_spv,
     };
     VkShaderModule mod = VK_NULL_HANDLE;
-    setenv("SHIM_A3_DEBUG_ENABLE", "1", 1);
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
     VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
     int after = *clamped_cnt;
     if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
     if (r != VK_SUCCESS) {
-        unsetenv("SHIM_A3_DEBUG_ENABLE");
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
         FAIL("spirv_pass_clamps_descriptor_loads",
              "vkCreateShaderModule rejected the A3-clamped module: %s",
              vkresult_str(r));
         return;
     }
     if (after - before < 1) {
-        unsetenv("SHIM_A3_DEBUG_ENABLE");
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
         FAIL("spirv_pass_clamps_descriptor_loads",
              "loads_clamped counter did not advance (stuck at %d) — A3 either skipped or never ran",
              before);
@@ -1445,7 +1451,8 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
     uint32_t *out_code = NULL;
     size_t    out_size = 0;
     int instrument_ok = instrument((const uint32_t *)oob_probe_spv, oob_probe_spv_len, &out_code, &out_size);
-    unsetenv("SHIM_A3_DEBUG_ENABLE");
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
     if (!instrument_ok || !out_code || out_size < 20) {
         if (out_code) freefn(out_code);
         FAIL("spirv_pass_clamps_descriptor_loads", "shim_spv_instrument returned no output bytes");
