@@ -785,37 +785,89 @@ static void test_maintenance5_properties2(void) {
         PASS("maintenance5_properties2", "all 6 maintenance5 properties written");
 }
 
+/* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
+ * VUID-VkBufferCreateInfo-usage-parameter, usage must be non-zero. If
+ * the wrapper rejects this, the partner _fold test's PASS is meaningful
+ * (folding is the only way the buffer becomes valid). If the wrapper
+ * accepts usage=0 here, the wrapper is lax and the _fold PASS is
+ * ambiguous (might be the shim, might be the wrapper not validating). */
+static void test_wrapper_usage_zero_strictness(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 4096,
+        .usage = 0,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(g_device, &bci, NULL, &buf);
+    if (r == VK_SUCCESS) {
+        INCOMPLETE("wrapper_usage_zero_strictness",
+                   "wrapper accepted usage=0 (lax); _fold test is therefore ambiguous as shim-correctness signal");
+        if (buf != VK_NULL_HANDLE) vkDestroyBuffer(g_device, buf, NULL);
+    } else {
+        PASS("wrapper_usage_zero_strictness",
+             "wrapper rejects usage=0 (%s) — strictness confirms _fold test is meaningful",
+             vkresult_str(r));
+    }
+}
+
 /* DXVK 2.7+ passes VkBufferUsageFlags2CreateInfoKHR via VkBufferCreateInfo.pNext
- * to extend the usage bitmask. The shim does not strip / translate this
- * pNext — the wrapper sees an unknown sType and ignores it, and the
- * buffer is created with whatever v1 .usage was. We can't observe the
- * real usage post-creation, so this is a TESTBENCH BLIND SPOT: the call
- * succeeds either way. Mark INCOMPLETE to keep the gap visible. */
-static void test_maintenance5_buffer_usage_flags2_blindspot(void) {
-    if (!maintenance5_present()) { SKIP("maintenance5_buffer_usage_flags2", "extension not present"); return; }
+ * to extend the usage bitmask. The shim must fold flags2 bits into
+ * v1.usage so the wrapper (which doesn't recognize the new sType) still
+ * sees the intended bits.
+ *
+ * Detection: dlsym shim_m5_buffer_flags2_fold_count from the .so
+ * loaded as WRAPPER_TESTBENCH_LIB. The shim increments it whenever a
+ * fold actually happens. PASS only if the counter advanced — the buffer
+ * being created successfully is not a sufficient signal (the wrapper
+ * is lax about usage=0; see test_wrapper_usage_zero_strictness). */
+static void test_maintenance5_buffer_usage_flags2_fold(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_buffer_usage_flags2_fold", "extension not present"); return; }
     PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
         (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
     LOAD_DEV(vkCreateBuffer);
     LOAD_DEV(vkDestroyBuffer);
 
+    volatile int *fold_counter = (volatile int *)dlsym(g_lib, "shim_m5_buffer_flags2_fold_count");
+    int before = fold_counter ? *fold_counter : -1;
+
     VkBufferUsageFlags2CreateInfoKHR f2 = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
         .pNext = NULL,
-        .usage = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR,
+        .usage = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR,
     };
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = &f2,
         .size = 4096,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /* matches f2.usage so v1 fallback is harmless */
+        .usage = 0, /* deliberate: usage comes from flags2 only */
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     VkBuffer buf = VK_NULL_HANDLE;
     VkResult r = vkCreateBuffer(g_device, &bci, NULL, &buf);
-    if (r != VK_SUCCESS) FAIL("maintenance5_buffer_usage_flags2", "vkCreateBuffer with flags2 pNext: %s", vkresult_str(r));
-    else INCOMPLETE("maintenance5_buffer_usage_flags2",
-                    "create succeeded but pNext-stripping not implemented; if DXVK uses flags2-only usage bits, those will be silently dropped (testbench blind spot)");
     if (buf != VK_NULL_HANDLE) vkDestroyBuffer(g_device, buf, NULL);
+
+    if (r != VK_SUCCESS) {
+        FAIL("maintenance5_buffer_usage_flags2_fold",
+             "vkCreateBuffer(usage=0,flags2={SRC|DST}): %s", vkresult_str(r));
+        return;
+    }
+    if (!fold_counter) {
+        INCOMPLETE("maintenance5_buffer_usage_flags2_fold",
+                   "create succeeded but shim fold-counter symbol not found (cannot prove fold fired)");
+        return;
+    }
+    int after = *fold_counter;
+    if (after > before)
+        PASS("maintenance5_buffer_usage_flags2_fold",
+             "shim folded flags2 into v1.usage (counter %d→%d) and create succeeded", before, after);
+    else
+        FAIL("maintenance5_buffer_usage_flags2_fold",
+             "create succeeded but shim fold-counter did NOT advance (counter stuck at %d) — fold path not taken", before);
 }
 
 /* ----- harness ----- */
@@ -839,7 +891,8 @@ int main(int argc, char **argv) {
     test_maintenance5_dev_isl_stub();
     test_maintenance5_features2();
     test_maintenance5_properties2();
-    test_maintenance5_buffer_usage_flags2_blindspot();
+    test_wrapper_usage_zero_strictness();
+    test_maintenance5_buffer_usage_flags2_fold();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)

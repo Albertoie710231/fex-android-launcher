@@ -34,6 +34,7 @@
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define WRAPPED_LIB "/data/data/com.mediatek.steamlauncher/files/imagefs_bionic/usr/lib/libvulkan_wrapper.so"
@@ -51,6 +52,16 @@ static PFN_vkGetPhysicalDeviceFeatures2                 g_real_gpdf2 = NULL;
 static PFN_vkGetPhysicalDeviceProperties2               g_real_gpdp2 = NULL;
 static PFN_vkCmdBindIndexBuffer                         g_real_cmd_bind_index = NULL;
 static PFN_vkGetImageSubresourceLayout                  g_real_get_isl = NULL;
+static PFN_vkCreateBuffer                               g_real_create_buffer = NULL;
+static PFN_vkCreateGraphicsPipelines                    g_real_create_graphics_pipelines = NULL;
+static PFN_vkCreateComputePipelines                     g_real_create_compute_pipelines = NULL;
+
+/* Exposed counters so the testbench can prove a fold actually fired,
+ * not just that vkCreateBuffer happened to succeed (the wrapper is lax
+ * about usage=0, so success-on-create is not a fold-correctness signal
+ * by itself). dlsym'd from the testbench. */
+__attribute__((visibility("default"))) volatile int shim_m5_buffer_flags2_fold_count = 0;
+__attribute__((visibility("default"))) volatile int shim_m5_pipeline_flags2_fold_count = 0;
 
 static void open_real_lib_once(void) {
     if (g_real_lib) return;
@@ -162,6 +173,136 @@ static void VKAPI_PTR shim_GetPhysicalDeviceProperties2(
     }
 }
 
+/* --- maintenance5 pNext folding for flags2 structs ---
+ *
+ * DXVK 2.7+ extends VkBufferCreateInfo / VkGraphicsPipelineCreateInfo /
+ * VkComputePipelineCreateInfo with a flags2 pNext struct that carries
+ * a 64-bit usage/flags bitmask. On a wrapper without maintenance5 the
+ * struct's sType is unknown, so the wrapper silently ignores it and
+ * the create call only sees v1.usage / v1.flags — losing whatever
+ * bits were supplied via flags2.
+ *
+ * Strategy: copy the create-info struct locally, OR the flags2 low-32
+ * bits into the local copy's v1 field, forward the modified copy with
+ * the *original* pNext chain unchanged. The flags2 struct stays in
+ * the chain — the wrapper still ignores it, but the bits already
+ * landed in the v1 field, which the wrapper does honor.
+ *
+ * Limitation: flags2 bits beyond bit 31 (rare; mostly future extension
+ * space) are dropped by the (uint32_t) cast. None of the currently
+ * defined bits live beyond bit 31. */
+
+static VkBufferUsageFlags fold_buffer_flags2(const void *pNext, VkBufferUsageFlags fallback) {
+    const VkBaseInStructure *p = (const VkBaseInStructure *)pNext;
+    while (p) {
+        if (p->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR) {
+            const VkBufferUsageFlags2CreateInfoKHR *f2 =
+                (const VkBufferUsageFlags2CreateInfoKHR *)p;
+            return (VkBufferUsageFlags)(f2->usage & 0xFFFFFFFFu);
+        }
+        p = p->pNext;
+    }
+    return fallback;
+}
+
+static VkPipelineCreateFlags fold_pipeline_flags2(const void *pNext, VkPipelineCreateFlags fallback) {
+    const VkBaseInStructure *p = (const VkBaseInStructure *)pNext;
+    while (p) {
+        if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR) {
+            const VkPipelineCreateFlags2CreateInfoKHR *f2 =
+                (const VkPipelineCreateFlags2CreateInfoKHR *)p;
+            return (VkPipelineCreateFlags)(f2->flags & 0xFFFFFFFFu);
+        }
+        p = p->pNext;
+    }
+    return fallback;
+}
+
+static VkResult VKAPI_PTR shim_CreateBuffer(
+    VkDevice                      device,
+    const VkBufferCreateInfo     *pCreateInfo,
+    const VkAllocationCallbacks  *pAllocator,
+    VkBuffer                     *pBuffer)
+{
+    if (!g_real_create_buffer || !pCreateInfo)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    /* If a flags2 pNext is present, OR its low-32 bits into a copy of
+     * the create-info. If v1.usage was 0 (DXVK supplying usage only via
+     * flags2), the copy now carries real usage. */
+    VkBufferUsageFlags folded = fold_buffer_flags2(pCreateInfo->pNext, pCreateInfo->usage);
+    if (folded == pCreateInfo->usage)
+        return g_real_create_buffer(device, pCreateInfo, pAllocator, pBuffer);
+    __atomic_fetch_add(&shim_m5_buffer_flags2_fold_count, 1, __ATOMIC_RELAXED);
+    VkBufferCreateInfo local = *pCreateInfo;
+    local.usage |= folded;
+    return g_real_create_buffer(device, &local, pAllocator, pBuffer);
+}
+
+static VkResult VKAPI_PTR shim_CreateGraphicsPipelines(
+    VkDevice                              device,
+    VkPipelineCache                       pipelineCache,
+    uint32_t                              createInfoCount,
+    const VkGraphicsPipelineCreateInfo   *pCreateInfos,
+    const VkAllocationCallbacks          *pAllocator,
+    VkPipeline                           *pPipelines)
+{
+    if (!g_real_create_graphics_pipelines || !pCreateInfos)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    /* Materialize a folded copy only if any pCreateInfo carries flags2.
+     * Most DXVK pipeline batches will have flags2 on every entry, so the
+     * fast path is the all-folded copy. */
+    VkGraphicsPipelineCreateInfo *local = NULL;
+    int needs_fold = 0;
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        VkPipelineCreateFlags folded = fold_pipeline_flags2(pCreateInfos[i].pNext, pCreateInfos[i].flags);
+        if (folded != pCreateInfos[i].flags) { needs_fold = 1; break; }
+    }
+    if (!needs_fold)
+        return g_real_create_graphics_pipelines(device, pipelineCache, createInfoCount,
+                                                pCreateInfos, pAllocator, pPipelines);
+    __atomic_fetch_add(&shim_m5_pipeline_flags2_fold_count, 1, __ATOMIC_RELAXED);
+    local = (VkGraphicsPipelineCreateInfo *)malloc(sizeof(*local) * createInfoCount);
+    if (!local) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(local, pCreateInfos, sizeof(*local) * createInfoCount);
+    for (uint32_t i = 0; i < createInfoCount; i++)
+        local[i].flags |= fold_pipeline_flags2(pCreateInfos[i].pNext, 0);
+    VkResult r = g_real_create_graphics_pipelines(device, pipelineCache, createInfoCount,
+                                                  local, pAllocator, pPipelines);
+    free(local);
+    return r;
+}
+
+static VkResult VKAPI_PTR shim_CreateComputePipelines(
+    VkDevice                              device,
+    VkPipelineCache                       pipelineCache,
+    uint32_t                              createInfoCount,
+    const VkComputePipelineCreateInfo    *pCreateInfos,
+    const VkAllocationCallbacks          *pAllocator,
+    VkPipeline                           *pPipelines)
+{
+    if (!g_real_create_compute_pipelines || !pCreateInfos)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    VkComputePipelineCreateInfo *local = NULL;
+    int needs_fold = 0;
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        VkPipelineCreateFlags folded = fold_pipeline_flags2(pCreateInfos[i].pNext, pCreateInfos[i].flags);
+        if (folded != pCreateInfos[i].flags) { needs_fold = 1; break; }
+    }
+    if (!needs_fold)
+        return g_real_create_compute_pipelines(device, pipelineCache, createInfoCount,
+                                               pCreateInfos, pAllocator, pPipelines);
+    __atomic_fetch_add(&shim_m5_pipeline_flags2_fold_count, 1, __ATOMIC_RELAXED);
+    local = (VkComputePipelineCreateInfo *)malloc(sizeof(*local) * createInfoCount);
+    if (!local) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(local, pCreateInfos, sizeof(*local) * createInfoCount);
+    for (uint32_t i = 0; i < createInfoCount; i++)
+        local[i].flags |= fold_pipeline_flags2(pCreateInfos[i].pNext, 0);
+    VkResult r = g_real_create_compute_pipelines(device, pipelineCache, createInfoCount,
+                                                 local, pAllocator, pPipelines);
+    free(local);
+    return r;
+}
+
 /* --- enumeration intercept (unchanged from earlier demo) --- */
 
 static VkResult VKAPI_PTR shim_EnumerateDeviceExtensionProperties(
@@ -213,6 +354,15 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
     if (!g_real_get_isl)
         g_real_get_isl = (PFN_vkGetImageSubresourceLayout)
             g_real_gdpa(device, "vkGetImageSubresourceLayout");
+    if (!g_real_create_buffer)
+        g_real_create_buffer = (PFN_vkCreateBuffer)
+            g_real_gdpa(device, "vkCreateBuffer");
+    if (!g_real_create_graphics_pipelines)
+        g_real_create_graphics_pipelines = (PFN_vkCreateGraphicsPipelines)
+            g_real_gdpa(device, "vkCreateGraphicsPipelines");
+    if (!g_real_create_compute_pipelines)
+        g_real_create_compute_pipelines = (PFN_vkCreateComputePipelines)
+            g_real_gdpa(device, "vkCreateComputePipelines");
 
     if (!strcmp(pName, "vkCmdBindIndexBuffer2KHR"))
         return (PFN_vkVoidFunction)shim_CmdBindIndexBuffer2KHR;
@@ -222,6 +372,12 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
         return (PFN_vkVoidFunction)shim_GetImageSubresourceLayout2KHR;
     if (!strcmp(pName, "vkGetDeviceImageSubresourceLayoutKHR"))
         return (PFN_vkVoidFunction)shim_GetDeviceImageSubresourceLayoutKHR;
+    if (!strcmp(pName, "vkCreateBuffer"))
+        return (PFN_vkVoidFunction)shim_CreateBuffer;
+    if (!strcmp(pName, "vkCreateGraphicsPipelines"))
+        return (PFN_vkVoidFunction)shim_CreateGraphicsPipelines;
+    if (!strcmp(pName, "vkCreateComputePipelines"))
+        return (PFN_vkVoidFunction)shim_CreateComputePipelines;
 
     return g_real_gdpa(device, pName);
 }
@@ -279,6 +435,21 @@ static PFN_vkVoidFunction shim_GetInstanceProcAddr(
         return (PFN_vkVoidFunction)shim_GetImageSubresourceLayout2KHR;
     if (!strcmp(pName, "vkGetDeviceImageSubresourceLayoutKHR"))
         return (PFN_vkVoidFunction)shim_GetDeviceImageSubresourceLayoutKHR;
+    if (!strcmp(pName, "vkCreateBuffer")) {
+        if (instance != VK_NULL_HANDLE && !g_real_create_buffer)
+            g_real_create_buffer = (PFN_vkCreateBuffer)g_real_gipa(instance, pName);
+        return (PFN_vkVoidFunction)shim_CreateBuffer;
+    }
+    if (!strcmp(pName, "vkCreateGraphicsPipelines")) {
+        if (instance != VK_NULL_HANDLE && !g_real_create_graphics_pipelines)
+            g_real_create_graphics_pipelines = (PFN_vkCreateGraphicsPipelines)g_real_gipa(instance, pName);
+        return (PFN_vkVoidFunction)shim_CreateGraphicsPipelines;
+    }
+    if (!strcmp(pName, "vkCreateComputePipelines")) {
+        if (instance != VK_NULL_HANDLE && !g_real_create_compute_pipelines)
+            g_real_create_compute_pipelines = (PFN_vkCreateComputePipelines)g_real_gipa(instance, pName);
+        return (PFN_vkVoidFunction)shim_CreateComputePipelines;
+    }
 
     return g_real_gipa(instance, pName);
 }
