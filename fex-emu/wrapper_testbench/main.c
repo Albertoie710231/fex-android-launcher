@@ -1213,6 +1213,181 @@ static void test_spirv_hook_fires(void) {
         FAIL("spirv_hook_fires", "counter did not advance (stuck at %d) — hook bypassed", before);
 }
 
+/* Phase A2 verification: the metadata-injection pass must add a
+ * runtime-array uint SSBO at (set=7, binding=0) and decorate it
+ * Block + ArrayStride 4 + member Offset 0. We verify two things:
+ *   (1) the per-module counter advances under vkCreateShaderModule,
+ *   (2) shim_spv_instrument's output bytes contain the expected
+ *       OpDecorate target/literal pairs.
+ *
+ * (2) bypasses the wrapper entirely — calls into the shim's
+ * public C entry directly via dlsym — so we can inspect the
+ * post-pass binary without depending on the wrapper accepting it.
+ * (1) doubles as the end-to-end "wrapper still accepts the
+ * round-tripped binary" check (vkCreateShaderModule succeeds). */
+static void test_spirv_pass_injects_metadata_binding(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *inj_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_metadata_injected");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!inj_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_injects_metadata_binding", "shim symbols not present (PASS A or pre-A2 build)");
+        return;
+    }
+
+    int before = *inj_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_probe_spv_len,
+        .pCode = (const uint32_t *)oob_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *inj_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        FAIL("spirv_pass_injects_metadata_binding",
+             "vkCreateShaderModule rejected the instrumented module: %s "
+             "(SPIRV-Tools emit may be malformed, or the wrapper's SPIR-V "
+             "checker rejects the injected binding)",
+             vkresult_str(r));
+        return;
+    }
+    if (after - before < 1) {
+        FAIL("spirv_pass_injects_metadata_binding",
+             "injection counter did not advance (stuck at %d) — A2 pass "
+             "either skipped (pre-1.3) or never ran",
+             before);
+        return;
+    }
+
+    /* Direct path: instrument the probe SPV out-of-band and grep the
+     * bytes for our markers. */
+    uint32_t *out_code = NULL;
+    size_t    out_size = 0;
+    int ok = instrument((const uint32_t *)oob_probe_spv, oob_probe_spv_len,
+                        &out_code, &out_size);
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_injects_metadata_binding",
+             "shim_spv_instrument returned no output bytes for the probe");
+        return;
+    }
+    /* spirv-val (Vulkan 1.3 env). The plan requires the post-pass
+     * binary to remain spec-valid; failure here would mean our
+     * emit logic is malformed (wrong operand types / missing
+     * decorations / interface mismatch) even if the wrapper
+     * happens to accept it. */
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_injects_metadata_binding",
+             "spirv-val rejected the instrumented module: %s", vmsg);
+        return;
+    }
+
+    /* SPIR-V opcode literals (from spirv.json):
+     *   OpDecorate           = 71
+     *   OpMemberDecorate     = 72
+     *   OpTypeRuntimeArray   = 29
+     *   OpVariable           = 59
+     * Decoration enum:
+     *   Block         = 2
+     *   ArrayStride   = 6
+     *   NonWritable   = 24
+     *   Binding       = 33
+     *   DescriptorSet = 34
+     *   Offset        = 35
+     */
+    int found_runtime_array = 0;
+    int found_block_decoration = 0;
+    int found_array_stride_4 = 0;
+    int found_member_offset_0 = 0;
+    int found_descriptor_set_7 = 0;
+    int found_binding_0 = 0;
+    int found_nonwritable = 0;
+    uint32_t metadata_var_id_from_descset = 0;
+    uint32_t metadata_var_id_from_binding = 0;
+
+    const size_t total_words = out_size / 4;
+    if (total_words < 5) goto check;
+    /* Skip 5-word header. */
+    size_t i = 5;
+    while (i < total_words) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op  = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        switch (op) {
+        case 29: /* OpTypeRuntimeArray */
+            found_runtime_array++;
+            break;
+        case 71: /* OpDecorate target deco [literals...] */
+            if (len >= 3) {
+                uint32_t target = out_code[i + 1];
+                uint32_t deco   = out_code[i + 2];
+                uint32_t lit    = (len >= 4) ? out_code[i + 3] : 0u;
+                if (deco == 2) found_block_decoration++;
+                if (deco == 6 && lit == 4) found_array_stride_4++;
+                if (deco == 24) found_nonwritable++;
+                if (deco == 33 && lit == 0) {
+                    found_binding_0++;
+                    metadata_var_id_from_binding = target;
+                }
+                if (deco == 34 && lit == 7) {
+                    found_descriptor_set_7++;
+                    metadata_var_id_from_descset = target;
+                }
+            }
+            break;
+        case 72: /* OpMemberDecorate target member deco [literals...] */
+            if (len >= 4) {
+                uint32_t member = out_code[i + 2];
+                uint32_t deco   = out_code[i + 3];
+                uint32_t lit    = (len >= 5) ? out_code[i + 4] : 0u;
+                if (deco == 35 && member == 0 && lit == 0) found_member_offset_0++;
+            }
+            break;
+        default: break;
+        }
+        i += len;
+    }
+check:
+    freefn(out_code);
+
+    if (found_runtime_array < 1 ||
+        found_block_decoration < 1 ||
+        found_array_stride_4 < 1 ||
+        found_member_offset_0 < 1 ||
+        found_descriptor_set_7 != 1 ||
+        found_binding_0 < 1 ||
+        metadata_var_id_from_descset == 0 ||
+        metadata_var_id_from_binding != metadata_var_id_from_descset) {
+        FAIL("spirv_pass_injects_metadata_binding",
+             "byte-scan of instrumented SPIR-V missing markers: "
+             "runtime_array=%d Block=%d ArrayStride4=%d MemberOffset0=%d "
+             "DescriptorSet7=%d Binding0=%d (descset_var=%u binding_var=%u)",
+             found_runtime_array, found_block_decoration, found_array_stride_4,
+             found_member_offset_0, found_descriptor_set_7, found_binding_0,
+             metadata_var_id_from_descset, metadata_var_id_from_binding);
+        return;
+    }
+
+    PASS("spirv_pass_injects_metadata_binding",
+         "metadata SSBO injected (var_id=%u, set=7 binding=0, Block + "
+         "ArrayStride 4 + member Offset 0); counter %d→%d, NonWritable=%d, "
+         "spirv-val OK, wrapper accepted instrumented module",
+         metadata_var_id_from_descset, before, after, found_nonwritable);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -1552,6 +1727,7 @@ int main(int argc, char **argv) {
     test_null_subst_via_template();
     test_spirv_hook_fires();
     test_spirv_pass_identifies_descriptor_loads();
+    test_spirv_pass_injects_metadata_binding();
     test_mali_oob_ssbo_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
