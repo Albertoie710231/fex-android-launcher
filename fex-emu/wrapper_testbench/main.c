@@ -4,10 +4,24 @@
  * Goal: iterate on extension shims in bionic-vulkan-wrapper without
  * launching a game, wine, or DXVK. Sub-second feedback loop.
  *
- * Each test prints `[PASS] name: detail` or `[FAIL] name: detail`. main
- * runs every registered test and exits with the failure count as the
- * status code. Add a new extension by adding a new test_*() function
- * and one line in main's table.
+ * Each test prints one of:
+ *   [PASS] name: detail        — feature works as advertised
+ *   [FAIL] name: detail        — regression / silent-ignore detected
+ *   [SKIP] name: detail        — precondition not met (extension absent)
+ *   [INCOMPLETE] name: detail  — shim ran, but covers only a subset of
+ *                                spec semantics (called out so it can't
+ *                                hide as a PASS later)
+ *
+ * Exit status = FAIL count. INCOMPLETE is informational and does NOT
+ * gate the run, so we can ratchet incrementally — but every INCOMPLETE
+ * is a TODO that needs to be either lifted to PASS (real impl) or
+ * dropped to FAIL (caller observed in practice).
+ *
+ * Sentinel-pattern checks: where a wrapper might silently ignore a
+ * pNext struct rather than fill it, the test pre-fills the struct with
+ * a recognizable non-zero pattern and verifies the pattern was
+ * overwritten. This separates "shim ran" from "wrapper saw unknown
+ * sType and skipped".
  *
  * Build: build.sh (cross-compile with NDK clang, push to device, run).
  * Runtime deps: libvulkan_wrapper.so on LD_LIBRARY_PATH (typically
@@ -24,9 +38,13 @@
 /* Counters shared across tests. */
 static int g_pass = 0;
 static int g_fail = 0;
+static int g_inc  = 0;
+static int g_skip = 0;
 
-#define PASS(name, fmt, ...) do { ++g_pass; printf("[PASS] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
-#define FAIL(name, fmt, ...) do { ++g_fail; printf("[FAIL] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
+#define PASS(name, fmt, ...)       do { ++g_pass; printf("[PASS] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
+#define FAIL(name, fmt, ...)       do { ++g_fail; printf("[FAIL] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
+#define INCOMPLETE(name, fmt, ...) do { ++g_inc;  printf("[INCOMPLETE] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
+#define SKIP(name, fmt, ...)       do { ++g_skip; printf("[SKIP] %s: " fmt "\n", name, ##__VA_ARGS__); } while (0)
 
 /* Globals filled in by setup_vulkan() and reused across tests. */
 static void                            *g_lib = NULL;
@@ -229,9 +247,9 @@ static void test_dxvk2_extensions_present(void) {
         if (found) present++;
     }
     free(ex);
-    if (present == 4) PASS("dxvk2_extensions_present", "all 4 present (DXVK 2.x ready)");
-    else if (present == 0) FAIL("dxvk2_extensions_present", "0/4 present (current baseline)");
-    else PASS("dxvk2_extensions_present", "%d/4 present (partial)", present);
+    if (present == 4)        PASS("dxvk2_extensions_present", "all 4 present (DXVK 2.x ext set complete)");
+    else if (present == 0)   FAIL("dxvk2_extensions_present", "0/4 present (current baseline)");
+    else                     INCOMPLETE("dxvk2_extensions_present", "%d/4 present — DXVK 2.x needs all 4", present);
 }
 
 /* End-to-end smoke: allocate a small buffer, free it. Confirms basic
@@ -300,7 +318,7 @@ static void test_maintenance5_dispatch(void) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(ex[i].extensionName, "VK_KHR_maintenance5")) { has = 1; break; }
     free(ex);
     if (!has) {
-        printf("[SKIP] maintenance5_dispatch: extension not present (expected on current wrapper)\n");
+        SKIP("maintenance5_dispatch", "extension not present (expected on current wrapper)");
         return;
     }
     PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
@@ -310,7 +328,7 @@ static void test_maintenance5_dispatch(void) {
     void *isl2      = (void *)pfn_GetDeviceProcAddr(g_device, "vkGetImageSubresourceLayout2KHR");
     void *dev_isl   = (void *)pfn_GetDeviceProcAddr(g_device, "vkGetDeviceImageSubresourceLayoutKHR");
     int resolved = (bind2 ? 1 : 0) + (gran ? 1 : 0) + (isl2 ? 1 : 0) + (dev_isl ? 1 : 0);
-    if (resolved == 4) PASS("maintenance5_dispatch", "all 4 entrypoints resolved");
+    if (resolved == 4) PASS("maintenance5_dispatch", "all 4 entrypoints resolved (resolution only — see behavior tests below)");
     else FAIL("maintenance5_dispatch", "%d/4 entrypoints resolved (bind2=%p gran=%p isl2=%p dev_isl=%p)",
               resolved, bind2, gran, isl2, dev_isl);
 }
@@ -330,7 +348,7 @@ static void test_maintenance5_record(void) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(ex[i].extensionName, "VK_KHR_maintenance5")) { has = 1; break; }
     free(ex);
     if (!has) {
-        printf("[SKIP] maintenance5_record: extension not present\n");
+        SKIP("maintenance5_record", "extension not present");
         return;
     }
 
@@ -423,12 +441,381 @@ static void test_maintenance5_record(void) {
     vkCmdBindIndexBuffer2KHR(cb, buf, 0, VK_WHOLE_SIZE, VK_INDEX_TYPE_UINT16);
 
     r = vkEndCommandBuffer(cb);
-    if (r == VK_SUCCESS) PASS("maintenance5_record", "vkCmdBindIndexBuffer2KHR recorded + End ok");
+    if (r == VK_SUCCESS) PASS("maintenance5_record", "vkCmdBindIndexBuffer2KHR(VK_WHOLE_SIZE,UINT16) recorded + End ok");
     else                 FAIL("maintenance5_record", "vkEndCommandBuffer: %s", vkresult_str(r));
 
     vkDestroyCommandPool(g_device, pool, NULL);
     vkFreeMemory(g_device, mem, NULL);
     vkDestroyBuffer(g_device, buf, NULL);
+}
+
+/* --- Per-entrypoint behavior tests (sharper than maintenance5_dispatch) --- */
+
+/* Helper: returns 1 if VK_KHR_maintenance5 is in the device ext list. */
+static int maintenance5_present(void) {
+    PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties =
+        (PFN_vkEnumerateDeviceExtensionProperties)
+        g_vkGetInstanceProcAddr(g_instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, NULL);
+    VkExtensionProperties *ex = calloc(n, sizeof(*ex));
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, ex);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!strcmp(ex[i].extensionName, "VK_KHR_maintenance5")) { has = 1; break; }
+    free(ex);
+    return has;
+}
+
+/* maintenance5's defining behavioral delta for vkCmdBindIndexBuffer2KHR
+ * is per-bind size bounding (out-of-range index reads return zero
+ * instead of UB). Our shim drops `size` and forwards to v1, which has
+ * no size bound. Recording succeeds either way; the bound is only
+ * observable at execution. So this test records with an explicit
+ * non-WHOLE_SIZE bound and reports INCOMPLETE — flagging that the shim
+ * does not honor the bound, even though "the call recorded fine". */
+static void test_maintenance5_bounded_size(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_bounded_size", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+    PFN_vkCmdBindIndexBuffer2KHR vkCmdBindIndexBuffer2KHR =
+        (PFN_vkCmdBindIndexBuffer2KHR)pfn_GetDeviceProcAddr(g_device, "vkCmdBindIndexBuffer2KHR");
+    if (!vkCmdBindIndexBuffer2KHR) { FAIL("maintenance5_bounded_size", "shim returned NULL"); return; }
+
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 4096, .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g_device, &bci, NULL, &buf) != VK_SUCCESS) {
+        FAIL("maintenance5_bounded_size", "vkCreateBuffer"); return;
+    }
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(g_device, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    int mt = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if (req.memoryTypeBits & (1u << i)) { mt = (int)i; break; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    vkAllocateMemory(g_device, &mai, NULL, &mem);
+    vkBindBufferMemory(g_device, buf, mem, 0);
+
+    VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_gfx_qfam };
+    VkCommandPool pool; vkCreateCommandPool(g_device, &cpci, NULL, &pool);
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb; vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cb, &cbbi);
+    /* Bound size: half the buffer. Shim drops this, falls through to v1
+     * which uses rest-of-buffer. Recording succeeds either way. */
+    vkCmdBindIndexBuffer2KHR(cb, buf, 0, 2048, VK_INDEX_TYPE_UINT16);
+    VkResult r = vkEndCommandBuffer(cb);
+    if (r != VK_SUCCESS) FAIL("maintenance5_bounded_size", "vkEndCommandBuffer: %s", vkresult_str(r));
+    else INCOMPLETE("maintenance5_bounded_size",
+                    "size=2048 recorded but shim drops the bound; v1 fallback uses rest-of-buffer (no OOB-read protection)");
+    vkDestroyCommandPool(g_device, pool, NULL);
+    vkFreeMemory(g_device, mem, NULL);
+    vkDestroyBuffer(g_device, buf, NULL);
+}
+
+/* maintenance5 implicitly enables VK_INDEX_TYPE_UINT8_KHR. The wrapper
+ * also exposes VK_EXT_index_type_uint8 directly (per the ext-list dump),
+ * so the v1 fallback should accept UINT8 indices. PASS = recorded + End
+ * succeeds; FAIL = wrapper rejected at End. */
+static void test_maintenance5_index_uint8(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_index_uint8", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+    PFN_vkCmdBindIndexBuffer2KHR vkCmdBindIndexBuffer2KHR =
+        (PFN_vkCmdBindIndexBuffer2KHR)pfn_GetDeviceProcAddr(g_device, "vkCmdBindIndexBuffer2KHR");
+    if (!vkCmdBindIndexBuffer2KHR) { FAIL("maintenance5_index_uint8", "shim returned NULL"); return; }
+
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 4096, .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer buf; vkCreateBuffer(g_device, &bci, NULL, &buf);
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(g_device, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    int mt = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if (req.memoryTypeBits & (1u << i)) { mt = (int)i; break; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkDeviceMemory mem; vkAllocateMemory(g_device, &mai, NULL, &mem);
+    vkBindBufferMemory(g_device, buf, mem, 0);
+
+    VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_gfx_qfam };
+    VkCommandPool pool; vkCreateCommandPool(g_device, &cpci, NULL, &pool);
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb; vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(cb, &cbbi);
+    vkCmdBindIndexBuffer2KHR(cb, buf, 0, VK_WHOLE_SIZE, VK_INDEX_TYPE_UINT8_EXT);
+    VkResult r = vkEndCommandBuffer(cb);
+    if (r == VK_SUCCESS) PASS("maintenance5_index_uint8", "UINT8 index recorded + End ok");
+    else                 FAIL("maintenance5_index_uint8", "vkEndCommandBuffer: %s (UINT8 not accepted)", vkresult_str(r));
+    vkDestroyCommandPool(g_device, pool, NULL);
+    vkFreeMemory(g_device, mem, NULL);
+    vkDestroyBuffer(g_device, buf, NULL);
+}
+
+/* Sentinel pattern: pre-fill the granularity output with a recognizable
+ * non-zero value. After the shim runs, the output is whatever the shim
+ * wrote. Our shim hardcodes {1,1}. Mark INCOMPLETE because that is a
+ * conservative minimum, not the device's actual tile granularity. */
+static void test_maintenance5_granularity(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_granularity", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    PFN_vkGetRenderingAreaGranularityKHR fn =
+        (PFN_vkGetRenderingAreaGranularityKHR)pfn_GetDeviceProcAddr(g_device, "vkGetRenderingAreaGranularityKHR");
+    if (!fn) { FAIL("maintenance5_granularity", "shim returned NULL"); return; }
+    VkRenderingAreaInfoKHR info = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_AREA_INFO_KHR,
+        .colorAttachmentCount = 0,
+        .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+        .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+    };
+    VkExtent2D gran = { .width = 0xDEADBEEF, .height = 0xCAFEBABE };
+    fn(g_device, &info, &gran);
+    if (gran.width == 0xDEADBEEF || gran.height == 0xCAFEBABE) {
+        FAIL("maintenance5_granularity", "output not written (sentinel persisted: w=0x%x h=0x%x)", gran.width, gran.height);
+        return;
+    }
+    if (gran.width == 1 && gran.height == 1)
+        INCOMPLETE("maintenance5_granularity", "shim returns {1,1} (always-safe minimum, not real tile granularity)");
+    else
+        PASS("maintenance5_granularity", "device-aware granularity {%u,%u}", gran.width, gran.height);
+}
+
+/* Create a real linear image, query its v1 layout directly via
+ * vkGetImageSubresourceLayout, then call the v2 shim and compare
+ * subresource layouts byte-for-byte. PASS = layouts agree; FAIL =
+ * shim returns different / zero layout. */
+static void test_maintenance5_isl2_agreement(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_isl2_agreement", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateImage);
+    LOAD_DEV(vkDestroyImage);
+    LOAD_DEV(vkGetImageSubresourceLayout);
+    PFN_vkGetImageSubresourceLayout2KHR fn =
+        (PFN_vkGetImageSubresourceLayout2KHR)pfn_GetDeviceProcAddr(g_device, "vkGetImageSubresourceLayout2KHR");
+    if (!fn) { FAIL("maintenance5_isl2_agreement", "shim returned NULL"); return; }
+
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = { 16, 16, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkImage img;
+    VkResult r = vkCreateImage(g_device, &ici, NULL, &img);
+    if (r != VK_SUCCESS) {
+        SKIP("maintenance5_isl2_agreement", "vkCreateImage(LINEAR R8G8B8A8) not supported: %s", vkresult_str(r));
+        return;
+    }
+    VkImageSubresource sr = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+    VkSubresourceLayout v1 = {0};
+    vkGetImageSubresourceLayout(g_device, img, &sr, &v1);
+
+    VkImageSubresource2KHR sr2 = { .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR, .imageSubresource = sr };
+    VkSubresourceLayout2KHR v2 = { .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR };
+    /* sentinel — if shim does nothing, this remains and we'll detect it */
+    v2.subresourceLayout.offset    = 0xDEADBEEFDEADBEEFull;
+    v2.subresourceLayout.size      = 0xDEADBEEFDEADBEEFull;
+    v2.subresourceLayout.rowPitch  = 0xDEADBEEFDEADBEEFull;
+    fn(g_device, img, &sr2, &v2);
+    int sentinel_persisted = (v2.subresourceLayout.offset    == 0xDEADBEEFDEADBEEFull) ||
+                             (v2.subresourceLayout.rowPitch  == 0xDEADBEEFDEADBEEFull);
+    if (sentinel_persisted) FAIL("maintenance5_isl2_agreement", "shim did not write subresource layout");
+    else if (memcmp(&v1, &v2.subresourceLayout, sizeof(VkSubresourceLayout)) == 0)
+        PASS("maintenance5_isl2_agreement", "v2 layout matches v1 (size=%llu rowPitch=%llu)",
+             (unsigned long long)v1.size, (unsigned long long)v1.rowPitch);
+    else FAIL("maintenance5_isl2_agreement",
+              "v1 vs v2 mismatch: v1 size=%llu rp=%llu off=%llu | v2 size=%llu rp=%llu off=%llu",
+              (unsigned long long)v1.size, (unsigned long long)v1.rowPitch, (unsigned long long)v1.offset,
+              (unsigned long long)v2.subresourceLayout.size, (unsigned long long)v2.subresourceLayout.rowPitch,
+              (unsigned long long)v2.subresourceLayout.offset);
+    vkDestroyImage(g_device, img, NULL);
+}
+
+/* vkGetDeviceImageSubresourceLayoutKHR is a zero-stub in the shim
+ * (no transient-image emulation yet). Mark INCOMPLETE so it can't be
+ * confused with a real implementation. */
+static void test_maintenance5_dev_isl_stub(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_dev_isl_stub", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    PFN_vkGetDeviceImageSubresourceLayoutKHR fn =
+        (PFN_vkGetDeviceImageSubresourceLayoutKHR)pfn_GetDeviceProcAddr(g_device, "vkGetDeviceImageSubresourceLayoutKHR");
+    if (!fn) { FAIL("maintenance5_dev_isl_stub", "shim returned NULL"); return; }
+
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = { 16, 16, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkImageSubresource2KHR sr2 = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 },
+    };
+    VkDeviceImageSubresourceInfoKHR info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO_KHR,
+        .pCreateInfo = &ici,
+        .pSubresource = &sr2,
+    };
+    VkSubresourceLayout2KHR out = { .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR };
+    out.subresourceLayout.size     = 0xDEADBEEFDEADBEEFull;
+    out.subresourceLayout.rowPitch = 0xDEADBEEFDEADBEEFull;
+    fn(g_device, &info, &out);
+    if (out.subresourceLayout.size == 0 && out.subresourceLayout.rowPitch == 0)
+        INCOMPLETE("maintenance5_dev_isl_stub", "shim is a zero-stub (no transient-image emulation)");
+    else if (out.subresourceLayout.size == 0xDEADBEEFDEADBEEFull)
+        FAIL("maintenance5_dev_isl_stub", "shim did not write output");
+    else
+        PASS("maintenance5_dev_isl_stub", "shim wrote real layout (size=%llu rowPitch=%llu)",
+             (unsigned long long)out.subresourceLayout.size,
+             (unsigned long long)out.subresourceLayout.rowPitch);
+}
+
+/* Build a Features2 query with a maintenance5 features pNext, sentinel
+ * pre-fill the maintenance5 field to detect "wrapper saw unknown sType
+ * and skipped". After the shim runs, maintenance5 must equal VK_TRUE. */
+static void test_maintenance5_features2(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_features2", "extension not present"); return; }
+    PFN_vkGetPhysicalDeviceFeatures2 fn =
+        (PFN_vkGetPhysicalDeviceFeatures2)g_vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceFeatures2");
+    if (!fn) { FAIL("maintenance5_features2", "vkGetPhysicalDeviceFeatures2 not exposed"); return; }
+
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+        .pNext = NULL,
+        .maintenance5 = 0xDEADBEEF, /* sentinel */
+    };
+    VkPhysicalDeviceFeatures2 f2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &m5,
+    };
+    fn(g_phys, &f2);
+    if (m5.maintenance5 == 0xDEADBEEF)
+        FAIL("maintenance5_features2", "wrapper ignored maintenance5 features struct (sentinel persisted)");
+    else if (m5.maintenance5 == VK_TRUE)
+        PASS("maintenance5_features2", "maintenance5 = VK_TRUE");
+    else
+        FAIL("maintenance5_features2", "maintenance5 = %u (expected VK_TRUE=1)", m5.maintenance5);
+}
+
+/* Same pattern for Properties2: build a chain with maintenance5 props,
+ * sentinel pre-fill, verify the shim wrote definite values. The shim
+ * writes VK_FALSE for every prop, which is fine — we just need to see
+ * the sentinels were overwritten. */
+static void test_maintenance5_properties2(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_properties2", "extension not present"); return; }
+    PFN_vkGetPhysicalDeviceProperties2 fn =
+        (PFN_vkGetPhysicalDeviceProperties2)g_vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceProperties2");
+    if (!fn) { FAIL("maintenance5_properties2", "vkGetPhysicalDeviceProperties2 not exposed"); return; }
+
+    VkPhysicalDeviceMaintenance5PropertiesKHR m5p = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR,
+        .pNext = NULL,
+        .earlyFragmentMultisampleCoverageAfterSampleCounting = 0xDEADBEEF,
+        .earlyFragmentSampleMaskTestBeforeSampleCounting     = 0xDEADBEEF,
+        .depthStencilSwizzleOneSupport                       = 0xDEADBEEF,
+        .polygonModePointSize                                = 0xDEADBEEF,
+        .nonStrictSinglePixelWideLinesUseParallelogram       = 0xDEADBEEF,
+        .nonStrictWideLinesUseParallelogram                  = 0xDEADBEEF,
+    };
+    VkPhysicalDeviceProperties2 p2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &m5p,
+    };
+    fn(g_phys, &p2);
+    int any_sentinel =
+        m5p.earlyFragmentMultisampleCoverageAfterSampleCounting == 0xDEADBEEF ||
+        m5p.earlyFragmentSampleMaskTestBeforeSampleCounting     == 0xDEADBEEF ||
+        m5p.depthStencilSwizzleOneSupport                       == 0xDEADBEEF ||
+        m5p.polygonModePointSize                                == 0xDEADBEEF ||
+        m5p.nonStrictSinglePixelWideLinesUseParallelogram       == 0xDEADBEEF ||
+        m5p.nonStrictWideLinesUseParallelogram                  == 0xDEADBEEF;
+    if (any_sentinel)
+        FAIL("maintenance5_properties2", "shim did not fill all properties (some sentinels persist)");
+    else
+        PASS("maintenance5_properties2", "all 6 maintenance5 properties written");
+}
+
+/* DXVK 2.7+ passes VkBufferUsageFlags2CreateInfoKHR via VkBufferCreateInfo.pNext
+ * to extend the usage bitmask. The shim does not strip / translate this
+ * pNext — the wrapper sees an unknown sType and ignores it, and the
+ * buffer is created with whatever v1 .usage was. We can't observe the
+ * real usage post-creation, so this is a TESTBENCH BLIND SPOT: the call
+ * succeeds either way. Mark INCOMPLETE to keep the gap visible. */
+static void test_maintenance5_buffer_usage_flags2_blindspot(void) {
+    if (!maintenance5_present()) { SKIP("maintenance5_buffer_usage_flags2", "extension not present"); return; }
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+
+    VkBufferUsageFlags2CreateInfoKHR f2 = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
+        .pNext = NULL,
+        .usage = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR,
+    };
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &f2,
+        .size = 4096,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, /* matches f2.usage so v1 fallback is harmless */
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(g_device, &bci, NULL, &buf);
+    if (r != VK_SUCCESS) FAIL("maintenance5_buffer_usage_flags2", "vkCreateBuffer with flags2 pNext: %s", vkresult_str(r));
+    else INCOMPLETE("maintenance5_buffer_usage_flags2",
+                    "create succeeded but pNext-stripping not implemented; if DXVK uses flags2-only usage bits, those will be silently dropped (testbench blind spot)");
+    if (buf != VK_NULL_HANDLE) vkDestroyBuffer(g_device, buf, NULL);
 }
 
 /* ----- harness ----- */
@@ -445,6 +832,17 @@ int main(int argc, char **argv) {
     test_buffer_alloc_smoke();
     test_maintenance5_dispatch();
     test_maintenance5_record();
-    printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
+    test_maintenance5_bounded_size();
+    test_maintenance5_index_uint8();
+    test_maintenance5_granularity();
+    test_maintenance5_isl2_agreement();
+    test_maintenance5_dev_isl_stub();
+    test_maintenance5_features2();
+    test_maintenance5_properties2();
+    test_maintenance5_buffer_usage_flags2_blindspot();
+    printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
+           g_pass, g_fail, g_inc, g_skip);
+    if (g_inc > 0)
+        printf("    NOTE: incomplete results indicate stubs / partial impls — must not be confused with PASS\n");
     return g_fail;
 }
