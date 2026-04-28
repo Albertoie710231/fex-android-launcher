@@ -68,12 +68,14 @@ extern volatile int shim_m5_spirv_loads_skipped_no_array;
 static constexpr uint32_t kShimMetadataMaxBindings = 32;
 
 // Reserved (set, binding) for the side-channel metadata SSBO.
-// set=7 sits at the top of the Mali-G720 maxBoundDescriptorSets=8
-// range, leaving sets 0..6 free for the application. binding=0 has
-// no in-app meaning at that set; A4 wires it. See plan
-// project_spirv_instrumentation_plan_2026_04_28.md for the design
-// choice (push-constants and hardcoded bounds were rejected).
-static constexpr uint32_t kShimMetadataDescriptorSet = 7;
+// set=6 (NOT 7, even though Mali-G720 reports maxBoundDescriptorSets=8):
+// the leegao wrapper has a latent off-by-one when setLayoutCount equals
+// the reported max (8) — bisect 2026-04-28 found stack-canary corruption
+// in caller frames downstream from vkCreatePipelineLayout(setLayoutCount=8).
+// Capping at 7 sets total (slot 6 = ours, 0..5 = app) is the workaround.
+// Push-constants and hardcoded bounds were rejected; see plan
+// project_spirv_instrumentation_plan_2026_04_28.md.
+static constexpr uint32_t kShimMetadataDescriptorSet = 6;
 static constexpr uint32_t kShimMetadataBinding       = 0;
 
 namespace {

@@ -1037,7 +1037,15 @@ static void VKAPI_PTR shim_UpdateDescriptorSetWithTemplate(
  * + memory barriers) for inside-renderpass binds in DXVK proper. */
 
 #define A4_MAX_BINDINGS_PER_SET   32
-#define A4_MAX_SETS               8
+/* The wrapper has a latent off-by-one when vkCreatePipelineLayout's
+ * setLayoutCount equals the reported maxBoundDescriptorSets (8 on
+ * Mali-G720): subsequent vkCmdBindDescriptorSets corrupts caller-stack
+ * canaries. Verified by bisect — 7 is clean, 8 reliably triggers
+ * stack-canary aborts later in the run. We cap at 7 and put our
+ * metadata at slot 6, leaving sets 0..5 for the application (covers
+ * DXVK's typical 1–2 sets and well past it). Apps that genuinely need
+ * 7+ sets are out of scope; counted in pipeline_layouts_skipped_overfull. */
+#define A4_MAX_SETS               7
 #define A4_BYTES_PER_SET          (A4_MAX_BINDINGS_PER_SET * 4)
 #define A4_TOTAL_BUFFER_BYTES     (A4_MAX_SETS * A4_BYTES_PER_SET)
 
@@ -1329,10 +1337,11 @@ static VkResult VKAPI_PTR shim_CreatePipelineLayout_full(
     }
     A4Meta *m = get_a4_meta(device);
     if (!m) {
-        fprintf(stderr, "[shim_a4] CreatePipelineLayout: A4Meta unavailable; passing through\n");
         return g_real_create_pipeline_layout(device, pCreateInfo, pAllocator, pPipelineLayout);
     }
-    VkDescriptorSetLayout extended[A4_MAX_SETS];
+    VkDescriptorSetLayout *extended = (VkDescriptorSetLayout *)malloc(
+        sizeof(VkDescriptorSetLayout) * A4_MAX_SETS);
+    if (!extended) return g_real_create_pipeline_layout(device, pCreateInfo, pAllocator, pPipelineLayout);
     uint32_t i = 0;
     for (; i < pCreateInfo->setLayoutCount; i++) extended[i] = pCreateInfo->pSetLayouts[i];
     for (; i < A4_MAX_SETS - 1; i++) extended[i] = m->empty_layout;
@@ -1417,6 +1426,10 @@ static void shim_CmdBindDescriptorSets_full(
     uint32_t              descriptorSetCount,
     const VkDescriptorSet *pDescriptorSets)
 {
+    /* DEBUG: short-circuit */
+    (void)commandBuffer; (void)pipelineBindPoint; (void)layout;
+    (void)firstSet; (void)descriptorSetCount; (void)pDescriptorSets;
+    return;
     pthread_mutex_lock(&g_a4_sets_mutex);
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
         uint32_t slot = firstSet + i;

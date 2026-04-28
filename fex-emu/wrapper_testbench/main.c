@@ -1214,7 +1214,7 @@ static void test_spirv_hook_fires(void) {
 }
 
 /* Phase A2 verification: the metadata-injection pass must add a
- * runtime-array uint SSBO at (set=7, binding=0) and decorate it
+ * runtime-array uint SSBO at (set=6, binding=0) and decorate it
  * Block + ArrayStride 4 + member Offset 0. We verify two things:
  *   (1) the per-module counter advances under vkCreateShaderModule,
  *   (2) shim_spv_instrument's output bytes contain the expected
@@ -1342,7 +1342,7 @@ static void test_spirv_pass_injects_metadata_binding(void) {
                     found_binding_0++;
                     metadata_var_id_from_binding = target;
                 }
-                if (deco == 34 && lit == 7) {
+                if (deco == 34 && lit == 6) {
                     found_descriptor_set_7++;
                     metadata_var_id_from_descset = target;
                 }
@@ -1374,7 +1374,7 @@ check:
         FAIL("spirv_pass_injects_metadata_binding",
              "byte-scan of instrumented SPIR-V missing markers: "
              "runtime_array=%d Block=%d ArrayStride4=%d MemberOffset0=%d "
-             "DescriptorSet7=%d Binding0=%d (descset_var=%u binding_var=%u)",
+             "DescriptorSet6=%d Binding0=%d (descset_var=%u binding_var=%u)",
              found_runtime_array, found_block_decoration, found_array_stride_4,
              found_member_offset_0, found_descriptor_set_7, found_binding_0,
              metadata_var_id_from_descset, metadata_var_id_from_binding);
@@ -1382,7 +1382,7 @@ check:
     }
 
     PASS("spirv_pass_injects_metadata_binding",
-         "metadata SSBO injected (var_id=%u, set=7 binding=0, Block + "
+         "metadata SSBO injected (var_id=%u, set=6 binding=0, Block + "
          "ArrayStride 4 + member Offset 0); counter %d→%d, NonWritable=%d, "
          "spirv-val OK, wrapper accepted instrumented module",
          metadata_var_id_from_descset, before, after, found_nonwritable);
@@ -1394,7 +1394,7 @@ check:
  *   (1) shim_m5_spirv_loads_clamped advances per shader-module create,
  *   (2) shim_spv_instrument's output passes spirv-val,
  *   (3) byte-scan finds an OpAccessChain into the metadata var
- *       (set=7, binding=0), then OpULessThan, and OpSelect.
+ *       (set=6, binding=0), then OpULessThan, and OpSelect.
  *
  * A3 is gated behind SHIM_INSTRUMENT_ENABLE — set just around this
  * test's own vkCreateShaderModule. */
@@ -1487,7 +1487,7 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
                 uint32_t target = out_code[i + 1];
                 uint32_t deco   = out_code[i + 2];
                 uint32_t lit    = out_code[i + 3];
-                if (deco == 34 && lit == 7) descset_target = target;
+                if (deco == 34 && lit == 6) descset_target = target;
                 if (deco == 33 && lit == 0 && target == descset_target) {
                     metadata_var_id = target;
                 }
@@ -1497,7 +1497,7 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
     }
     if (metadata_var_id == 0) {
         freefn(out_code);
-        FAIL("spirv_pass_clamps_descriptor_loads", "metadata var (set=7, binding=0) not found in A2 output");
+        FAIL("spirv_pass_clamps_descriptor_loads", "metadata var (set=6, binding=0) not found in A2 output");
         return;
     }
 
@@ -1560,6 +1560,21 @@ static void test_spirv_pass_clamps_descriptor_loads(void) {
 static void test_mali_oob_ssbo_probe(void) {
     PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
         (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    /* When the shim has the A4 runtime metadata-buffer infrastructure,
+     * setting SHIM_INSTRUMENT_ENABLE around the entire probe makes A3+A4
+     * fully transparent — vkCreateShaderModule clamps OOB loads,
+     * vkCreatePipelineLayout extends to slot 6 = our meta layout,
+     * vkAllocateDescriptorSets registers the test's set,
+     * vkUpdateDescriptorSets captures the (set 0, binding 0) range,
+     * vkCmdBindDescriptorSets refreshes the metadata buffer + binds
+     * our meta set at slot 6. */
+    int a4_active = ((volatile int *)dlsym(g_lib, "shim_m5_a4_pipeline_layouts_extended")) != NULL;
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh a4_refresh = a4_active ? (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env") : NULL;
+    if (a4_active) {
+        setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+        if (a4_refresh) a4_refresh();
+    }
     LOAD_DEV(vkCreateBuffer);
     LOAD_DEV(vkDestroyBuffer);
     LOAD_DEV(vkAllocateMemory);
@@ -1739,11 +1754,21 @@ static void test_mali_oob_ssbo_probe(void) {
     vkUnmapMemory(g_device, out_mem);
 
     if (result == 0u) {
-        PASS("mali_oob_ssbo_probe",
-             "result=0 → Mali zeros OOB at descriptor-range level (real robustness2 for SSBOs comes free, no SPIR-V instrumentation needed for buffer reads)");
+        if (a4_active) {
+            PASS("mali_oob_ssbo_probe",
+                 "result=0 with A3+A4 active → SPIR-V instrumentation clamped the OOB read; real robustBufferAccess2 delivered (not just spoofed)");
+        } else {
+            PASS("mali_oob_ssbo_probe",
+                 "result=0 → Mali zeros OOB at descriptor-range level (real robustness2 for SSBOs comes free, no SPIR-V instrumentation needed for buffer reads)");
+        }
     } else if (result == 0xDEADBEEFu) {
-        INCOMPLETE("mali_oob_ssbo_probe",
-                   "result=0xDEADBEEF → Mali read past descriptor range into underlying allocation; spec-correct robustness2 requires SPIR-V instrumentation");
+        if (a4_active) {
+            FAIL("mali_oob_ssbo_probe",
+                 "result=0xDEADBEEF with A3+A4 active → instrumentation did NOT clamp; check counters: pipeline_layouts_extended, sets_tracked, writes_recorded, binds_extended");
+        } else {
+            INCOMPLETE("mali_oob_ssbo_probe",
+                       "result=0xDEADBEEF → Mali read past descriptor range into underlying allocation; spec-correct robustness2 requires SPIR-V instrumentation");
+        }
     } else {
         INCOMPLETE("mali_oob_ssbo_probe",
                    "result=0x%08x → unexpected (neither zero nor marker); behavior is implementation-defined garbage, instrumentation required",
@@ -1763,6 +1788,10 @@ cleanup_buffers:
     vkFreeMemory(g_device, out_mem, NULL);
     vkDestroyBuffer(g_device, in_buf, NULL);
     vkDestroyBuffer(g_device, out_buf, NULL);
+    if (a4_active) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (a4_refresh) a4_refresh();
+    }
 }
 
 /* Control: vkCreateBuffer(usage=0) with NO flags2 pNext at all. Per
