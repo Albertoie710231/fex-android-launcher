@@ -305,9 +305,130 @@ static void test_maintenance5_dispatch(void) {
     }
     PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
         (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
-    void *p = (void *)pfn_GetDeviceProcAddr(g_device, "vkCmdBindIndexBuffer2KHR");
-    if (p) PASS("maintenance5_dispatch", "vkCmdBindIndexBuffer2KHR resolved");
-    else   FAIL("maintenance5_dispatch", "vkCmdBindIndexBuffer2KHR returned NULL despite extension present");
+    void *bind2     = (void *)pfn_GetDeviceProcAddr(g_device, "vkCmdBindIndexBuffer2KHR");
+    void *gran      = (void *)pfn_GetDeviceProcAddr(g_device, "vkGetRenderingAreaGranularityKHR");
+    void *isl2      = (void *)pfn_GetDeviceProcAddr(g_device, "vkGetImageSubresourceLayout2KHR");
+    void *dev_isl   = (void *)pfn_GetDeviceProcAddr(g_device, "vkGetDeviceImageSubresourceLayoutKHR");
+    int resolved = (bind2 ? 1 : 0) + (gran ? 1 : 0) + (isl2 ? 1 : 0) + (dev_isl ? 1 : 0);
+    if (resolved == 4) PASS("maintenance5_dispatch", "all 4 entrypoints resolved");
+    else FAIL("maintenance5_dispatch", "%d/4 entrypoints resolved (bind2=%p gran=%p isl2=%p dev_isl=%p)",
+              resolved, bind2, gran, isl2, dev_isl);
+}
+
+/* Behavior test: record vkCmdBindIndexBuffer2KHR into a real command
+ * buffer with a real index buffer, end the command buffer, verify no
+ * error. Skipped when the extension isn't present. This is the actual
+ * "did we move the needle" gauge — the dispatch test only checks that
+ * a non-NULL pointer comes back. */
+static void test_maintenance5_record(void) {
+    LOAD_INST(vkEnumerateDeviceExtensionProperties);
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, NULL);
+    VkExtensionProperties *ex = calloc(n, sizeof(*ex));
+    vkEnumerateDeviceExtensionProperties(g_phys, NULL, &n, ex);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(ex[i].extensionName, "VK_KHR_maintenance5")) { has = 1; break; }
+    free(ex);
+    if (!has) {
+        printf("[SKIP] maintenance5_record: extension not present\n");
+        return;
+    }
+
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+    PFN_vkCmdBindIndexBuffer2KHR vkCmdBindIndexBuffer2KHR =
+        (PFN_vkCmdBindIndexBuffer2KHR)pfn_GetDeviceProcAddr(g_device, "vkCmdBindIndexBuffer2KHR");
+    if (!vkCmdBindIndexBuffer2KHR) {
+        FAIL("maintenance5_record", "shim returned NULL for vkCmdBindIndexBuffer2KHR");
+        return;
+    }
+
+    /* Create an index buffer (small, host-visible). */
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 4096,
+        .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(g_device, &bci, NULL, &buf);
+    if (r != VK_SUCCESS) { FAIL("maintenance5_record", "vkCreateBuffer: %s", vkresult_str(r)); return; }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_device, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    int mt = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if (req.memoryTypeBits & (1u << i)) { mt = (int)i; break; }
+    if (mt < 0) { FAIL("maintenance5_record", "no memory type"); vkDestroyBuffer(g_device, buf, NULL); return; }
+
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = (uint32_t)mt,
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    r = vkAllocateMemory(g_device, &mai, NULL, &mem);
+    if (r != VK_SUCCESS) { FAIL("maintenance5_record", "vkAllocateMemory: %s", vkresult_str(r)); vkDestroyBuffer(g_device, buf, NULL); return; }
+    vkBindBufferMemory(g_device, buf, mem, 0);
+
+    /* Command pool + buffer. */
+    VkCommandPoolCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = g_gfx_qfam,
+    };
+    VkCommandPool pool = VK_NULL_HANDLE;
+    r = vkCreateCommandPool(g_device, &cpci, NULL, &pool);
+    if (r != VK_SUCCESS) {
+        FAIL("maintenance5_record", "vkCreateCommandPool: %s", vkresult_str(r));
+        vkFreeMemory(g_device, mem, NULL); vkDestroyBuffer(g_device, buf, NULL); return;
+    }
+    VkCommandBufferAllocateInfo cbai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    r = vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    if (r != VK_SUCCESS) {
+        FAIL("maintenance5_record", "vkAllocateCommandBuffers: %s", vkresult_str(r));
+        vkDestroyCommandPool(g_device, pool, NULL);
+        vkFreeMemory(g_device, mem, NULL); vkDestroyBuffer(g_device, buf, NULL); return;
+    }
+
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    r = vkBeginCommandBuffer(cb, &cbbi);
+    if (r != VK_SUCCESS) {
+        FAIL("maintenance5_record", "vkBeginCommandBuffer: %s", vkresult_str(r));
+        vkDestroyCommandPool(g_device, pool, NULL);
+        vkFreeMemory(g_device, mem, NULL); vkDestroyBuffer(g_device, buf, NULL); return;
+    }
+
+    /* The actual call under test. Recording errors only surface at End,
+     * so we proceed and check there. */
+    vkCmdBindIndexBuffer2KHR(cb, buf, 0, VK_WHOLE_SIZE, VK_INDEX_TYPE_UINT16);
+
+    r = vkEndCommandBuffer(cb);
+    if (r == VK_SUCCESS) PASS("maintenance5_record", "vkCmdBindIndexBuffer2KHR recorded + End ok");
+    else                 FAIL("maintenance5_record", "vkEndCommandBuffer: %s", vkresult_str(r));
+
+    vkDestroyCommandPool(g_device, pool, NULL);
+    vkFreeMemory(g_device, mem, NULL);
+    vkDestroyBuffer(g_device, buf, NULL);
 }
 
 /* ----- harness ----- */
@@ -323,6 +444,7 @@ int main(int argc, char **argv) {
     test_dxvk2_extensions_present();
     test_buffer_alloc_smoke();
     test_maintenance5_dispatch();
+    test_maintenance5_record();
     printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail;
 }
