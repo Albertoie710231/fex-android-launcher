@@ -27,6 +27,8 @@ extern volatile int shim_m5_spirv_loads_seen;
 extern volatile int shim_m5_spirv_descriptor_loads_seen;
 extern volatile int shim_m5_spirv_metadata_injected;
 extern volatile int shim_m5_spirv_metadata_skipped_pre_1_3;
+extern volatile int shim_m5_spirv_loads_clamped;
+extern volatile int shim_m5_spirv_loads_skipped_no_array;
 
 #ifdef __cplusplus
 }

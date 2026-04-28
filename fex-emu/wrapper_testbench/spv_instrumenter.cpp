@@ -35,10 +35,14 @@
 #include <vector>
 
 #include "source/opt/build_module.h"
+#include "source/opt/constants.h"
+#include "source/opt/def_use_manager.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_context.h"
 #include "source/opt/module.h"
 #include "source/opt/pass.h"
+#include "source/opt/type_manager.h"
+#include "source/opt/types.h"
 #include "spirv-tools/libspirv.hpp"
 
 // Forward-declare the C-linkage counters here so the in-pass increments
@@ -49,7 +53,19 @@ extern volatile int shim_m5_spirv_loads_seen;
 extern volatile int shim_m5_spirv_descriptor_loads_seen;
 extern volatile int shim_m5_spirv_metadata_injected;
 extern volatile int shim_m5_spirv_metadata_skipped_pre_1_3;
+extern volatile int shim_m5_spirv_loads_clamped;
+extern volatile int shim_m5_spirv_loads_skipped_no_array;
 }
+
+// Metadata buffer logical layout: bucket = set * kShimMetadataMaxBindings + binding.
+// 8 sets × 32 bindings = 256 entries × 4 bytes = 1024 bytes total. A4
+// will allocate one device-lived SSBO of that size and write each
+// bucket's element-count whenever the application binds something to
+// the corresponding (set, binding). For now A3 just emits the OpLoad
+// against this layout; the buffer doesn't yet exist at runtime, which
+// means at draw time the wrapper would dereference an unbound binding
+// — A3 is purely a SPIR-V change, not yet end-to-end.
+static constexpr uint32_t kShimMetadataMaxBindings = 32;
 
 // Reserved (set, binding) for the side-channel metadata SSBO.
 // set=7 sits at the top of the Mali-G720 maxBoundDescriptorSets=8
@@ -283,6 +299,263 @@ class InjectMetadataBindingPass : public spvtools::opt::Pass {
   }
 };
 
+// Helper: extract DescriptorSet + Binding decorations for a given
+// variable result-id by linear scan of OpDecorate annotations.
+// Returns false if either is missing.
+static bool ExtractSetBinding(spvtools::opt::Module* mod, uint32_t var_id,
+                              uint32_t* out_set, uint32_t* out_binding) {
+  using spv::Op;
+  bool have_set = false, have_binding = false;
+  for (auto& a : mod->annotations()) {
+    if (a.opcode() != Op::OpDecorate || a.NumInOperands() < 3) continue;
+    if (a.GetSingleWordInOperand(0) != var_id) continue;
+    uint32_t deco = a.GetSingleWordInOperand(1);
+    if (deco == 34 /*DescriptorSet*/) {
+      *out_set = a.GetSingleWordInOperand(2);
+      have_set = true;
+    } else if (deco == 33 /*Binding*/) {
+      *out_binding = a.GetSingleWordInOperand(2);
+      have_binding = true;
+    }
+  }
+  return have_set && have_binding;
+}
+
+// Helper: locate the variable injected by InjectMetadataBindingPass —
+// the OpVariable with DescriptorSet=kShimMetadataDescriptorSet and
+// Binding=kShimMetadataBinding.
+static uint32_t FindMetadataVarId(spvtools::opt::Module* mod) {
+  using spv::Op;
+  for (auto& g : mod->types_values()) {
+    if (g.opcode() != Op::OpVariable) continue;
+    uint32_t set = 0, binding = 0;
+    if (!ExtractSetBinding(mod, g.result_id(), &set, &binding)) continue;
+    if (set == kShimMetadataDescriptorSet && binding == kShimMetadataBinding) {
+      return g.result_id();
+    }
+  }
+  return 0;
+}
+
+// Phase A3 pass: rewrite each descriptor-mediated OpLoad whose pointer
+// is a single OpAccessChain with ≥ 2 indices into a clamped form:
+//
+//   %ac      = OpAccessChain %_ptr_StorageBuffer_uint %metadata
+//                  %const_uint_0 %const_uint_<bucket>
+//   %count   = OpLoad %uint %ac
+//   %cond    = OpULessThan %bool %array_idx %count
+//   %orig    = OpLoad %T %ptr            (left in place; consumers redirected)
+//   %sel     = OpSelect %T %cond %orig %null_T
+//   ; uses of %orig redirected to %sel
+//
+// The "array index" picked is the LAST in-operand of the AccessChain
+// (DXVK-typical pattern: var.field0.array[idx] → AC has 2 indices,
+// last = idx). For accesses that have only 1 index (struct field
+// only, no array) we skip — there's nothing to bound. This is the
+// minimum needed for test_mali_oob_ssbo_probe; bindless / nested
+// chains / NonUniformEXT / OpInBoundsAccessChain are out of scope
+// for A3 and pass through unchanged.
+class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
+ public:
+  const char* name() const override { return "shim-m5-bounds-check-descriptor-loads"; }
+
+  Status Process() override {
+    using spv::Op;
+    namespace opt = spvtools::opt;
+    opt::IRContext* ctx = context();
+    opt::Module* mod = ctx->module();
+
+    // Pre-1.3: A2 didn't inject metadata, so there's no buffer to
+    // index against. Skip silently.
+    if (mod->version() < 0x00010300u) return Status::SuccessWithoutChange;
+
+    const uint32_t metadata_var_id = FindMetadataVarId(mod);
+    if (metadata_var_id == 0) return Status::SuccessWithoutChange;
+
+    opt::analysis::DefUseManager* du = ctx->get_def_use_mgr();
+    opt::analysis::TypeManager* tm = ctx->get_type_mgr();
+    opt::analysis::ConstantManager* cm = ctx->get_constant_mgr();
+
+    const uint32_t uint_id = tm->GetUIntTypeId();
+    const uint32_t bool_id = tm->GetBoolTypeId();
+    const uint32_t ptr_uint_sb_id = tm->FindPointerToType(
+        uint_id, spv::StorageClass::StorageBuffer);
+    const uint32_t const_uint_0 = cm->GetUIntConstId(0);
+
+    // Snapshot candidate loads first; we'll mutate the IR after.
+    struct LoadCandidate {
+      opt::Instruction* load;
+      uint32_t array_idx_id;
+      uint32_t bucket;
+    };
+    std::vector<LoadCandidate> candidates;
+    int loads_skipped_no_array = 0;
+
+    for (auto& fn : *mod) {
+      fn.ForEachInst([&](opt::Instruction* inst) {
+        if (inst->opcode() != Op::OpLoad) return;
+        uint32_t ptr_id = inst->GetSingleWordInOperand(0);
+        opt::Instruction* ptr_def = du->GetDef(ptr_id);
+        if (!ptr_def) return;
+        // Only rewrite plain OpAccessChain; OpInBoundsAccessChain is
+        // an application-level invariant we won't touch.
+        if (ptr_def->opcode() != Op::OpAccessChain) return;
+        opt::Instruction* ac = ptr_def;
+
+        // Find the descriptor variable at the root of the chain.
+        opt::Instruction* root = du->GetDef(ac->GetSingleWordInOperand(0));
+        while (root && (root->opcode() == Op::OpAccessChain ||
+                        root->opcode() == Op::OpInBoundsAccessChain)) {
+          root = du->GetDef(root->GetSingleWordInOperand(0));
+        }
+        if (!root || root->opcode() != Op::OpVariable) return;
+
+        uint32_t sc = root->GetSingleWordInOperand(0);
+        if (sc != static_cast<uint32_t>(spv::StorageClass::StorageBuffer) &&
+            sc != static_cast<uint32_t>(spv::StorageClass::Uniform)) {
+          return;
+        }
+        if (root->result_id() == metadata_var_id) return;
+
+        uint32_t set = 0, binding = 0;
+        if (!ExtractSetBinding(mod, root->result_id(), &set, &binding)) return;
+        if (set >= 8 || binding >= kShimMetadataMaxBindings) return;
+
+        // AccessChain operands: base, idx0, idx1, ...  We need at
+        // least 2 indices (struct field + array element).
+        uint32_t num_indices = ac->NumInOperands() - 1;
+        if (num_indices < 2) {
+          loads_skipped_no_array++;
+          return;
+        }
+        uint32_t array_idx_id = ac->GetSingleWordInOperand(num_indices);
+        uint32_t bucket = set * kShimMetadataMaxBindings + binding;
+
+        candidates.push_back({inst, array_idx_id, bucket});
+      });
+    }
+
+    if (candidates.empty()) {
+      __atomic_add_fetch(&shim_m5_spirv_loads_skipped_no_array,
+                         loads_skipped_no_array, __ATOMIC_RELAXED);
+      return Status::SuccessWithoutChange;
+    }
+
+    // Sanity: required types must already be in the module. uint and
+    // const-zero are nearly always present in any non-trivial shader;
+    // bool and the StorageBuffer-uint pointer might not be. The
+    // helpers above already lazily create them.
+    if (!uint_id || !bool_id || !ptr_uint_sb_id || !const_uint_0) {
+      // Should never happen — the helpers add types/consts on demand.
+      return Status::Failure;
+    }
+
+    int clamped = 0;
+    for (auto& c : candidates) {
+      opt::Instruction* load = c.load;
+      const uint32_t loaded_type = load->type_id();
+      const uint32_t orig_load_id = load->result_id();
+
+      uint32_t bucket_const = cm->GetUIntConstId(c.bucket);
+
+      // OpAccessChain into metadata[0][bucket]:
+      uint32_t ac_id = ctx->TakeNextId();
+      auto ac_inst = std::make_unique<opt::Instruction>(
+          ctx, Op::OpAccessChain, ptr_uint_sb_id, ac_id,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {metadata_var_id}},
+              {SPV_OPERAND_TYPE_ID, {const_uint_0}},
+              {SPV_OPERAND_TYPE_ID, {bucket_const}}});
+
+      // OpLoad %uint %ac → count
+      uint32_t count_id = ctx->TakeNextId();
+      auto count_inst = std::make_unique<opt::Instruction>(
+          ctx, Op::OpLoad, uint_id, count_id,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {ac_id}}});
+
+      // OpULessThan %bool %array_idx_id %count → cond
+      uint32_t cond_id = ctx->TakeNextId();
+      auto cond_inst = std::make_unique<opt::Instruction>(
+          ctx, Op::OpULessThan, bool_id, cond_id,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {c.array_idx_id}},
+              {SPV_OPERAND_TYPE_ID, {count_id}}});
+
+      // OpConstantNull %loaded_type → null
+      opt::analysis::Type* loaded_t = tm->GetType(loaded_type);
+      if (!loaded_t) continue;
+      uint32_t null_id = cm->GetNullConstId(loaded_t);
+      if (!null_id) continue;
+
+      // OpSelect %loaded_type %cond %orig_load %null → sel
+      // Built with raw `new` because IntrusiveNodeBase::InsertAfter
+      // (the only InsertAfter Instruction inherits) takes a position
+      // pointer and the list takes ownership of the inserted node.
+      // Pattern matches invocation_interlock_placement_pass.cpp:210.
+      uint32_t sel_id = ctx->TakeNextId();
+      opt::Instruction* sel_inst = new opt::Instruction(
+          ctx, Op::OpSelect, loaded_type, sel_id,
+          std::initializer_list<opt::Operand>{
+              {SPV_OPERAND_TYPE_ID, {cond_id}},
+              {SPV_OPERAND_TYPE_ID, {orig_load_id}},
+              {SPV_OPERAND_TYPE_ID, {null_id}}});
+
+      // Capture existing users of the original load BEFORE adding
+      // the OpSelect (so the OpSelect's own use of orig_load_id
+      // isn't included in the redirect set).
+      std::vector<std::pair<opt::Instruction*, uint32_t>> uses_to_redirect;
+      du->ForEachUse(orig_load_id,
+                     [&](opt::Instruction* user, uint32_t op_idx) {
+                       uses_to_redirect.push_back({user, op_idx});
+                     });
+
+      // Insert prelude before the load (InsertBefore takes unique_ptr).
+      opt::Instruction* ac_raw = load->InsertBefore(std::move(ac_inst));
+      opt::Instruction* count_raw = load->InsertBefore(std::move(count_inst));
+      opt::Instruction* cond_raw = load->InsertBefore(std::move(cond_inst));
+      // Insert OpSelect after the load.
+      sel_inst->InsertAfter(load);
+      du->AnalyzeInstDefUse(ac_raw);
+      du->AnalyzeInstDefUse(count_raw);
+      du->AnalyzeInstDefUse(cond_raw);
+      du->AnalyzeInstDefUse(sel_inst);
+
+      // Redirect all prior consumers of orig_load_id to sel_id.
+      for (auto& u : uses_to_redirect) {
+        opt::Instruction* user = u.first;
+        uint32_t op_idx = u.second;
+        // op_idx is a TOTAL operand index (counting type/result),
+        // matching the storage layout SPIRV-Tools uses internally.
+        // Rewrite that operand's id.
+        opt::Operand& o = *(user->begin() + op_idx);
+        if (o.words.size() == 1 && o.words[0] == orig_load_id) {
+          o.words[0] = sel_id;
+        }
+        du->AnalyzeInstUse(user);
+      }
+
+      clamped++;
+    }
+
+    if (consumer()) {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf),
+                    "[shim-spv] A3: clamped %d descriptor load(s); "
+                    "skipped_no_array=%d (struct-field-only chains)",
+                    clamped, loads_skipped_no_array);
+      spv_position_t pos = {};
+      consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
+    }
+
+    __atomic_add_fetch(&shim_m5_spirv_loads_clamped, clamped, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_loads_skipped_no_array,
+                       loads_skipped_no_array, __ATOMIC_RELAXED);
+    return clamped > 0 ? Status::SuccessWithChange
+                       : Status::SuccessWithoutChange;
+  }
+};
+
 }  // namespace
 
 extern "C" {
@@ -298,6 +571,10 @@ __attribute__((visibility("default")))
 volatile int shim_m5_spirv_metadata_injected = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_metadata_skipped_pre_1_3 = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_loads_clamped = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_loads_skipped_no_array = 0;
 
 __attribute__((visibility("default")))
 int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
@@ -319,9 +596,32 @@ int shim_spv_instrument(const uint32_t *in_code, size_t in_size_bytes,
   a1.SetMessageConsumer(consumer);
   if (a1.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
 
+  // A2 always runs — declares an unused storage_buffer variable;
+  // wrappers skip validation for unused-but-declared interface vars
+  // (verified in the A2-only commit, which didn't regress any test).
   InjectMetadataBindingPass a2;
   a2.SetMessageConsumer(consumer);
   if (a2.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
+
+  // A3 is env-gated until A4 (runtime metadata buffer plumbing) lands.
+  // Reasons:
+  //   1. A3 makes the SPIR-V actively reference set=7 binding=0 (via
+  //      OpAccessChain into the metadata var). Without a matching
+  //      pipeline layout, vkCreateComputePipelines rejects. Every
+  //      shader the shim sees — including the wrapper's internal
+  //      BC6/BC7/S3TC compute decoders at device init — would fail.
+  //   2. There is also an uncharacterised stack-corruption regression
+  //      that surfaces during wrapper-internal shader compile when
+  //      A3 is unconditionally on. Until isolated, restrict A3 to
+  //      tests that opt in.
+  // Tests exercising A3 setenv this gate around their vkCreateShaderModule
+  // call, then unsetenv to keep the rest of the run clean.
+  const char *a3_enable = std::getenv("SHIM_A3_DEBUG_ENABLE");
+  if (a3_enable && a3_enable[0] == '1') {
+    BoundsCheckDescriptorLoadsPass a3;
+    a3.SetMessageConsumer(consumer);
+    if (a3.Run(ctx.get()) == spvtools::opt::Pass::Status::Failure) return 0;
+  }
 
   std::vector<uint32_t> output;
   ctx->module()->ToBinary(&output, /*skip_nop=*/true);

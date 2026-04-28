@@ -1388,6 +1388,153 @@ check:
          metadata_var_id_from_descset, before, after, found_nonwritable);
 }
 
+/* Phase A3 verification: byte-scan + spirv-val. End-to-end pipeline
+ * dispatch is A4's responsibility — the metadata buffer must be
+ * created and bound by the wrapper, not by the test. We assert:
+ *   (1) shim_m5_spirv_loads_clamped advances per shader-module create,
+ *   (2) shim_spv_instrument's output passes spirv-val,
+ *   (3) byte-scan finds an OpAccessChain into the metadata var
+ *       (set=7, binding=0), then OpULessThan, and OpSelect.
+ *
+ * A3 is gated behind SHIM_A3_DEBUG_ENABLE — set just around this
+ * test's own vkCreateShaderModule. */
+static void test_spirv_pass_clamps_descriptor_loads(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *clamped_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_loads_clamped");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!clamped_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_clamps_descriptor_loads", "shim symbols not present (PASS A or pre-A3 build)");
+        return;
+    }
+
+    int before = *clamped_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_probe_spv_len,
+        .pCode = (const uint32_t *)oob_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_A3_DEBUG_ENABLE", "1", 1);
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *clamped_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_A3_DEBUG_ENABLE");
+        FAIL("spirv_pass_clamps_descriptor_loads",
+             "vkCreateShaderModule rejected the A3-clamped module: %s",
+             vkresult_str(r));
+        return;
+    }
+    if (after - before < 1) {
+        unsetenv("SHIM_A3_DEBUG_ENABLE");
+        FAIL("spirv_pass_clamps_descriptor_loads",
+             "loads_clamped counter did not advance (stuck at %d) — A3 either skipped or never ran",
+             before);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t    out_size = 0;
+    int instrument_ok = instrument((const uint32_t *)oob_probe_spv, oob_probe_spv_len, &out_code, &out_size);
+    unsetenv("SHIM_A3_DEBUG_ENABLE");
+    if (!instrument_ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_clamps_descriptor_loads", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_clamps_descriptor_loads",
+             "spirv-val rejected the A3-clamped module: %s", vmsg);
+        return;
+    }
+
+    /* Locate the metadata var_id (target of OpDecorate DescriptorSet 7
+     * + OpDecorate Binding 0 sharing the same target).
+     *   OpDecorate           = 71
+     *   OpAccessChain        = 65
+     *   OpULessThan          = 176
+     *   OpSelect             = 169
+     */
+    uint32_t metadata_var_id = 0;
+    {
+        size_t total_words = out_size / 4;
+        size_t i = 5;
+        uint32_t descset_target = 0;
+        while (i < total_words) {
+            uint32_t w0 = out_code[i];
+            uint32_t len = w0 >> 16;
+            uint32_t op  = w0 & 0xFFFFu;
+            if (len == 0 || i + len > total_words) break;
+            if (op == 71 && len >= 4) {
+                uint32_t target = out_code[i + 1];
+                uint32_t deco   = out_code[i + 2];
+                uint32_t lit    = out_code[i + 3];
+                if (deco == 34 && lit == 7) descset_target = target;
+                if (deco == 33 && lit == 0 && target == descset_target) {
+                    metadata_var_id = target;
+                }
+            }
+            i += len;
+        }
+    }
+    if (metadata_var_id == 0) {
+        freefn(out_code);
+        FAIL("spirv_pass_clamps_descriptor_loads", "metadata var (set=7, binding=0) not found in A2 output");
+        return;
+    }
+
+    int access_into_metadata = 0;
+    int ulessthan_count = 0;
+    int select_count = 0;
+    {
+        size_t total_words = out_size / 4;
+        size_t i = 5;
+        while (i < total_words) {
+            uint32_t w0 = out_code[i];
+            uint32_t len = w0 >> 16;
+            uint32_t op  = w0 & 0xFFFFu;
+            if (len == 0 || i + len > total_words) break;
+            switch (op) {
+            case 65:
+                if (len >= 4) {
+                    uint32_t base = out_code[i + 3];
+                    if (base == metadata_var_id) access_into_metadata++;
+                }
+                break;
+            case 176: ulessthan_count++; break;
+            case 169: select_count++;    break;
+            default: break;
+            }
+            i += len;
+        }
+    }
+    freefn(out_code);
+
+    if (access_into_metadata < 1 || ulessthan_count < 1 || select_count < 1) {
+        FAIL("spirv_pass_clamps_descriptor_loads",
+             "clamp scaffolding missing: AccessChain-into-metadata=%d "
+             "OpULessThan=%d OpSelect=%d (expected ≥1 of each)",
+             access_into_metadata, ulessthan_count, select_count);
+        return;
+    }
+    PASS("spirv_pass_clamps_descriptor_loads",
+         "A3 emitted %d clamp(s); counter %d→%d, AccessChain→metadata=%d, "
+         "OpULessThan=%d, OpSelect=%d, spirv-val OK",
+         after - before, before, after,
+         access_into_metadata, ulessthan_count, select_count);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -1728,6 +1875,7 @@ int main(int argc, char **argv) {
     test_spirv_hook_fires();
     test_spirv_pass_identifies_descriptor_loads();
     test_spirv_pass_injects_metadata_binding();
+    test_spirv_pass_clamps_descriptor_loads();
     test_mali_oob_ssbo_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
