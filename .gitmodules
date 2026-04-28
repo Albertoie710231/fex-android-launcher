@@ -1,0 +1,6 @@
+[submodule "fex-emu/wrapper_testbench/external/SPIRV-Tools"]
+	path = fex-emu/wrapper_testbench/external/SPIRV-Tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+[submodule "fex-emu/wrapper_testbench/external/SPIRV-Headers"]
+	path = fex-emu/wrapper_testbench/external/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git

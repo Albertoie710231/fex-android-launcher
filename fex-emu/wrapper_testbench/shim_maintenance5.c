@@ -37,6 +37,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "spv_instrumenter.h"
+
 #define WRAPPED_LIB "/data/data/com.mediatek.steamlauncher/files/imagefs_bionic/usr/lib/libvulkan_wrapper.so"
 
 /* Extensions this shim claims on top of the real wrapper.
@@ -82,6 +84,7 @@ static PFN_vkGetImageSubresourceLayout                  g_real_get_isl = NULL;
 static PFN_vkCreateBuffer                               g_real_create_buffer = NULL;
 static PFN_vkCreateGraphicsPipelines                    g_real_create_graphics_pipelines = NULL;
 static PFN_vkCreateComputePipelines                     g_real_create_compute_pipelines = NULL;
+static PFN_vkCreateShaderModule                         g_real_create_shader_module = NULL;
 /* Forward declarations used by hooks defined earlier in the file. The
  * full state for nullDescriptor lives further down (search "robustness2
  * nullDescriptor real-implementation"). */
@@ -278,6 +281,42 @@ static VkPipelineCreateFlags fold_pipeline_flags2(const void *pNext, VkPipelineC
         p = p->pNext;
     }
     return fallback;
+}
+
+/* SPIR-V instrumentation hook. Routes the input SPIR-V through
+ * spv_instrumenter (C++ side, links SPIRV-Tools) and forwards the
+ * possibly-modified module to the real wrapper. Currently a passthrough
+ * (parse + reserialize, no transform) — verifies the link works
+ * end-to-end before the real robustBufferAccess2 / robustImageAccess2
+ * pass is wired in. */
+static VkResult VKAPI_PTR shim_CreateShaderModule(
+    VkDevice                            device,
+    const VkShaderModuleCreateInfo     *pCreateInfo,
+    const VkAllocationCallbacks        *pAllocator,
+    VkShaderModule                     *pShaderModule)
+{
+    if (!g_real_create_shader_module) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!pCreateInfo || !pCreateInfo->pCode || pCreateInfo->codeSize == 0) {
+        return g_real_create_shader_module(device, pCreateInfo, pAllocator, pShaderModule);
+    }
+
+    uint32_t *new_code = NULL;
+    size_t    new_size = 0;
+    int ok = shim_spv_instrument(pCreateInfo->pCode, pCreateInfo->codeSize,
+                                 &new_code, &new_size);
+    if (!ok || !new_code) {
+        /* Instrumenter declined (parse failure, OOM, etc.) — fall through
+         * to forwarding the original. The wrapper sees what the caller
+         * sent, no behavior change. */
+        return g_real_create_shader_module(device, pCreateInfo, pAllocator, pShaderModule);
+    }
+
+    VkShaderModuleCreateInfo modified = *pCreateInfo;
+    modified.pCode    = new_code;
+    modified.codeSize = new_size;
+    VkResult r = g_real_create_shader_module(device, &modified, pAllocator, pShaderModule);
+    shim_spv_free(new_code);
+    return r;
 }
 
 static VkResult VKAPI_PTR shim_CreateBuffer(
@@ -1005,6 +1044,9 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
     if (!g_real_create_compute_pipelines)
         g_real_create_compute_pipelines = (PFN_vkCreateComputePipelines)
             g_real_gdpa(device, "vkCreateComputePipelines");
+    if (!g_real_create_shader_module)
+        g_real_create_shader_module = (PFN_vkCreateShaderModule)
+            g_real_gdpa(device, "vkCreateShaderModule");
     /* Real fn pointers for standin construction + descriptor-write substitution. */
     if (!g_real_alloc_memory)
         g_real_alloc_memory = (PFN_vkAllocateMemory)g_real_gdpa(device, "vkAllocateMemory");
@@ -1054,6 +1096,8 @@ static PFN_vkVoidFunction VKAPI_PTR shim_GetDeviceProcAddr(
         return (PFN_vkVoidFunction)shim_CreateGraphicsPipelines;
     if (!strcmp(pName, "vkCreateComputePipelines"))
         return (PFN_vkVoidFunction)shim_CreateComputePipelines;
+    if (!strcmp(pName, "vkCreateShaderModule"))
+        return (PFN_vkVoidFunction)shim_CreateShaderModule;
     if (!strcmp(pName, "vkUpdateDescriptorSets"))
         return (PFN_vkVoidFunction)shim_UpdateDescriptorSets;
     if (!strcmp(pName, "vkCreateDescriptorUpdateTemplate") ||
@@ -1145,6 +1189,11 @@ static PFN_vkVoidFunction shim_GetInstanceProcAddr(
         if (instance != VK_NULL_HANDLE && !g_real_create_compute_pipelines)
             g_real_create_compute_pipelines = (PFN_vkCreateComputePipelines)g_real_gipa(instance, pName);
         return (PFN_vkVoidFunction)shim_CreateComputePipelines;
+    }
+    if (!strcmp(pName, "vkCreateShaderModule")) {
+        if (instance != VK_NULL_HANDLE && !g_real_create_shader_module)
+            g_real_create_shader_module = (PFN_vkCreateShaderModule)g_real_gipa(instance, pName);
+        return (PFN_vkVoidFunction)shim_CreateShaderModule;
     }
 
     return g_real_gipa(instance, pName);

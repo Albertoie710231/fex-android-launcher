@@ -1131,6 +1131,44 @@ static void test_null_subst_via_template(void) {
     cleanup_single_binding_set(pool, layout);
 }
 
+/* Verifies the shim's vkCreateShaderModule hook actually routes through
+ * the SPIR-V instrumenter. Counter symbol is dlsym'd from the loaded
+ * shim .so; missing in PASS A. We just create a shader module from the
+ * embedded OOB probe SPIR-V — the body of that module isn't relevant
+ * here, only that it's a valid binary the round-trip can parse. */
+static void test_spirv_hook_fires(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_instrument_count");
+    if (!cnt) {
+        SKIP("spirv_hook_fires", "shim counter symbol not present (vanilla wrapper or pre-SPIR-V build)");
+        return;
+    }
+    int before = *cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_probe_spv_len,
+        .pCode = (const uint32_t *)oob_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        FAIL("spirv_hook_fires", "vkCreateShaderModule round-trip rejected the SPIR-V: %s", vkresult_str(r));
+        return;
+    }
+    if (after > before)
+        PASS("spirv_hook_fires",
+             "shim parsed + reserialized OOB probe SPIR-V via SPIRV-Tools (counter %d→%d)",
+             before, after);
+    else
+        FAIL("spirv_hook_fires", "counter did not advance (stuck at %d) — hook bypassed", before);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -1468,6 +1506,7 @@ int main(int argc, char **argv) {
     test_null_subst_sampled_image();
     test_null_subst_storage_buffer_incomplete();
     test_null_subst_via_template();
+    test_spirv_hook_fires();
     test_mali_oob_ssbo_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
