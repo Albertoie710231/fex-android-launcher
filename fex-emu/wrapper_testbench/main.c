@@ -29,7 +29,9 @@
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3137,14 +3139,174 @@ static void test_maintenance5_buffer_usage_flags2_fold(void) {
              "create succeeded but shim fold-counter did NOT advance (counter stuck at %d) — fold path not taken", before);
 }
 
+/* ----- shader replay mode -----
+ *
+ * Phase 0 verification: does the leegao Vulkan wrapper's
+ * vkCreateShaderModule accept stock DXVK SPIR-V? If yes, the layer-side
+ * SPIR-V instrumentation strategy in shim_maintenance5 is viable for
+ * DXVK 2.x; if no, bet (b) in project_spirv_instrumentation_plan_2026_04_28.md
+ * is broken and we need bucket #3 (SPIR-V validation/lowering shim
+ * inside the wrapper) — see project_strategic_priority_mali_wrapper.md.
+ *
+ * Walks every .spv in <dir>, calls vkCreateShaderModule on each, counts
+ * accepted vs rejected (by VkResult). Logs a stderr breadcrumb every
+ * 100 shaders with flush, so a wrapper crash leaves us a forensic
+ * trail of which shader was in flight.
+ *
+ * Toggling the shim's SPIR-V instrumentation:
+ *   SHIM_INSTRUMENT_ENABLE=0  (or unset)  → vanilla passthrough; tests
+ *                                            whether the wrapper alone
+ *                                            accepts DXVK SPIR-V.
+ *   SHIM_INSTRUMENT_ENABLE=1              → A2/A3/A5/A5W instrumentation
+ *                                            applied first; tests the
+ *                                            full production path.
+ * Run this binary against PASS A (vanilla wrapper) AND PASS B (shim) to
+ * separate "wrapper accepts DXVK SPIR-V" from "shim's added passes don't
+ * regress otherwise-acceptable shaders".
+ */
+static int str_cmp_indirect(const void *a, const void *b) {
+    return strcmp(*(const char * const *)a, *(const char * const *)b);
+}
+
+static int run_replay(const char *dir_path) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+    if (!vkCreateShaderModule || !vkDestroyShaderModule) {
+        fprintf(stderr, "[replay] failed to resolve shader module entrypoints\n");
+        return 2;
+    }
+
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        fprintf(stderr, "[replay] cannot open %s: %s\n", dir_path, strerror(errno));
+        return 2;
+    }
+    struct dirent *e;
+    char **files = NULL;
+    int n_files = 0, cap = 0;
+    while ((e = readdir(d)) != NULL) {
+        const char *name = e->d_name;
+        size_t len = strlen(name);
+        if (len < 5 || strcmp(name + len - 4, ".spv") != 0) continue;
+        if (n_files == cap) {
+            cap = cap ? cap * 2 : 1024;
+            char **nf = (char **)realloc(files, (size_t)cap * sizeof(char *));
+            if (!nf) { closedir(d); free(files); return 2; }
+            files = nf;
+        }
+        files[n_files++] = strdup(name);
+    }
+    closedir(d);
+    if (n_files == 0) {
+        fprintf(stderr, "[replay] no .spv files in %s\n", dir_path);
+        free(files);
+        return 2;
+    }
+    qsort(files, (size_t)n_files, sizeof(char *), str_cmp_indirect);
+    fprintf(stderr, "[replay] %d shaders in %s\n", n_files, dir_path);
+
+    /* Track outcomes. VkResult is signed (errors are negative); collect
+     * the unique negative codes we see so the summary shows the
+     * distribution rather than just total rejections. */
+    int n_accepted = 0;
+    int n_rejected = 0;
+    /* simple linear association list — there are typically only a few
+     * distinct rejection codes, so linear scan is fine. */
+    struct { int code; int count; } reject_codes[32] = {0};
+    int n_reject_codes = 0;
+
+    for (int i = 0; i < n_files; i++) {
+        if (i % 100 == 0 || i + 1 == n_files) {
+            fprintf(stderr, "[replay] %d/%d  %s\n", i, n_files, files[i]);
+            fflush(stderr);
+        }
+
+        char path[2048];
+        int wn = snprintf(path, sizeof(path), "%s/%s", dir_path, files[i]);
+        if (wn <= 0 || wn >= (int)sizeof(path)) continue;
+
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz < 20 || sz > 16 * 1024 * 1024) { fclose(f); continue; }
+        uint32_t *code = (uint32_t *)malloc((size_t)sz);
+        if (!code) { fclose(f); continue; }
+        size_t rd = fread(code, 1, (size_t)sz, f);
+        fclose(f);
+        if (rd != (size_t)sz) { free(code); continue; }
+
+        VkShaderModuleCreateInfo smci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = (size_t)sz,
+            .pCode = code,
+        };
+        VkShaderModule mod = VK_NULL_HANDLE;
+        VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+        free(code);
+
+        if (r == VK_SUCCESS) {
+            n_accepted++;
+            if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+        } else {
+            n_rejected++;
+            int found = 0;
+            for (int j = 0; j < n_reject_codes; j++) {
+                if (reject_codes[j].code == (int)r) { reject_codes[j].count++; found = 1; break; }
+            }
+            if (!found && n_reject_codes < 32) {
+                reject_codes[n_reject_codes].code = (int)r;
+                reject_codes[n_reject_codes].count = 1;
+                n_reject_codes++;
+            }
+            /* Print the first few rejections in detail so we can grab
+             * specific failing shaders for further analysis. */
+            if (n_rejected <= 10) {
+                fprintf(stderr, "[replay] REJECT %s: %s\n", files[i], vkresult_str(r));
+            }
+        }
+    }
+
+    printf("=== shader replay summary (%s) ===\n", dir_path);
+    printf("  total:    %d\n", n_files);
+    printf("  accepted: %d (%.2f%%)\n",
+           n_accepted, 100.0 * (double)n_accepted / (double)n_files);
+    printf("  rejected: %d\n", n_rejected);
+    for (int j = 0; j < n_reject_codes; j++) {
+        printf("    %s: %d\n",
+               vkresult_str((VkResult)reject_codes[j].code),
+               reject_codes[j].count);
+    }
+
+    for (int i = 0; i < n_files; i++) free(files[i]);
+    free(files);
+    return n_rejected > 0 ? 1 : 0;
+}
+
 /* ----- harness ----- */
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    /* --replay <dir>: skip the test battery and run every .spv in <dir>
+     * through vkCreateShaderModule. Used for Phase 0 bet (b)
+     * verification with real DXVK shader captures. */
+    const char *replay_dir = NULL;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--replay") == 0) {
+            replay_dir = argv[i + 1];
+            break;
+        }
+    }
+
     printf("=== wrapper_testbench (leegao bionic-vulkan-wrapper direct harness) ===\n");
     if (setup_vulkan() != 0) {
         printf("=== %d passed, %d failed (setup blocked) ===\n", g_pass, g_fail);
         return g_fail;
+    }
+    if (replay_dir) {
+        return run_replay(replay_dir);
     }
     test_enum_extensions();
     test_dxvk2_extensions_present();
