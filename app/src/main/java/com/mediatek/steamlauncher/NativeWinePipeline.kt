@@ -366,6 +366,30 @@ class NativeWinePipeline(private val context: Context) {
                 }
                 """.trimIndent()
             )
+            File(implicitLayerDir, "wrapper_maintenance5_layer.json").writeText(
+                """
+                {
+                    "file_format_version": "1.0.0",
+                    "layer": {
+                        "name": "VK_LAYER_WRAPPER_MAINTENANCE5",
+                        "type": "GLOBAL",
+                        "library_path": "$nativeLibDir/libwrapper_maintenance5.so",
+                        "api_version": "1.3.0",
+                        "implementation_version": "1",
+                        "description": "Wrapper-side VK_KHR_maintenance5 shim for DXVK 2.x on the leegao Mali wrapper",
+                        "functions": {
+                            "vkGetInstanceProcAddr": "Maintenance5_GetInstanceProcAddr",
+                            "vkGetDeviceProcAddr": "Maintenance5_GetDeviceProcAddr"
+                        },
+                        "device_extensions": [
+                            { "name": "VK_KHR_maintenance5", "spec_version": "1" }
+                        ],
+                        "enable_environment": { "WRAPPER_MAINTENANCE5": "1" },
+                        "disable_environment": { "WRAPPER_MAINTENANCE5_DISABLE": "1" }
+                    }
+                }
+                """.trimIndent()
+            )
 
             ensureYs9Stubs()
             ensureNullAlsaConfig()
@@ -1377,6 +1401,12 @@ class NativeWinePipeline(private val context: Context) {
             // vkGetPhysicalDeviceFeatures. Mali Valhall reports those as
             // FALSE which blocks DXVK's FL11_0 check.
             put("SPOOF_FEATURES", "1")
+            // Phase 3.1 DXVK 2.x foundation: productized maintenance5 shim.
+            // The manifest advertises VK_KHR_maintenance5; the layer fills
+            // Maintenance5 feature/property structs, implements the KHR device
+            // entrypoints, and folds maintenance5 flags2 pNext structs into
+            // the legacy fields before forwarding to the wrapper.
+            put("WRAPPER_MAINTENANCE5", "1")
             // Phase-0 dedup probe: hashes vkUpdateDescriptorSets writes,
             // logs duplicate-content rate periodically. Decides whether
             // the descriptor-set deduplication direction is engineering-
