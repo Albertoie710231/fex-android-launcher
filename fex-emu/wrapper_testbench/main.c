@@ -3672,6 +3672,37 @@ static int run_replay(const char *dir_path) {
                reject_codes[j].count);
     }
 
+    /* If the shim exposes counter symbols, dump them. Tells us how often
+     * each instrumentation path was exercised across the whole corpus —
+     * a NU/bindless count of zero means real DXVK output for this game
+     * doesn't use the corresponding pattern, which informs which Phase 1
+     * slice to invest in next. */
+    static const char *counters[] = {
+        "shim_m5_spirv_instrument_count",
+        "shim_m5_spirv_loads_seen",
+        "shim_m5_spirv_descriptor_loads_seen",
+        "shim_m5_spirv_metadata_injected",
+        "shim_m5_spirv_metadata_skipped_pre_1_3",
+        "shim_m5_spirv_loads_clamped",
+        "shim_m5_spirv_loads_skipped_no_array",
+        "shim_m5_spirv_loads_decorated_nonuniform",
+        "shim_m5_spirv_image_ops_seen",
+        "shim_m5_spirv_image_ops_clamped",
+        "shim_m5_spirv_image_ops_skipped",
+        "shim_m5_spirv_image_sample_ops_seen",
+        "shim_m5_spirv_image_writes_seen",
+        "shim_m5_spirv_image_writes_clamped",
+        "shim_m5_spirv_image_writes_skipped",
+        NULL,
+    };
+    int any = 0;
+    for (int j = 0; counters[j]; j++) {
+        volatile int *p = (volatile int *)dlsym(g_lib, counters[j]);
+        if (!p) continue;
+        if (!any) { printf("  counters:\n"); any = 1; }
+        printf("    %-44s = %d\n", counters[j], *p);
+    }
+
     for (int i = 0; i < n_files; i++) free(files[i]);
     free(files);
     return n_rejected > 0 ? 1 : 0;

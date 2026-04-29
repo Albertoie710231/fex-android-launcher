@@ -29,6 +29,7 @@
 #include "spv_instrumenter.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1082,18 +1083,32 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
     std::vector<Candidate> candidates;
     int seen = 0;
     int skipped = 0;
+    int skip_merge = 0, skip_short = 0, skip_mask = 0, skip_coord_def = 0;
+    int skip_int_type = 0, skip_dim_mismatch = 0, skip_rewrite = 0;
 
     for (auto& fn : *mod) {
       for (auto& bb : fn) {
-        // Pre-scan the block for structured merges. If we find one,
-        // every OpImageWrite in the block is unsafe to split (the merge
-        // instruction is by spec right before the terminator and would
-        // migrate into our merge_bb after the split).
-        bool has_structured_merge = false;
+        // Pre-scan for OpLoopMerge: if the block is a loop header,
+        // splitting it migrates the loop-merge declaration into our new
+        // merge_bb, which would change which block is the loop header.
+        // Back-edge predecessors of the original block would then point
+        // at a block that no longer carries the loop construct — broken
+        // loop semantics.
+        //
+        // OpSelectionMerge is structurally tolerant: when we split, the
+        // declaration moves into merge_bb, which becomes the header of
+        // the original selection construct. Selection constructs have
+        // no back-edges, so the only predecessors of the original block
+        // were dataflow (now dataflow of old_bb, our outer If's header).
+        // Both branches of our outer If converge at merge_bb, which then
+        // enters its own structured construct unchanged. Two nested
+        // structured Ifs — valid spirv-val output and verified against
+        // the 2 real Sekiro shaders that previously hit the skip rule
+        // (cs.b4dcff5… and fs.a13144db6… — both OpSelectionMerge cases).
+        bool has_loop_merge = false;
         for (auto& inst : bb) {
-          if (inst.opcode() == Op::OpSelectionMerge ||
-              inst.opcode() == Op::OpLoopMerge) {
-            has_structured_merge = true;
+          if (inst.opcode() == Op::OpLoopMerge) {
+            has_loop_merge = true;
             break;
           }
         }
@@ -1101,8 +1116,8 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
         for (auto& inst : bb) {
           if (inst.opcode() != Op::OpImageWrite) continue;
           seen++;
-          if (has_structured_merge) { skipped++; continue; }
-          if (inst.NumInOperands() < 3) { skipped++; continue; }
+          if (has_loop_merge) { skipped++; skip_merge++; continue; }
+          if (inst.NumInOperands() < 3) { skipped++; skip_short++; continue; }
 
           // OpImageWrite layout: image, coord, texel, [image_operands_mask,
           // operand_args...]. Glslc emits ZeroExtend (or SignExtend) for
@@ -1124,18 +1139,19 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
                 uint32_t(spv::ImageOperandsMask::Sample) |
                 uint32_t(spv::ImageOperandsMask::MinLod) |
                 uint32_t(spv::ImageOperandsMask::Offsets);
-            if (mask & kIndexingMask) { skipped++; continue; }
+            if (mask & kIndexingMask) { skipped++; skip_mask++; continue; }
           }
 
           const uint32_t image_id = inst.GetSingleWordInOperand(0);
           const uint32_t coord_id = inst.GetSingleWordInOperand(1);
 
           opt::Instruction* coord_def = du->GetDef(coord_id);
-          if (!coord_def) { skipped++; continue; }
+          if (!coord_def) { skipped++; skip_coord_def++; continue; }
 
           IntCoordType coord_type;
           if (!GetIntCoordType(du, coord_def->type_id(), &coord_type)) {
             skipped++;
+            skip_int_type++;
             continue;
           }
 
@@ -1145,6 +1161,7 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
           if (needed_components == 0 ||
               needed_components != coord_type.component_count) {
             skipped++;
+            skip_dim_mismatch++;
             continue;
           }
 
@@ -1166,17 +1183,17 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
     for (const Candidate& c : candidates) {
       opt::Instruction* write = c.image_write;
       opt::analysis::Type* scalar_coord_t = tm->GetType(c.coord_type.scalar_type_id);
-      if (!scalar_coord_t) { skipped++; continue; }
+      if (!scalar_coord_t) { skipped++; skip_rewrite++; continue; }
       const uint32_t zero_coord_id = cm->GetNullConstId(scalar_coord_t);
-      if (!zero_coord_id) { skipped++; continue; }
+      if (!zero_coord_id) { skipped++; skip_rewrite++; continue; }
 
       opt::BasicBlock* old_bb = ctx->get_instr_block(write);
-      if (!old_bb) { skipped++; continue; }
+      if (!old_bb) { skipped++; skip_rewrite++; continue; }
 
       // Locate the OpImageWrite's iterator within its (current) block.
       auto write_iter = old_bb->begin();
       while (write_iter != old_bb->end() && &*write_iter != write) ++write_iter;
-      if (write_iter == old_bb->end()) { skipped++; continue; }
+      if (write_iter == old_bb->end()) { skipped++; skip_rewrite++; continue; }
 
       // Build the bounds-check instructions but defer insertion until
       // after the splits — we need the merge label to be allocated before
@@ -1258,7 +1275,7 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
         }
       }
 
-      if (combined_cond_id == 0) { skipped++; continue; }
+      if (combined_cond_id == 0) { skipped++; skip_rewrite++; continue; }
 
       // Allocate labels for do_write_bb and merge_bb. The first split
       // moves [OpImageWrite, ..., terminator] to a new block "tail_bb"
@@ -1316,13 +1333,16 @@ class BoundsCheckImageWritesPass : public spvtools::opt::Pass {
       clamped++;
     }
 
-    if (consumer()) {
-      char buf[200];
-      std::snprintf(buf, sizeof(buf),
-                    "[shim-spv] A5W: clamped %d image-write op(s); seen=%d skipped=%d",
-                    clamped, seen, skipped);
-      spv_position_t pos = {};
-      consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
+    if (skipped > 0) {
+      static const char *dbg = std::getenv("SHIM_A5W_DEBUG_SKIPS");
+      if (dbg && dbg[0] == '1') {
+        std::fprintf(stderr,
+                     "[shim-spv] A5W: clamped %d image-write(s); seen=%d skipped=%d "
+                     "(merge=%d short=%d mask=%d coord_def=%d int_type=%d dim_mismatch=%d rewrite=%d)\n",
+                     clamped, seen, skipped,
+                     skip_merge, skip_short, skip_mask, skip_coord_def,
+                     skip_int_type, skip_dim_mismatch, skip_rewrite);
+      }
     }
 
     __atomic_add_fetch(&shim_m5_spirv_image_writes_clamped, clamped,
