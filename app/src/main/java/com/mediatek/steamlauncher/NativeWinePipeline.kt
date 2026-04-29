@@ -1415,6 +1415,16 @@ class NativeWinePipeline(private val context: Context) {
             put("VK_GC_ENABLE", "1")
             put("VK_GC_INTERVAL", "120")       // waitIdle every 120 submits (~2s at 60 fps)
             put("VK_GC_LOG_EVERY", "600")      // log stats every 600 submits (~10s)
+            // wrapper_pool_resetter (Phase 2 v0): per-descriptor-pool stats
+            // counter. Foundation for the eventual reset-enforcement layer
+            // that lets DXVK 2.x's set-list cache run without OOM on the
+            // leegao Mali wrapper (the cache deliberately skips
+            // vkResetDescriptorPool, but on this wrapper the call is the
+            // only memory-bounding mechanism — see failed_attempts.md:11).
+            // v0 logs per-pool alloc/free/reset rates to stderr every 1000
+            // pool ops; no enforcement yet. Use the data to size the v2
+            // forced-reset threshold. See fex-emu/wrapper_pool_resetter_layer.c.
+            put("WRAPPER_POOL_RESETTER", "1")
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
             // DXVK_LOG_PATH is a DIRECTORY (DXVK writes <exe>_<dll>.log

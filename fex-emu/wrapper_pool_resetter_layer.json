@@ -1,0 +1,21 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_WRAPPER_POOL_RESETTER",
+        "type": "GLOBAL",
+        "library_path": "libwrapper_pool_resetter.so",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "Phase 2 v0: per-descriptor-pool stats. Foundation for the eventual reset-enforcement layer that will let DXVK 2.x set-list-cache patterns run without OOM on the leegao Mali wrapper.",
+        "functions": {
+            "vkGetInstanceProcAddr": "PoolResetter_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "PoolResetter_GetDeviceProcAddr"
+        },
+        "enable_environment": {
+            "WRAPPER_POOL_RESETTER": "1"
+        },
+        "disable_environment": {
+            "WRAPPER_POOL_RESETTER_DISABLE": "1"
+        }
+    }
+}
