@@ -390,6 +390,30 @@ class NativeWinePipeline(private val context: Context) {
                 }
                 """.trimIndent()
             )
+            File(implicitLayerDir, "wrapper_shader_identifier_layer.json").writeText(
+                """
+                {
+                    "file_format_version": "1.0.0",
+                    "layer": {
+                        "name": "VK_LAYER_WRAPPER_SHADER_IDENTIFIER",
+                        "type": "GLOBAL",
+                        "library_path": "$nativeLibDir/libwrapper_shader_identifier.so",
+                        "api_version": "1.3.0",
+                        "implementation_version": "1",
+                        "description": "Wrapper-side VK_EXT_shader_module_identifier metadata shim for DXVK 2.x",
+                        "functions": {
+                            "vkGetInstanceProcAddr": "ShaderIdentifier_GetInstanceProcAddr",
+                            "vkGetDeviceProcAddr": "ShaderIdentifier_GetDeviceProcAddr"
+                        },
+                        "device_extensions": [
+                            { "name": "VK_EXT_shader_module_identifier", "spec_version": "1" }
+                        ],
+                        "enable_environment": { "WRAPPER_SHADER_IDENTIFIER": "1" },
+                        "disable_environment": { "WRAPPER_SHADER_IDENTIFIER_DISABLE": "1" }
+                    }
+                }
+                """.trimIndent()
+            )
 
             ensureYs9Stubs()
             ensureNullAlsaConfig()
@@ -1407,6 +1431,11 @@ class NativeWinePipeline(private val context: Context) {
             // entrypoints, and folds maintenance5 flags2 pNext structs into
             // the legacy fields before forwarding to the wrapper.
             put("WRAPPER_MAINTENANCE5", "1")
+            // Phase 3.2 DXVK 2.x foundation: shader-module identifier shim.
+            // This is metadata-only: the layer hashes shader-module create
+            // info into stable identifiers and tracks VkShaderModule handles
+            // so DXVK can use its pipeline-cache fast path.
+            put("WRAPPER_SHADER_IDENTIFIER", "1")
             // Phase-0 dedup probe: hashes vkUpdateDescriptorSets writes,
             // logs duplicate-content rate periodically. Decides whether
             // the descriptor-set deduplication direction is engineering-
