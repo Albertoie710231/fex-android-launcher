@@ -57,6 +57,7 @@ extern volatile int shim_m5_spirv_metadata_injected;
 extern volatile int shim_m5_spirv_metadata_skipped_pre_1_3;
 extern volatile int shim_m5_spirv_loads_clamped;
 extern volatile int shim_m5_spirv_loads_skipped_no_array;
+extern volatile int shim_m5_spirv_loads_decorated_nonuniform;
 extern volatile int shim_m5_spirv_image_ops_seen;
 extern volatile int shim_m5_spirv_image_ops_clamped;
 extern volatile int shim_m5_spirv_image_ops_skipped;
@@ -348,6 +349,35 @@ static uint32_t FindMetadataVarId(spvtools::opt::Module* mod) {
   return 0;
 }
 
+// Returns true if the module has any OpDecorate <target_id> NonUniform.
+// Used to detect descriptor accesses that cross wave-uniformity boundaries
+// (bindless arrays indexed by per-invocation values, etc.). When the
+// original load/image-read was NonUniform-decorated, the OpSelect we emit
+// to replace it must inherit the NonUniform decoration so downstream
+// descriptor consumers stay valid under spirv-val.
+static bool IsNonUniformDecorated(spvtools::opt::Module* mod, uint32_t target_id) {
+  using spv::Op;
+  for (auto& a : mod->annotations()) {
+    if (a.opcode() != Op::OpDecorate || a.NumInOperands() < 2) continue;
+    if (a.GetSingleWordInOperand(0) != target_id) continue;
+    if (a.GetSingleWordInOperand(1) ==
+        static_cast<uint32_t>(spv::Decoration::NonUniform)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void AddNonUniformDecoration(spvtools::opt::IRContext* ctx,
+                                    uint32_t target_id) {
+  ctx->module()->AddAnnotationInst(std::make_unique<spvtools::opt::Instruction>(
+      ctx, spv::Op::OpDecorate, 0, 0,
+      std::initializer_list<spvtools::opt::Operand>{
+          {SPV_OPERAND_TYPE_ID, {target_id}},
+          {SPV_OPERAND_TYPE_DECORATION,
+           {static_cast<uint32_t>(spv::Decoration::NonUniform)}}}));
+}
+
 static bool HasCapability(spvtools::opt::IRContext* ctx, spv::Capability cap) {
   for (auto& c : ctx->capabilities()) {
     if (c.opcode() == spv::Op::OpCapability &&
@@ -502,6 +532,7 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
       opt::Instruction* load;
       uint32_t array_idx_id;
       uint32_t bucket;
+      bool is_nonuniform;
     };
     std::vector<LoadCandidate> candidates;
     int loads_skipped_no_array = 0;
@@ -546,7 +577,12 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
         uint32_t array_idx_id = ac->GetSingleWordInOperand(num_indices);
         uint32_t bucket = set * kShimMetadataMaxBindings + binding;
 
-        candidates.push_back({inst, array_idx_id, bucket});
+        // Detect NonUniform on the original load OR on the access-chain
+        // result feeding it. Either decoration means downstream consumers
+        // expect a NonUniform-decorated value; our OpSelect must inherit.
+        bool is_nu = IsNonUniformDecorated(mod, inst->result_id()) ||
+                     IsNonUniformDecorated(mod, ac->result_id());
+        candidates.push_back({inst, array_idx_id, bucket, is_nu});
       });
     }
 
@@ -566,6 +602,7 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
     }
 
     int clamped = 0;
+    int nu_decorated = 0;
     for (auto& c : candidates) {
       opt::Instruction* load = c.load;
       const uint32_t loaded_type = load->type_id();
@@ -640,6 +677,20 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
       for (auto& u : uses_to_redirect) {
         opt::Instruction* user = u.first;
         uint32_t op_idx = u.second;
+        // Skip metadata-class instructions: their reference to the load's
+        // result id is a *target* (decoration applies to that id), not a
+        // dataflow consumer. Rewriting them would silently retarget the
+        // decoration onto the OpSelect — which collides with our explicit
+        // NonUniform propagation below and creates duplicate decorations
+        // (spirv-val rejects "ID decorated NonUniform multiple times").
+        spv::Op uop = user->opcode();
+        if (uop == Op::OpDecorate || uop == Op::OpMemberDecorate ||
+            uop == Op::OpDecorateId || uop == Op::OpDecorateString ||
+            uop == Op::OpMemberDecorateString ||
+            uop == Op::OpGroupDecorate || uop == Op::OpGroupMemberDecorate ||
+            uop == Op::OpName || uop == Op::OpMemberName) {
+          continue;
+        }
         // op_idx is a TOTAL operand index (counting type/result),
         // matching the storage layout SPIRV-Tools uses internally.
         // Rewrite that operand's id.
@@ -650,15 +701,35 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
         du->AnalyzeInstUse(user);
       }
 
+      // NonUniform propagation: when the original load (or its access
+      // chain) was NonUniform-decorated, downstream descriptor consumers
+      // expect a NonUniform-decorated value. The OpSelect that now feeds
+      // those consumers must carry the same decoration to keep spirv-val
+      // happy — and to keep the underlying driver's bindless execution
+      // model behaving correctly under non-uniform indexing.
+      if (c.is_nonuniform) {
+        AddNonUniformDecoration(ctx, sel_id);
+        nu_decorated++;
+      }
+
       clamped++;
     }
 
+    if (nu_decorated > 0) {
+      // Capability MUST already be present (the input had NonUniform
+      // decorations to begin with), but call defensively in case the
+      // shader leaned on an alias or the validator wants the canonical
+      // form. EnsureCapability is idempotent.
+      EnsureCapability(ctx, spv::Capability::ShaderNonUniform);
+    }
+
     if (consumer()) {
-      char buf[200];
+      char buf[240];
       std::snprintf(buf, sizeof(buf),
                     "[shim-spv] A3: clamped %d descriptor load(s); "
-                    "skipped_no_array=%d (struct-field-only chains)",
-                    clamped, loads_skipped_no_array);
+                    "skipped_no_array=%d (struct-field-only chains); "
+                    "nonuniform_decorated=%d",
+                    clamped, loads_skipped_no_array, nu_decorated);
       spv_position_t pos = {};
       consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
     }
@@ -666,6 +737,8 @@ class BoundsCheckDescriptorLoadsPass : public spvtools::opt::Pass {
     __atomic_add_fetch(&shim_m5_spirv_loads_clamped, clamped, __ATOMIC_RELAXED);
     __atomic_add_fetch(&shim_m5_spirv_loads_skipped_no_array,
                        loads_skipped_no_array, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_loads_decorated_nonuniform, nu_decorated,
+                       __ATOMIC_RELAXED);
     return clamped > 0 ? Status::SuccessWithChange
                        : Status::SuccessWithoutChange;
   }
@@ -711,6 +784,7 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
       uint32_t coord_id;
       uint32_t lod_id;
       IntCoordType coord_type;
+      bool is_nonuniform;
     };
     std::vector<Candidate> candidates;
     int seen = 0;
@@ -754,7 +828,11 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
           return;
         }
 
-        candidates.push_back({inst, image_id, coord_id, lod_id, coord_type});
+        // Detect NonUniform on the image-read result or on the image
+        // operand itself (the latter for bindless image-array access).
+        bool is_nu = IsNonUniformDecorated(mod, inst->result_id()) ||
+                     IsNonUniformDecorated(mod, image_id);
+        candidates.push_back({inst, image_id, coord_id, lod_id, coord_type, is_nu});
       });
     }
 
@@ -769,6 +847,7 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
     EnsureCapability(ctx, spv::Capability::ImageQuery);
 
     int clamped = 0;
+    int nu_decorated = 0;
     for (const Candidate& c : candidates) {
       opt::Instruction* read = c.image_read;
       const uint32_t result_type = read->type_id();
@@ -894,6 +973,17 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
       for (auto& u : uses_to_redirect) {
         opt::Instruction* user = u.first;
         uint32_t op_idx = u.second;
+        // Same metadata-target skip as A3: don't retarget OpDecorate,
+        // OpName, etc. — they reference the original id as a decoration
+        // target, not a dataflow operand.
+        spv::Op uop = user->opcode();
+        if (uop == Op::OpDecorate || uop == Op::OpMemberDecorate ||
+            uop == Op::OpDecorateId || uop == Op::OpDecorateString ||
+            uop == Op::OpMemberDecorateString ||
+            uop == Op::OpGroupDecorate || uop == Op::OpGroupMemberDecorate ||
+            uop == Op::OpName || uop == Op::OpMemberName) {
+          continue;
+        }
         opt::Operand& o = *(user->begin() + op_idx);
         if (o.words.size() == 1 && o.words[0] == orig_read_id) {
           o.words[0] = sel_id;
@@ -901,20 +991,33 @@ class BoundsCheckImageReadsPass : public spvtools::opt::Pass {
         du->AnalyzeInstUse(user);
       }
 
+      // Same NonUniform-propagation rule as A3 — see BoundsCheckDescriptor
+      // LoadsPass for rationale.
+      if (c.is_nonuniform) {
+        AddNonUniformDecoration(ctx, sel_id);
+        nu_decorated++;
+      }
+
       clamped++;
     }
 
+    if (nu_decorated > 0) {
+      EnsureCapability(ctx, spv::Capability::ShaderNonUniform);
+    }
+
     if (consumer()) {
-      char buf[200];
+      char buf[240];
       std::snprintf(buf, sizeof(buf),
-                    "[shim-spv] A5: clamped %d image read/fetch op(s); seen=%d skipped=%d normalized_samples=%d",
-                    clamped, seen, skipped, normalized_samples);
+                    "[shim-spv] A5: clamped %d image read/fetch op(s); seen=%d skipped=%d normalized_samples=%d nonuniform_decorated=%d",
+                    clamped, seen, skipped, normalized_samples, nu_decorated);
       spv_position_t pos = {};
       consumer()(SPV_MSG_INFO, "shim-spv", pos, buf);
     }
 
     __atomic_add_fetch(&shim_m5_spirv_image_ops_clamped, clamped, __ATOMIC_RELAXED);
     __atomic_add_fetch(&shim_m5_spirv_image_ops_skipped, skipped, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&shim_m5_spirv_loads_decorated_nonuniform, nu_decorated,
+                       __ATOMIC_RELAXED);
     return clamped > 0 ? Status::SuccessWithChange
                        : Status::SuccessWithoutChange;
   }
@@ -1263,6 +1366,8 @@ __attribute__((visibility("default")))
 volatile int shim_m5_spirv_loads_clamped = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_loads_skipped_no_array = 0;
+__attribute__((visibility("default")))
+volatile int shim_m5_spirv_loads_decorated_nonuniform = 0;
 __attribute__((visibility("default")))
 volatile int shim_m5_spirv_image_ops_seen = 0;
 __attribute__((visibility("default")))

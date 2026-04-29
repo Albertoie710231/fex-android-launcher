@@ -41,6 +41,7 @@
 #include "oob_fetch_probe_spv.h"
 #include "oob_sample_probe_spv.h"
 #include "oob_image_write_probe_spv.h"
+#include "oob_nonuniform_probe_spv.h"
 
 /* Counters shared across tests. */
 static int g_pass = 0;
@@ -1969,6 +1970,141 @@ static void test_spirv_pass_clamps_image_writes(void) {
          before, after, op_selection_merge, op_branch_conditional, op_branch);
 }
 
+/* Phase 1 task #10/#11 — NonUniform decoration propagation. The probe
+ * shader wraps the OOB index in nonuniformEXT() so glslang emits
+ * OpDecorate NonUniform on the OpAccessChain and OpLoad. This unit test
+ * verifies that the A3 pass:
+ *   - detects the decoration on the original load
+ *   - decorates the OpSelect that replaces it with NonUniform
+ *   - leaves the module spirv-val-clean
+ *   - keeps the wrapper accepting the module (vkCreateShaderModule OK)
+ *
+ * Counter shim_m5_spirv_loads_decorated_nonuniform advances by >=1.
+ * The output SPIR-V's NonUniform-decoration count is strictly greater
+ * than the input's. */
+static void test_spirv_pass_decorates_nonuniform(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+
+    volatile int *nu_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_loads_decorated_nonuniform");
+    typedef int (*pfn_instrument)(const uint32_t *, size_t, uint32_t **, size_t *);
+    typedef void (*pfn_free)(uint32_t *);
+    typedef int (*pfn_validate)(const uint32_t *, size_t, char *, size_t);
+    pfn_instrument instrument = (pfn_instrument)dlsym(g_lib, "shim_spv_instrument");
+    pfn_free       freefn     = (pfn_free)dlsym(g_lib, "shim_spv_free");
+    pfn_validate   validate   = (pfn_validate)dlsym(g_lib, "shim_spv_validate");
+    if (!nu_cnt || !instrument || !freefn || !validate) {
+        SKIP("spirv_pass_decorates_nonuniform", "shim symbols not present (PASS A or pre-NU build)");
+        return;
+    }
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+
+    /* Count NonUniform decorations in the input (baseline from glslang). */
+    int nu_input = 0;
+    {
+        const uint32_t *code = (const uint32_t *)oob_nonuniform_probe_spv;
+        size_t total_words = oob_nonuniform_probe_spv_len / 4;
+        for (size_t i = 5; i < total_words;) {
+            uint32_t w0 = code[i];
+            uint32_t len = w0 >> 16;
+            uint32_t op = w0 & 0xFFFFu;
+            if (len == 0 || i + len > total_words) break;
+            /* OpDecorate = 71, NonUniform = 5300 */
+            if (op == 71 && len >= 3 && code[i + 2] == 5300) nu_input++;
+            i += len;
+        }
+    }
+    if (nu_input < 1) {
+        FAIL("spirv_pass_decorates_nonuniform",
+             "input shader did not carry any NonUniform decoration — glslang behavior changed?");
+        return;
+    }
+
+    int before = *nu_cnt;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_nonuniform_probe_spv_len,
+        .pCode = (const uint32_t *)oob_nonuniform_probe_spv,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (refresh) refresh();
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &mod);
+    int after = *nu_cnt;
+    if (mod != VK_NULL_HANDLE) vkDestroyShaderModule(g_device, mod, NULL);
+    if (r != VK_SUCCESS) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_decorates_nonuniform",
+             "vkCreateShaderModule rejected the NonUniform-decorated module: %s",
+             vkresult_str(r));
+        return;
+    }
+    if (after - before < 1) {
+        unsetenv("SHIM_INSTRUMENT_ENABLE");
+        if (refresh) refresh();
+        FAIL("spirv_pass_decorates_nonuniform",
+             "loads_decorated_nonuniform counter did not advance (stuck at %d) — propagation skipped",
+             before);
+        return;
+    }
+
+    uint32_t *out_code = NULL;
+    size_t out_size = 0;
+    int ok = instrument((const uint32_t *)oob_nonuniform_probe_spv,
+                        oob_nonuniform_probe_spv_len, &out_code, &out_size);
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (refresh) refresh();
+    if (!ok || !out_code || out_size < 20) {
+        if (out_code) freefn(out_code);
+        FAIL("spirv_pass_decorates_nonuniform", "shim_spv_instrument returned no output bytes");
+        return;
+    }
+    char vmsg[256];
+    if (!validate(out_code, out_size, vmsg, sizeof(vmsg))) {
+        freefn(out_code);
+        FAIL("spirv_pass_decorates_nonuniform",
+             "spirv-val rejected NonUniform-propagated module: %s", vmsg);
+        return;
+    }
+
+    /* Count NonUniform decorations in the output, plus locate the
+     * OpSelect result id and confirm at least one NonUniform decoration
+     * targets a brand-new id (not one that was decorated in the input). */
+    int nu_output = 0;
+    int op_select = 0;
+    size_t total_words = out_size / 4;
+    for (size_t i = 5; i < total_words;) {
+        uint32_t w0 = out_code[i];
+        uint32_t len = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (len == 0 || i + len > total_words) break;
+        if (op == 71 && len >= 3 && out_code[i + 2] == 5300) nu_output++;
+        if (op == 169) op_select++; /* OpSelect */
+        i += len;
+    }
+    freefn(out_code);
+
+    if (nu_output <= nu_input) {
+        FAIL("spirv_pass_decorates_nonuniform",
+             "NonUniform decoration count did not grow: input=%d output=%d "
+             "(propagation didn't add OpSelect decoration)",
+             nu_input, nu_output);
+        return;
+    }
+    if (op_select < 1) {
+        FAIL("spirv_pass_decorates_nonuniform",
+             "no OpSelect found in output — A3 didn't run on this module");
+        return;
+    }
+    PASS("spirv_pass_decorates_nonuniform",
+         "A3 propagated NonUniform; counter %d→%d, NU decorations input=%d output=%d, OpSelect=%d, spirv-val OK",
+         before, after, nu_input, nu_output, op_select);
+}
+
 /* Wrapper-behavior probe: dispatch a compute shader that reads SSBO
  * index 1024 through a descriptor whose range covers only 1 element
  * (4 bytes). The underlying buffer ALLOCATION is 16 KiB pre-filled
@@ -2231,6 +2367,261 @@ cleanup_buffers:
         unsetenv("SHIM_INSTRUMENT_ENABLE");
         if (a4_refresh) a4_refresh();
     }
+}
+
+/* End-to-end NonUniform probe: same SSBO setup as test_mali_oob_ssbo_probe,
+ * but the shader wraps the OOB index in nonuniformEXT() and supplies it via
+ * push constants. With A3+A4 active, the load should be clamped, the
+ * NonUniform decoration should propagate to the OpSelect, and the wrapper
+ * should accept + execute the dispatch. Result must be 0 (clamped); a value
+ * of 0xDEADBEEF means propagation didn't fire or the metadata wasn't bound. */
+static void test_mali_oob_nonuniform_probe(void) {
+    PFN_vkGetDeviceProcAddr pfn_GetDeviceProcAddr =
+        (PFN_vkGetDeviceProcAddr)g_vkGetInstanceProcAddr(g_instance, "vkGetDeviceProcAddr");
+    int a4_active = ((volatile int *)dlsym(g_lib, "shim_m5_a4_pipeline_layouts_extended")) != NULL;
+    volatile int *a4_binds_cnt = a4_active
+        ? (volatile int *)dlsym(g_lib, "shim_m5_a4_binds_extended")
+        : NULL;
+    volatile int *nu_cnt = (volatile int *)dlsym(g_lib, "shim_m5_spirv_loads_decorated_nonuniform");
+    if (!a4_active || !a4_binds_cnt || !nu_cnt) {
+        SKIP("mali_oob_nonuniform_probe", "shim A4/NU symbols not present (PASS A or pre-NU build)");
+        return;
+    }
+    int a4_binds_before = *a4_binds_cnt;
+    int nu_before = *nu_cnt;
+    typedef void (*pfn_refresh)(void);
+    pfn_refresh a4_refresh = (pfn_refresh)dlsym(g_lib, "shim_a4_refresh_env");
+    setenv("SHIM_INSTRUMENT_ENABLE", "1", 1);
+    if (a4_refresh) a4_refresh();
+
+    LOAD_DEV(vkCreateBuffer);
+    LOAD_DEV(vkDestroyBuffer);
+    LOAD_DEV(vkAllocateMemory);
+    LOAD_DEV(vkFreeMemory);
+    LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkGetBufferMemoryRequirements);
+    LOAD_DEV(vkMapMemory);
+    LOAD_DEV(vkUnmapMemory);
+    LOAD_DEV(vkCreateShaderModule);
+    LOAD_DEV(vkDestroyShaderModule);
+    LOAD_DEV(vkCreateDescriptorSetLayout);
+    LOAD_DEV(vkDestroyDescriptorSetLayout);
+    LOAD_DEV(vkCreateDescriptorPool);
+    LOAD_DEV(vkDestroyDescriptorPool);
+    LOAD_DEV(vkAllocateDescriptorSets);
+    LOAD_DEV(vkUpdateDescriptorSets);
+    LOAD_DEV(vkCreatePipelineLayout);
+    LOAD_DEV(vkDestroyPipelineLayout);
+    LOAD_DEV(vkCreateComputePipelines);
+    LOAD_DEV(vkDestroyPipeline);
+    LOAD_DEV(vkCreateCommandPool);
+    LOAD_DEV(vkDestroyCommandPool);
+    LOAD_DEV(vkAllocateCommandBuffers);
+    LOAD_DEV(vkBeginCommandBuffer);
+    LOAD_DEV(vkEndCommandBuffer);
+    LOAD_DEV(vkCmdBindPipeline);
+    LOAD_DEV(vkCmdBindDescriptorSets);
+    LOAD_DEV(vkCmdPushConstants);
+    LOAD_DEV(vkCmdDispatch);
+    LOAD_DEV(vkCreateFence);
+    LOAD_DEV(vkDestroyFence);
+    LOAD_DEV(vkWaitForFences);
+    LOAD_DEV(vkGetDeviceQueue);
+    LOAD_DEV(vkQueueSubmit);
+    LOAD_INST(vkGetPhysicalDeviceMemoryProperties);
+
+    const VkDeviceSize BUF_SZ = 16 * 1024;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = BUF_SZ, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer in_buf = VK_NULL_HANDLE, out_buf = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g_device, &bci, NULL, &in_buf) != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkCreateBuffer in failed"); goto cleanup_env; }
+    if (vkCreateBuffer(g_device, &bci, NULL, &out_buf) != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkCreateBuffer out failed");
+        vkDestroyBuffer(g_device, in_buf, NULL); goto cleanup_env; }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_device, in_buf, &req);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_phys, &mp);
+    int mt = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (!(req.memoryTypeBits & (1u << i))) continue;
+        VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if ((mp.memoryTypes[i].propertyFlags & want) == want) { mt = (int)i; break; }
+    }
+    if (mt < 0) { FAIL("mali_oob_nonuniform_probe", "no host-visible memory");
+        vkDestroyBuffer(g_device, out_buf, NULL); vkDestroyBuffer(g_device, in_buf, NULL); goto cleanup_env; }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkDeviceMemory in_mem = VK_NULL_HANDLE, out_mem = VK_NULL_HANDLE;
+    vkAllocateMemory(g_device, &mai, NULL, &in_mem);
+    vkAllocateMemory(g_device, &mai, NULL, &out_mem);
+    vkBindBufferMemory(g_device, in_buf,  in_mem,  0);
+    vkBindBufferMemory(g_device, out_buf, out_mem, 0);
+
+    void *p = NULL;
+    vkMapMemory(g_device, in_mem, 0, BUF_SZ, 0, &p);
+    for (size_t i = 0; i < BUF_SZ / 4; i++) ((uint32_t *)p)[i] = 0xDEADBEEFu;
+    vkUnmapMemory(g_device, in_mem);
+    vkMapMemory(g_device, out_mem, 0, BUF_SZ, 0, &p);
+    memset(p, 0, BUF_SZ);
+    vkUnmapMemory(g_device, out_mem);
+
+    VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = oob_nonuniform_probe_spv_len, .pCode = (const uint32_t *)oob_nonuniform_probe_spv };
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g_device, &smci, NULL, &shader);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkCreateShaderModule rejected NonUniform module: %s", vkresult_str(r));
+        goto cleanup_buffers; }
+    if (*nu_cnt - nu_before < 1) {
+        FAIL("mali_oob_nonuniform_probe", "NU counter did not advance during shader create (%d→%d)",
+             nu_before, *nu_cnt);
+        vkDestroyShaderModule(g_device, shader, NULL); goto cleanup_buffers; }
+
+    VkDescriptorSetLayoutBinding dslb[2] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+    VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2, .pBindings = dslb };
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(g_device, &dslci, NULL, &dsl) != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkCreateDescriptorSetLayout failed");
+        vkDestroyShaderModule(g_device, shader, NULL); goto cleanup_buffers; }
+
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0, .size = sizeof(uint32_t) };
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(g_device, &plci, NULL, &pl);
+
+    VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+        .layout = pl };
+    VkPipeline pipe = VK_NULL_HANDLE;
+    r = vkCreateComputePipelines(g_device, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkCreateComputePipelines: %s", vkresult_str(r));
+        vkDestroyPipelineLayout(g_device, pl, NULL);
+        vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+        vkDestroyShaderModule(g_device, shader, NULL); goto cleanup_buffers; }
+
+    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 };
+    VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps };
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    vkCreateDescriptorPool(g_device, &dpci, NULL, &dpool);
+    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+    VkDescriptorSet dset = VK_NULL_HANDLE;
+    vkAllocateDescriptorSets(g_device, &dsai, &dset);
+
+    VkDescriptorBufferInfo bi_in  = { .buffer = in_buf,  .offset = 0, .range = 4 };
+    VkDescriptorBufferInfo bi_out = { .buffer = out_buf, .offset = 0, .range = VK_WHOLE_SIZE };
+    VkWriteDescriptorSet writes[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi_in },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi_out },
+    };
+    vkUpdateDescriptorSets(g_device, 2, writes, 0, NULL);
+
+    VkCommandPoolCreateInfo cpci2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = g_gfx_qfam };
+    VkCommandPool cpool = VK_NULL_HANDLE;
+    vkCreateCommandPool(g_device, &cpci2, NULL, &cpool);
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(g_device, &cbai, &cb);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer(cb, &cbbi);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, NULL);
+    /* Push the OOB index — same 1024 as the simpler probe. The shader's
+     * descriptor range is 4 bytes; index 1024 reads byte offset 4096
+     * which is real allocation memory but past the descriptor's range. */
+    uint32_t idx = 1024;
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(idx), &idx);
+    vkCmdDispatch(cb, 1, 1, 1);
+    vkEndCommandBuffer(cb);
+
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g_device, g_gfx_qfam, 0, &queue);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    vkCreateFence(g_device, &fci, NULL, &fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    r = vkQueueSubmit(queue, 1, &si, fence);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkQueueSubmit: %s (Mali rejected NonUniform dispatch)", vkresult_str(r));
+        goto cleanup_all; }
+    r = vkWaitForFences(g_device, 1, &fence, VK_TRUE, 5ULL * 1000 * 1000 * 1000);
+    if (r != VK_SUCCESS) {
+        FAIL("mali_oob_nonuniform_probe", "vkWaitForFences: %s (Mali likely faulted on NonUniform-decorated OOB load)",
+             vkresult_str(r));
+        goto cleanup_all; }
+
+    uint32_t result = 0xCAFEBABEu;
+    void *outp = NULL;
+    vkMapMemory(g_device, out_mem, 0, BUF_SZ, 0, &outp);
+    if (outp) result = *(uint32_t *)outp;
+    vkUnmapMemory(g_device, out_mem);
+    int a4_binds_after = *a4_binds_cnt;
+    int nu_after = *nu_cnt;
+
+    if (result == 0u) {
+        if (a4_binds_after <= a4_binds_before) {
+            FAIL("mali_oob_nonuniform_probe",
+                 "result=0 but A4 bind counter did not advance (%d→%d) — metadata path was not proven",
+                 a4_binds_before, a4_binds_after);
+            goto cleanup_all;
+        }
+        if (nu_after - nu_before < 1) {
+            FAIL("mali_oob_nonuniform_probe",
+                 "result=0 but NU counter did not advance (%d→%d) — propagation path was not exercised",
+                 nu_before, nu_after);
+            goto cleanup_all;
+        }
+        PASS("mali_oob_nonuniform_probe",
+             "result=0 with NonUniform-decorated OpSelect → propagation works on Mali; NU %d→%d, A4 binds %d→%d",
+             nu_before, nu_after, a4_binds_before, a4_binds_after);
+    } else if (result == 0xDEADBEEFu) {
+        FAIL("mali_oob_nonuniform_probe",
+             "result=0xDEADBEEF — A3 didn't clamp the NonUniform load (NU %d→%d, A4 binds %d→%d)",
+             nu_before, nu_after, a4_binds_before, a4_binds_after);
+    } else {
+        INCOMPLETE("mali_oob_nonuniform_probe",
+                   "result=0x%08x → unexpected; Mali behavior on NonUniform-decorated OpSelect is implementation-defined",
+                   result);
+    }
+
+cleanup_all:
+    vkDestroyFence(g_device, fence, NULL);
+    vkDestroyCommandPool(g_device, cpool, NULL);
+    vkDestroyDescriptorPool(g_device, dpool, NULL);
+    vkDestroyPipeline(g_device, pipe, NULL);
+    vkDestroyPipelineLayout(g_device, pl, NULL);
+    vkDestroyDescriptorSetLayout(g_device, dsl, NULL);
+    vkDestroyShaderModule(g_device, shader, NULL);
+cleanup_buffers:
+    vkFreeMemory(g_device, in_mem, NULL);
+    vkFreeMemory(g_device, out_mem, NULL);
+    vkDestroyBuffer(g_device, in_buf, NULL);
+    vkDestroyBuffer(g_device, out_buf, NULL);
+cleanup_env:
+    unsetenv("SHIM_INSTRUMENT_ENABLE");
+    if (a4_refresh) a4_refresh();
 }
 
 /* End-to-end A5 probe: a compute shader reads one in-bounds texel and one
@@ -3336,10 +3727,12 @@ int main(int argc, char **argv) {
     test_spirv_pass_clamps_image_fetches();
     test_spirv_pass_classifies_image_samples();
     test_spirv_pass_clamps_image_writes();
+    test_spirv_pass_decorates_nonuniform();
     test_mali_oob_ssbo_probe();
     test_mali_oob_storage_image_probe();
     test_mali_oob_texel_fetch_probe();
     test_mali_oob_image_write_probe();
+    test_mali_oob_nonuniform_probe();
     printf("=== %d passed, %d failed, %d incomplete, %d skipped ===\n",
            g_pass, g_fail, g_inc, g_skip);
     if (g_inc > 0)

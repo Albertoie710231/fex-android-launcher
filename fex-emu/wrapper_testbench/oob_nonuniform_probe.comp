@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+/*
+ * NonUniformEXT-decorated OOB SSBO probe.
+ *
+ * Same logical OOB read as oob_probe.comp (bound range = 4 bytes,
+ * read at byte offset 4096), but the index is wrapped in nonuniformEXT()
+ * so glslang emits OpDecorate %x NonUniform on the resulting OpAccessChain
+ * and OpLoad. Tests that the A3 pass:
+ *   - detects the NonUniform decoration on the descriptor load
+ *   - decorates the OpSelect that replaces the load with NonUniform too
+ *   - leaves the module spirv-val-clean and wrapper-acceptable
+ *
+ * idx is supplied via push constants — keeps the descriptor layout
+ * identical to oob_probe.comp so the runtime test reuses the same
+ * setup other than the push-constant range.
+ */
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer InBuf  { uint indata[];  };
+layout(set = 0, binding = 1)          buffer OutBuf { uint outdata[]; };
+layout(push_constant) uniform PC { uint idx; } pc;
+
+void main() {
+    outdata[0] = indata[nonuniformEXT(pc.idx)];
+}
