@@ -414,6 +414,31 @@ class NativeWinePipeline(private val context: Context) {
                 }
                 """.trimIndent()
             )
+            File(implicitLayerDir, "wrapper_pipeline_library_layer.json").writeText(
+                """
+                {
+                    "file_format_version": "1.0.0",
+                    "layer": {
+                        "name": "VK_LAYER_WRAPPER_PIPELINE_LIBRARY",
+                        "type": "GLOBAL",
+                        "library_path": "$nativeLibDir/libwrapper_pipeline_library.so",
+                        "api_version": "1.3.0",
+                        "implementation_version": "1",
+                        "description": "Guarded VK_KHR_pipeline_library / VK_EXT_graphics_pipeline_library shim for the leegao Mali wrapper",
+                        "functions": {
+                            "vkGetInstanceProcAddr": "PipelineLibrary_GetInstanceProcAddr",
+                            "vkGetDeviceProcAddr": "PipelineLibrary_GetDeviceProcAddr"
+                        },
+                        "device_extensions": [
+                            { "name": "VK_KHR_pipeline_library", "spec_version": "1" },
+                            { "name": "VK_EXT_graphics_pipeline_library", "spec_version": "1" }
+                        ],
+                        "enable_environment": { "WRAPPER_PIPELINE_LIBRARY": "1" },
+                        "disable_environment": { "WRAPPER_PIPELINE_LIBRARY_DISABLE": "1" }
+                    }
+                }
+                """.trimIndent()
+            )
 
             ensureYs9Stubs()
             ensureNullAlsaConfig()
@@ -1436,6 +1461,11 @@ class NativeWinePipeline(private val context: Context) {
             // info into stable identifiers and tracks VkShaderModule handles
             // so DXVK can use its pipeline-cache fast path.
             put("WRAPPER_SHADER_IDENTIFIER", "1")
+            // Phase 3.3 DXVK 2.x foundation: guarded pipeline-library shim.
+            // Library pipeline creates get fake handles and do not reach the
+            // wrapper; final pipeline creates are forwarded with library pNext
+            // structs stripped so fake handles are never passed to Mali.
+            put("WRAPPER_PIPELINE_LIBRARY", "1")
             // Phase-0 dedup probe: hashes vkUpdateDescriptorSets writes,
             // logs duplicate-content rate periodically. Decides whether
             // the descriptor-set deduplication direction is engineering-
