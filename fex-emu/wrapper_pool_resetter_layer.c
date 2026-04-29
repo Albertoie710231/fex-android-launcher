@@ -66,6 +66,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <time.h>
 
 typedef int VkResult;
 typedef void *VkInstance;
@@ -183,6 +184,46 @@ static int enabled_v1(void) {
     return e && e[0] == '1';
 }
 
+static int enabled_v2(void) {
+    const char *e = getenv("WRAPPER_POOL_RESETTER_V2");
+    return e && e[0] == '1';
+}
+
+/* v2a observer mode — does NOT call vkResetDescriptorPool. Instead, when
+ * the trigger condition matches, it logs "[wrapper_pool_resetter] WOULD
+ * force reset ..." and bumps a per-pool counter. Validates the trigger
+ * logic without risking a regression in DXVK 1.10.3's natural reset
+ * cycle (failed_attempts.md:11 — wrong reset semantics OOM'd Sekiro
+ * in 3.6 min historically).
+ *
+ * Trigger: pool.inflight_uses == 0 AND pool.allocated_now >= threshold
+ * AND time since last app vkResetDescriptorPool >= grace period.
+ *
+ * Tunables (read once at first device-create):
+ *   WRAPPER_POOL_RESETTER_THRESHOLD  — default 2000
+ *   WRAPPER_POOL_RESETTER_GRACE_MS   — default 1000 (1 second)
+ */
+static int      g_v2_threshold = 2000;
+static uint64_t g_v2_grace_ns  = 1000000000ULL;
+static pthread_once_t g_v2_init_once = PTHREAD_ONCE_INIT;
+
+static void v2_init_impl(void) {
+    const char *t = getenv("WRAPPER_POOL_RESETTER_THRESHOLD");
+    if (t) { int v = atoi(t); if (v > 0) g_v2_threshold = v; }
+    const char *g = getenv("WRAPPER_POOL_RESETTER_GRACE_MS");
+    if (g) { int v = atoi(g); if (v >= 0) g_v2_grace_ns = (uint64_t)v * 1000000ULL; }
+}
+
+static void v2_init(void) {
+    pthread_once(&g_v2_init_once, v2_init_impl);
+}
+
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* ================================================================
  *  v0 — per-pool stats (linked list, small N, linear scan is fine)
  * ================================================================ */
@@ -202,6 +243,10 @@ typedef struct PoolEntry {
      * bound (wrapper fence semantics not trusted, state_stack_wrapper.md:18). */
     int64_t  inflight_uses;
     int64_t  inflight_uses_peak;
+    /* v2a observer-mode trigger bookkeeping. */
+    uint64_t last_reset_ns;      /* monotonic ns at last app-driven reset (0 = never) */
+    uint64_t last_logged_ns;     /* monotonic ns at last WOULD-reset log (rate limiter) */
+    uint64_t would_reset_count;  /* trigger fire count (logged or rate-limited) */
     int      destroyed;          /* never freed; reusable if same pool addr is recycled */
     struct PoolEntry *next;
 } PoolEntry;
@@ -233,6 +278,9 @@ static PoolEntry *get_or_create_pool(VkDescriptorPool pool, uint32_t maxSets, ui
         e->max_allocated_seen = 0;
         e->inflight_uses = 0;
         e->inflight_uses_peak = 0;
+        e->last_reset_ns = 0;
+        e->last_logged_ns = 0;
+        e->would_reset_count = 0;
     } else if (!e) {
         e = (PoolEntry *)calloc(1, sizeof(PoolEntry));
         if (e) {
@@ -415,6 +463,48 @@ static void cmdbuf_add_ref_locked(CmdBufEntry *e, PoolEntry *pe) {
 }
 
 /* ================================================================
+ *  v2a — observer-mode trigger
+ *
+ *  Called from fence_drain after pool inflight_uses are decremented;
+ *  caller must hold g_pools_mutex. Returns a snapshot of trigger
+ *  state if the rate-limited log should fire (caller logs after lock
+ *  release to avoid blocking other pool ops on stderr). Defined ahead
+ *  of fence_drain so the struct is in scope there.
+ * ================================================================ */
+typedef struct V2TriggerInfo {
+    void    *pool;
+    int64_t  allocated_now;
+    int64_t  max_allocated_seen;
+    uint64_t since_last_reset_us;
+    uint64_t would_reset_count;
+    int      fired;
+} V2TriggerInfo;
+
+static V2TriggerInfo v2_check_trigger_locked(PoolEntry *pe, uint64_t now_ns) {
+    V2TriggerInfo info = (V2TriggerInfo){0};
+    if (!enabled_v2()) return info;
+    if (pe->destroyed) return info;
+    if (pe->inflight_uses != 0) return info;
+    if (pe->allocated_now < g_v2_threshold) return info;
+    if (pe->last_reset_ns != 0 && now_ns - pe->last_reset_ns < g_v2_grace_ns) return info;
+
+    pe->would_reset_count++;
+    /* Rate-limit per-pool log to once per second to avoid stderr spam.
+     * The would_reset_count keeps incrementing regardless. */
+    if (pe->last_logged_ns != 0 && now_ns - pe->last_logged_ns < 1000000000ULL) {
+        return info;
+    }
+    pe->last_logged_ns = now_ns;
+    info.pool = pe->pool;
+    info.allocated_now = pe->allocated_now;
+    info.max_allocated_seen = pe->max_allocated_seen;
+    info.since_last_reset_us = pe->last_reset_ns ? (now_ns - pe->last_reset_ns) / 1000 : 0;
+    info.would_reset_count = pe->would_reset_count;
+    info.fired = 1;
+    return info;
+}
+
+/* ================================================================
  *  v1 — per-fence in-flight refs.
  * ================================================================ */
 typedef struct InflightRef {
@@ -495,13 +585,38 @@ static void fence_drain(VkFence f) {
     fe->refs_count = 0;
     pthread_mutex_unlock(&g_fences_mutex);
 
+    V2TriggerInfo *trig = NULL;
+    int trig_count = 0;
+    if (enabled_v2()) {
+        trig = (V2TriggerInfo*)malloc(n * sizeof(V2TriggerInfo));
+    }
+    uint64_t now_ns = enabled_v2() ? monotonic_ns() : 0;
+
     pthread_mutex_lock(&g_pools_mutex);
     for (int i = 0; i < n; i++) {
         snap[i].pe->inflight_uses -= snap[i].count;
         if (snap[i].pe->inflight_uses < 0) snap[i].pe->inflight_uses = 0;
+        if (trig && snap[i].pe->inflight_uses == 0) {
+            V2TriggerInfo info = v2_check_trigger_locked(snap[i].pe, now_ns);
+            if (info.fired) trig[trig_count++] = info;
+        }
     }
     pthread_mutex_unlock(&g_pools_mutex);
     free(snap);
+
+    if (trig) {
+        for (int i = 0; i < trig_count; i++) {
+            fprintf(stderr,
+                "[wrapper_pool_resetter] WOULD force reset pool=%p (now=%lld peak=%lld inflight=0 last_reset=%lluus_ago count=%llu)\n",
+                trig[i].pool,
+                (long long)trig[i].allocated_now,
+                (long long)trig[i].max_allocated_seen,
+                (unsigned long long)trig[i].since_last_reset_us,
+                (unsigned long long)trig[i].would_reset_count);
+        }
+        if (trig_count > 0) fflush(stderr);
+        free(trig);
+    }
 }
 
 static void fence_destroy(VkFence f) {
@@ -539,6 +654,7 @@ static void maybe_log(void) {
     int64_t total_inflight = 0;
     uint64_t total_allocs = 0;
     uint64_t total_resets = 0;
+    uint64_t total_would_reset = 0;
     PoolEntry *worst = NULL;
     for (PoolEntry *e = g_pools; e; e = e->next) {
         if (e->destroyed) continue;
@@ -548,22 +664,24 @@ static void maybe_log(void) {
         total_allocs += e->allocs_sets;
         total_resets += e->reset_calls;
         total_inflight += e->inflight_uses;
+        total_would_reset += e->would_reset_count;
         if (e->reset_calls == 0 && e->allocs_sets > 0) n_unbounded++;
         if (e->inflight_uses == 0 && e->allocated_now > 0) n_qgrow++;
         if (!worst || e->max_allocated_seen > worst->max_allocated_seen) worst = e;
     }
     fprintf(stderr,
         "[wrapper_pool_resetter] op=%llu pools=%d unbounded=%d qgrow=%d "
-        "(allocs=%llu resets=%llu now=%lld peak=%lld inflight=%lld)",
+        "(allocs=%llu resets=%llu now=%lld peak=%lld inflight=%lld would_reset=%llu)",
         (unsigned long long)op, n, n_unbounded, n_qgrow,
         (unsigned long long)total_allocs,
         (unsigned long long)total_resets,
         (long long)total_now,
         (long long)total_peak,
-        (long long)total_inflight);
+        (long long)total_inflight,
+        (unsigned long long)total_would_reset);
     if (worst) {
         fprintf(stderr,
-            " worst=%p (allocs=%llu frees=%llu resets=%llu now=%lld peak=%lld inflight=%lld maxSets=%u flags=0x%x)",
+            " worst=%p (allocs=%llu frees=%llu resets=%llu now=%lld peak=%lld inflight=%lld would_reset=%llu maxSets=%u flags=0x%x)",
             worst->pool,
             (unsigned long long)worst->allocs_sets,
             (unsigned long long)worst->free_sets,
@@ -571,6 +689,7 @@ static void maybe_log(void) {
             (long long)worst->allocated_now,
             (long long)worst->max_allocated_seen,
             (long long)worst->inflight_uses,
+            (unsigned long long)worst->would_reset_count,
             worst->maxSets,
             worst->flags);
     }
@@ -644,11 +763,13 @@ VkResult PoolResetter_ResetDescriptorPool(
     VkDevice device, VkDescriptorPool pool, uint32_t flags) {
     VkResult r = next_ResetDescriptorPool(device, pool, flags);
     if (enabled() && r == 0) {
+        uint64_t now_ns = enabled_v2() ? monotonic_ns() : 0;
         pthread_mutex_lock(&g_pools_mutex);
         PoolEntry *e = find_pool_locked(pool);
         if (e) {
             e->reset_calls++;
             e->allocated_now = 0;
+            if (now_ns) e->last_reset_ns = now_ns;
         }
         pthread_mutex_unlock(&g_pools_mutex);
         if (enabled_v1() && e) set_table_purge_pool(e);
@@ -872,9 +993,19 @@ VkResult PoolResetter_CreateDevice(
     next_ResetFences            = (PFN_vkResetFences)           next_GetDeviceProcAddr(*pDevice, "vkResetFences");
     next_DestroyFence           = (PFN_vkDestroyFence)          next_GetDeviceProcAddr(*pDevice, "vkDestroyFence");
 
+    v2_init();
+
     if (enabled()) {
-        fprintf(stderr, "[wrapper_pool_resetter] device created, hooks armed (v1=%s)\n",
-                enabled_v1() ? "on" : "off");
+        fprintf(stderr,
+                "[wrapper_pool_resetter] device created, hooks armed (v1=%s v2=%s",
+                enabled_v1() ? "on" : "off",
+                enabled_v2() ? "on" : "off");
+        if (enabled_v2()) {
+            fprintf(stderr, " threshold=%d grace_ms=%llu",
+                    g_v2_threshold,
+                    (unsigned long long)(g_v2_grace_ns / 1000000ULL));
+        }
+        fputs(")\n", stderr);
         fflush(stderr);
     }
     return r;

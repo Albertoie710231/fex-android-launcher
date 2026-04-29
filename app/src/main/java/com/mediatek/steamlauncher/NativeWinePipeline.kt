@@ -1521,6 +1521,14 @@ class NativeWinePipeline(private val context: Context) {
             // safe. Heuristic upper bound only; wrapper fence semantics
             // are not trusted (state_stack_wrapper.md:18).
             put("WRAPPER_POOL_RESETTER_V1", "1")
+            // Phase 2 v2a: observer-mode forced-reset trigger. Logs
+            // "[wrapper_pool_resetter] WOULD force reset ..." when a pool
+            // would be a candidate for forced vkResetDescriptorPool, but
+            // does NOT actually call it. Validates trigger logic + tunes
+            // threshold without risking a regression in DXVK 1.10.3's
+            // natural reset cycle (failed_attempts.md:11). Promote to
+            // real forced reset only once DXVK 2.7.1 is shipping.
+            put("WRAPPER_POOL_RESETTER_V2", "1")
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
             // DXVK_LOG_PATH is a DIRECTORY (DXVK writes <exe>_<dll>.log
