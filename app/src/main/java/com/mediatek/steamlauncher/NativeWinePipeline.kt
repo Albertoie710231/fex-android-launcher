@@ -1514,6 +1514,13 @@ class NativeWinePipeline(private val context: Context) {
             // pool ops; no enforcement yet. Use the data to size the v2
             // forced-reset threshold. See fex-emu/wrapper_pool_resetter_layer.c.
             put("WRAPPER_POOL_RESETTER", "1")
+            // Phase 2 v1: in-flight set tracking via cmd-buffer + fence
+            // hooks. Adds the "is anyone using this pool right now?"
+            // signal — observability only, no enforcement. v2 will use
+            // this to decide when a forced vkResetDescriptorPool is
+            // safe. Heuristic upper bound only; wrapper fence semantics
+            // are not trusted (state_stack_wrapper.md:18).
+            put("WRAPPER_POOL_RESETTER_V1", "1")
             put("DXVK_STATE_CACHE_PATH", "$dataDir/imagefs_bionic/home/xuser/.cache")
             put("DXVK_LOG_LEVEL", "info")                // verbose enough to see feature level decision
             // DXVK_LOG_PATH is a DIRECTORY (DXVK writes <exe>_<dll>.log

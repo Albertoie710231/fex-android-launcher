@@ -1,5 +1,5 @@
 /*
- * VK_LAYER_WRAPPER_POOL_RESETTER — Phase 2 v0: per-descriptor-pool tracking.
+ * VK_LAYER_WRAPPER_POOL_RESETTER — Phase 2 v0 (per-pool stats) + v1 (in-flight tracking).
  *
  * Background. The leegao Vulkan wrapper has a single memory-bounding
  * mechanism for descriptor-pool memory: vkResetDescriptorPool. Each
@@ -21,10 +21,30 @@
  *
  * v0 (this layer): observability only. Hooks the five pool/set
  * entrypoints, maintains a per-pool linked list of stats, and logs
- * periodically to stderr. No enforcement; useful as a baseline against
- * which v1/v2 changes can be measured. Also informs the threshold for
- * forced resets — we want to see, on the production 1.10.3 stack, how
- * often DXVK resets and how many sets accumulate per pool before resets.
+ * periodically to stderr. No enforcement; useful as a baseline.
+ *
+ * v1 (this layer, gated on WRAPPER_POOL_RESETTER_V1=1): adds the
+ * "is anyone using this pool right now?" signal. Hooks
+ * vkAllocate/FreeCommandBuffers, vkBegin/ResetCommandBuffer,
+ * vkCmdBindDescriptorSets, vkQueueSubmit, vkWaitForFences,
+ * vkGetFenceStatus, vkResetFences, vkDestroyFence. Maintains:
+ *   - set->pool hashtable (populated at vkAllocateDescriptorSets)
+ *   - per-cmd-buffer dedup'd list of pools its bound sets touch
+ *   - per-fence list of in-flight pool refs
+ *   - per-pool inflight_uses counter (incremented at submit,
+ *     decremented at fence completion / reset / destroy)
+ *
+ * v1 is OBSERVABILITY ONLY — we do NOT force resets, do NOT invalidate
+ * sets, and do NOT trust fence completion as a hard "GPU done" signal
+ * (state_stack_wrapper.md:18 — wrapper sync semantics are not per-spec).
+ * The inflight_uses counter is logged as a heuristic upper bound for v2
+ * to combine with other signals, not as a safety primitive.
+ *
+ * PoolEntry lifetime: never freed. vkDestroyDescriptorPool sets a
+ * destroyed flag; the entry stays around so any cmd-buffer / fence list
+ * that still references the pointer can keep doing dead-counter ops
+ * without UAF. get_or_create_pool reuses destroyed entries that match
+ * a recycled VkDescriptorPool address.
  *
  * Build:
  *   ~/Android/Sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
@@ -34,7 +54,9 @@
  *   files/imagefs_bionic/usr/lib/libwrapper_pool_resetter.so
  *   files/imagefs_bionic/usr/share/vulkan/implicit_layer.d/wrapper_pool_resetter_layer.json
  *
- * Activate via env: WRAPPER_POOL_RESETTER=1
+ * Activate via env:
+ *   WRAPPER_POOL_RESETTER=1     — v0 stats (always required)
+ *   WRAPPER_POOL_RESETTER_V1=1  — v1 in-flight tracking (additional)
  */
 
 #define _GNU_SOURCE
@@ -52,6 +74,14 @@ typedef void *VkPhysicalDevice;
 typedef void *VkDescriptorPool;
 typedef void *VkDescriptorSet;
 typedef void *VkDescriptorSetLayout;
+typedef void *VkCommandBuffer;
+typedef void *VkCommandPool;
+typedef void *VkFence;
+typedef void *VkQueue;
+typedef void *VkSemaphore;
+typedef void *VkPipelineLayout;
+typedef int   VkPipelineBindPoint;
+typedef uint32_t VkBool32;
 
 typedef struct {
     int32_t       sType;
@@ -77,6 +107,26 @@ typedef struct VkDescriptorPoolCreateInfo {
     const VkDescriptorPoolSize *pPoolSizes;
 } VkDescriptorPoolCreateInfo;
 
+typedef struct VkCommandBufferAllocateInfo {
+    int32_t sType;
+    const void *pNext;
+    VkCommandPool commandPool;
+    int32_t  level;
+    uint32_t commandBufferCount;
+} VkCommandBufferAllocateInfo;
+
+typedef struct VkSubmitInfo {
+    int32_t sType;
+    const void *pNext;
+    uint32_t waitSemaphoreCount;
+    const VkSemaphore *pWaitSemaphores;
+    const uint32_t    *pWaitDstStageMask;
+    uint32_t commandBufferCount;
+    const VkCommandBuffer *pCommandBuffers;
+    uint32_t signalSemaphoreCount;
+    const VkSemaphore *pSignalSemaphores;
+} VkSubmitInfo;
+
 typedef void (*PFN_vkVoidFunction)(void);
 typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char*);
 typedef PFN_vkVoidFunction (*PFN_vkGetDeviceProcAddr)(VkDevice, const char*);
@@ -87,6 +137,16 @@ typedef VkResult (*PFN_vkFreeDescriptorSets)(VkDevice, VkDescriptorPool, uint32_
 typedef VkResult (*PFN_vkCreateDescriptorPool)(VkDevice, const void*, const void*, VkDescriptorPool*);
 typedef VkResult (*PFN_vkResetDescriptorPool)(VkDevice, VkDescriptorPool, uint32_t);
 typedef void     (*PFN_vkDestroyDescriptorPool)(VkDevice, VkDescriptorPool, const void*);
+typedef VkResult (*PFN_vkAllocateCommandBuffers)(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*);
+typedef void     (*PFN_vkFreeCommandBuffers)(VkDevice, VkCommandPool, uint32_t, const VkCommandBuffer*);
+typedef VkResult (*PFN_vkBeginCommandBuffer)(VkCommandBuffer, const void*);
+typedef VkResult (*PFN_vkResetCommandBuffer)(VkCommandBuffer, uint32_t);
+typedef void     (*PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
+typedef VkResult (*PFN_vkQueueSubmit)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+typedef VkResult (*PFN_vkWaitForFences)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+typedef VkResult (*PFN_vkGetFenceStatus)(VkDevice, VkFence);
+typedef VkResult (*PFN_vkResetFences)(VkDevice, uint32_t, const VkFence*);
+typedef void     (*PFN_vkDestroyFence)(VkDevice, VkFence, const void*);
 
 typedef struct VkLayerDeviceLink_ {
     struct VkLayerDeviceLink_ *pNext;
@@ -102,28 +162,47 @@ static PFN_vkFreeDescriptorSets     next_FreeDescriptorSets     = NULL;
 static PFN_vkCreateDescriptorPool   next_CreateDescriptorPool   = NULL;
 static PFN_vkResetDescriptorPool    next_ResetDescriptorPool    = NULL;
 static PFN_vkDestroyDescriptorPool  next_DestroyDescriptorPool  = NULL;
+static PFN_vkAllocateCommandBuffers next_AllocateCommandBuffers = NULL;
+static PFN_vkFreeCommandBuffers     next_FreeCommandBuffers     = NULL;
+static PFN_vkBeginCommandBuffer     next_BeginCommandBuffer     = NULL;
+static PFN_vkResetCommandBuffer     next_ResetCommandBuffer     = NULL;
+static PFN_vkCmdBindDescriptorSets  next_CmdBindDescriptorSets  = NULL;
+static PFN_vkQueueSubmit            next_QueueSubmit            = NULL;
+static PFN_vkWaitForFences          next_WaitForFences          = NULL;
+static PFN_vkGetFenceStatus         next_GetFenceStatus         = NULL;
+static PFN_vkResetFences            next_ResetFences            = NULL;
+static PFN_vkDestroyFence           next_DestroyFence           = NULL;
 
 static int enabled(void) {
     const char *e = getenv("WRAPPER_POOL_RESETTER");
     return e && e[0] == '1';
 }
 
-/* Per-pool tracking: linked list of PoolEntry. The active pool count
- * is small (DXVK has on the order of tens of pools live at once); a
- * linear scan is fine and avoids needing a hash-table dependency. */
+static int enabled_v1(void) {
+    const char *e = getenv("WRAPPER_POOL_RESETTER_V1");
+    return e && e[0] == '1';
+}
+
+/* ================================================================
+ *  v0 — per-pool stats (linked list, small N, linear scan is fine)
+ * ================================================================ */
+
 typedef struct PoolEntry {
     VkDescriptorPool pool;
     uint32_t maxSets;
     uint32_t flags;
-    /* Cumulative counters across the pool's lifetime. */
     uint64_t allocs_calls;
     uint64_t allocs_sets;
     uint64_t free_calls;
     uint64_t free_sets;
     uint64_t reset_calls;
-    /* Currently allocated set count (resets at vkResetDescriptorPool). */
     int64_t  allocated_now;
     int64_t  max_allocated_seen;
+    /* v1: in-flight cmd-buffer references to this pool. Heuristic upper
+     * bound (wrapper fence semantics not trusted, state_stack_wrapper.md:18). */
+    int64_t  inflight_uses;
+    int64_t  inflight_uses_peak;
+    int      destroyed;          /* never freed; reusable if same pool addr is recycled */
     struct PoolEntry *next;
 } PoolEntry;
 
@@ -141,7 +220,20 @@ static PoolEntry *find_pool_locked(VkDescriptorPool pool) {
 static PoolEntry *get_or_create_pool(VkDescriptorPool pool, uint32_t maxSets, uint32_t flags) {
     pthread_mutex_lock(&g_pools_mutex);
     PoolEntry *e = find_pool_locked(pool);
-    if (!e) {
+    if (e && e->destroyed) {
+        e->destroyed = 0;
+        e->maxSets = maxSets;
+        e->flags = flags;
+        e->allocs_calls = 0;
+        e->allocs_sets = 0;
+        e->free_calls = 0;
+        e->free_sets = 0;
+        e->reset_calls = 0;
+        e->allocated_now = 0;
+        e->max_allocated_seen = 0;
+        e->inflight_uses = 0;
+        e->inflight_uses_peak = 0;
+    } else if (!e) {
         e = (PoolEntry *)calloc(1, sizeof(PoolEntry));
         if (e) {
             e->pool = pool;
@@ -155,21 +247,283 @@ static PoolEntry *get_or_create_pool(VkDescriptorPool pool, uint32_t maxSets, ui
     return e;
 }
 
-static void destroy_pool(VkDescriptorPool pool) {
-    pthread_mutex_lock(&g_pools_mutex);
-    PoolEntry **pp = &g_pools;
+/* ================================================================
+ *  v1 — set->pool hashtable.
+ *  Populated at vkAllocateDescriptorSets, drained at FreeDescriptorSets
+ *  and ResetDescriptorPool. Not drained at DestroyDescriptorPool —
+ *  destroyed pools' entries leak until end of session (bounded by total
+ *  alloc count, fine in practice).
+ * ================================================================ */
+#define SET_BUCKETS 16384  /* power of 2 */
+
+typedef struct SetEntry {
+    VkDescriptorSet set;
+    PoolEntry *pool_entry;
+    struct SetEntry *next;
+} SetEntry;
+
+static SetEntry *g_set_buckets[SET_BUCKETS];
+static pthread_mutex_t g_set_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned set_hash(VkDescriptorSet s) {
+    uintptr_t p = (uintptr_t)s;
+    p ^= p >> 16;
+    p *= 0x45d9f3bUL;
+    p ^= p >> 16;
+    return (unsigned)(p & (SET_BUCKETS - 1));
+}
+
+static void set_table_insert(VkDescriptorSet s, PoolEntry *pe) {
+    SetEntry *e = (SetEntry*)calloc(1, sizeof(SetEntry));
+    if (!e) return;
+    e->set = s;
+    e->pool_entry = pe;
+    unsigned b = set_hash(s);
+    pthread_mutex_lock(&g_set_mutex);
+    e->next = g_set_buckets[b];
+    g_set_buckets[b] = e;
+    pthread_mutex_unlock(&g_set_mutex);
+}
+
+static void set_table_remove(VkDescriptorSet s) {
+    unsigned b = set_hash(s);
+    pthread_mutex_lock(&g_set_mutex);
+    SetEntry **pp = &g_set_buckets[b];
     while (*pp) {
-        if ((*pp)->pool == pool) {
-            PoolEntry *victim = *pp;
-            *pp = victim->next;
-            free(victim);
+        if ((*pp)->set == s) {
+            SetEntry *v = *pp;
+            *pp = v->next;
+            free(v);
             break;
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&g_pools_mutex);
+    pthread_mutex_unlock(&g_set_mutex);
 }
 
+/* Walk all buckets and drop entries belonging to pe. Called from
+ * vkResetDescriptorPool (sets are invalidated en-masse). */
+static void set_table_purge_pool(PoolEntry *pe) {
+    pthread_mutex_lock(&g_set_mutex);
+    for (int i = 0; i < SET_BUCKETS; i++) {
+        SetEntry **pp = &g_set_buckets[i];
+        while (*pp) {
+            if ((*pp)->pool_entry == pe) {
+                SetEntry *v = *pp;
+                *pp = v->next;
+                free(v);
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_set_mutex);
+}
+
+static PoolEntry *set_table_lookup(VkDescriptorSet s) {
+    unsigned b = set_hash(s);
+    pthread_mutex_lock(&g_set_mutex);
+    PoolEntry *r = NULL;
+    for (SetEntry *e = g_set_buckets[b]; e; e = e->next) {
+        if (e->set == s) { r = e->pool_entry; break; }
+    }
+    pthread_mutex_unlock(&g_set_mutex);
+    return r;
+}
+
+/* ================================================================
+ *  v1 — per-cmd-buffer record. Tracks the dedup'd set of pools whose
+ *  sets were bound during the current recording. Cleared at Begin/Reset,
+ *  snapshotted at Submit.
+ * ================================================================ */
+typedef struct CmdBufEntry {
+    VkCommandBuffer cmdbuf;
+    PoolEntry **pool_refs;
+    int pool_refs_count;
+    int pool_refs_cap;
+    struct CmdBufEntry *next;
+} CmdBufEntry;
+
+static CmdBufEntry *g_cmdbufs = NULL;
+static pthread_mutex_t g_cmdbufs_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static CmdBufEntry *find_cmdbuf_locked(VkCommandBuffer cb) {
+    for (CmdBufEntry *e = g_cmdbufs; e; e = e->next)
+        if (e->cmdbuf == cb) return e;
+    return NULL;
+}
+
+static CmdBufEntry *cmdbuf_get_or_create_locked(VkCommandBuffer cb) {
+    CmdBufEntry *e = find_cmdbuf_locked(cb);
+    if (!e) {
+        e = (CmdBufEntry*)calloc(1, sizeof(CmdBufEntry));
+        if (e) {
+            e->cmdbuf = cb;
+            e->next = g_cmdbufs;
+            g_cmdbufs = e;
+        }
+    }
+    return e;
+}
+
+static void cmdbuf_register(VkCommandBuffer cb) {
+    pthread_mutex_lock(&g_cmdbufs_mutex);
+    cmdbuf_get_or_create_locked(cb);
+    pthread_mutex_unlock(&g_cmdbufs_mutex);
+}
+
+static void cmdbuf_clear(VkCommandBuffer cb) {
+    pthread_mutex_lock(&g_cmdbufs_mutex);
+    CmdBufEntry *e = find_cmdbuf_locked(cb);
+    if (e) {
+        free(e->pool_refs);
+        e->pool_refs = NULL;
+        e->pool_refs_count = 0;
+        e->pool_refs_cap = 0;
+    }
+    pthread_mutex_unlock(&g_cmdbufs_mutex);
+}
+
+static void cmdbuf_destroy(VkCommandBuffer cb) {
+    pthread_mutex_lock(&g_cmdbufs_mutex);
+    CmdBufEntry **pp = &g_cmdbufs;
+    while (*pp) {
+        if ((*pp)->cmdbuf == cb) {
+            CmdBufEntry *v = *pp;
+            *pp = v->next;
+            free(v->pool_refs);
+            free(v);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_cmdbufs_mutex);
+}
+
+static void cmdbuf_add_ref_locked(CmdBufEntry *e, PoolEntry *pe) {
+    for (int i = 0; i < e->pool_refs_count; i++) {
+        if (e->pool_refs[i] == pe) return;
+    }
+    if (e->pool_refs_count == e->pool_refs_cap) {
+        int new_cap = e->pool_refs_cap ? e->pool_refs_cap * 2 : 4;
+        PoolEntry **new_refs = (PoolEntry**)realloc(e->pool_refs, new_cap * sizeof(PoolEntry*));
+        if (!new_refs) return;
+        e->pool_refs = new_refs;
+        e->pool_refs_cap = new_cap;
+    }
+    e->pool_refs[e->pool_refs_count++] = pe;
+}
+
+/* ================================================================
+ *  v1 — per-fence in-flight refs.
+ * ================================================================ */
+typedef struct InflightRef {
+    PoolEntry *pe;
+    int count;
+} InflightRef;
+
+typedef struct FenceEntry {
+    VkFence fence;
+    InflightRef *refs;
+    int refs_count;
+    int refs_cap;
+    struct FenceEntry *next;
+} FenceEntry;
+
+static FenceEntry *g_fences = NULL;
+static pthread_mutex_t g_fences_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static FenceEntry *find_fence_locked(VkFence f) {
+    for (FenceEntry *e = g_fences; e; e = e->next)
+        if (e->fence == f) return e;
+    return NULL;
+}
+
+static FenceEntry *fence_get_or_create_locked(VkFence f) {
+    FenceEntry *e = find_fence_locked(f);
+    if (!e) {
+        e = (FenceEntry*)calloc(1, sizeof(FenceEntry));
+        if (e) {
+            e->fence = f;
+            e->next = g_fences;
+            g_fences = e;
+        }
+    }
+    return e;
+}
+
+/* Append (pe, count) to fence's list, merging if pe is already there. */
+static void fence_add_refs(VkFence f, PoolEntry **pes, int n) {
+    if (n <= 0) return;
+    pthread_mutex_lock(&g_fences_mutex);
+    FenceEntry *fe = fence_get_or_create_locked(f);
+    if (!fe) { pthread_mutex_unlock(&g_fences_mutex); return; }
+    for (int i = 0; i < n; i++) {
+        PoolEntry *pe = pes[i];
+        int merged = 0;
+        for (int j = 0; j < fe->refs_count; j++) {
+            if (fe->refs[j].pe == pe) { fe->refs[j].count++; merged = 1; break; }
+        }
+        if (merged) continue;
+        if (fe->refs_count == fe->refs_cap) {
+            int new_cap = fe->refs_cap ? fe->refs_cap * 2 : 4;
+            InflightRef *nr = (InflightRef*)realloc(fe->refs, new_cap * sizeof(InflightRef));
+            if (!nr) continue;
+            fe->refs = nr;
+            fe->refs_cap = new_cap;
+        }
+        fe->refs[fe->refs_count].pe = pe;
+        fe->refs[fe->refs_count].count = 1;
+        fe->refs_count++;
+    }
+    pthread_mutex_unlock(&g_fences_mutex);
+}
+
+/* Snapshot a fence's in-flight list, then clear it. Decrement pool
+ * inflight_uses for each ref. Avoids holding two locks at once. */
+static void fence_drain(VkFence f) {
+    pthread_mutex_lock(&g_fences_mutex);
+    FenceEntry *fe = find_fence_locked(f);
+    if (!fe || fe->refs_count == 0) {
+        pthread_mutex_unlock(&g_fences_mutex);
+        return;
+    }
+    int n = fe->refs_count;
+    InflightRef *snap = (InflightRef*)malloc(n * sizeof(InflightRef));
+    if (!snap) { pthread_mutex_unlock(&g_fences_mutex); return; }
+    memcpy(snap, fe->refs, n * sizeof(InflightRef));
+    fe->refs_count = 0;
+    pthread_mutex_unlock(&g_fences_mutex);
+
+    pthread_mutex_lock(&g_pools_mutex);
+    for (int i = 0; i < n; i++) {
+        snap[i].pe->inflight_uses -= snap[i].count;
+        if (snap[i].pe->inflight_uses < 0) snap[i].pe->inflight_uses = 0;
+    }
+    pthread_mutex_unlock(&g_pools_mutex);
+    free(snap);
+}
+
+static void fence_destroy(VkFence f) {
+    fence_drain(f);
+    pthread_mutex_lock(&g_fences_mutex);
+    FenceEntry **pp = &g_fences;
+    while (*pp) {
+        if ((*pp)->fence == f) {
+            FenceEntry *v = *pp;
+            *pp = v->next;
+            free(v->refs);
+            free(v);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_fences_mutex);
+}
+
+/* ================================================================
+ *  Logging
+ * ================================================================ */
 #define LOG_EVERY 1000
 
 static void maybe_log(void) {
@@ -179,37 +533,44 @@ static void maybe_log(void) {
     pthread_mutex_lock(&g_pools_mutex);
     int n = 0;
     int n_unbounded = 0;
+    int n_qgrow = 0;
     int64_t total_now = 0;
     int64_t total_peak = 0;
+    int64_t total_inflight = 0;
     uint64_t total_allocs = 0;
     uint64_t total_resets = 0;
     PoolEntry *worst = NULL;
     for (PoolEntry *e = g_pools; e; e = e->next) {
+        if (e->destroyed) continue;
         n++;
         total_now += e->allocated_now;
         total_peak += e->max_allocated_seen;
         total_allocs += e->allocs_sets;
         total_resets += e->reset_calls;
+        total_inflight += e->inflight_uses;
         if (e->reset_calls == 0 && e->allocs_sets > 0) n_unbounded++;
+        if (e->inflight_uses == 0 && e->allocated_now > 0) n_qgrow++;
         if (!worst || e->max_allocated_seen > worst->max_allocated_seen) worst = e;
     }
     fprintf(stderr,
-        "[wrapper_pool_resetter] op=%llu pools=%d unbounded=%d "
-        "(allocs=%llu resets=%llu now=%lld peak=%lld)",
-        (unsigned long long)op, n, n_unbounded,
+        "[wrapper_pool_resetter] op=%llu pools=%d unbounded=%d qgrow=%d "
+        "(allocs=%llu resets=%llu now=%lld peak=%lld inflight=%lld)",
+        (unsigned long long)op, n, n_unbounded, n_qgrow,
         (unsigned long long)total_allocs,
         (unsigned long long)total_resets,
         (long long)total_now,
-        (long long)total_peak);
+        (long long)total_peak,
+        (long long)total_inflight);
     if (worst) {
         fprintf(stderr,
-            " worst=%p (allocs=%llu frees=%llu resets=%llu now=%lld peak=%lld maxSets=%u flags=0x%x)",
+            " worst=%p (allocs=%llu frees=%llu resets=%llu now=%lld peak=%lld inflight=%lld maxSets=%u flags=0x%x)",
             worst->pool,
             (unsigned long long)worst->allocs_sets,
             (unsigned long long)worst->free_sets,
             (unsigned long long)worst->reset_calls,
             (long long)worst->allocated_now,
             (long long)worst->max_allocated_seen,
+            (long long)worst->inflight_uses,
             worst->maxSets,
             worst->flags);
     }
@@ -217,6 +578,10 @@ static void maybe_log(void) {
     fflush(stderr);
     pthread_mutex_unlock(&g_pools_mutex);
 }
+
+/* ================================================================
+ *  v0 hooks (extended in v1 to update the set->pool table when active)
+ * ================================================================ */
 
 __attribute__((visibility("default")))
 VkResult PoolResetter_CreateDescriptorPool(
@@ -244,6 +609,11 @@ VkResult PoolResetter_AllocateDescriptorSets(
                 e->max_allocated_seen = e->allocated_now;
         }
         pthread_mutex_unlock(&g_pools_mutex);
+        if (enabled_v1() && e && pSets) {
+            for (uint32_t i = 0; i < pInfo->descriptorSetCount; i++) {
+                set_table_insert(pSets[i], e);
+            }
+        }
         maybe_log();
     }
     return r;
@@ -262,6 +632,9 @@ VkResult PoolResetter_FreeDescriptorSets(
             e->allocated_now -= (int64_t)count;
         }
         pthread_mutex_unlock(&g_pools_mutex);
+        if (enabled_v1() && pSets) {
+            for (uint32_t i = 0; i < count; i++) set_table_remove(pSets[i]);
+        }
     }
     return r;
 }
@@ -278,6 +651,7 @@ VkResult PoolResetter_ResetDescriptorPool(
             e->allocated_now = 0;
         }
         pthread_mutex_unlock(&g_pools_mutex);
+        if (enabled_v1() && e) set_table_purge_pool(e);
     }
     return r;
 }
@@ -285,9 +659,143 @@ VkResult PoolResetter_ResetDescriptorPool(
 __attribute__((visibility("default")))
 void PoolResetter_DestroyDescriptorPool(
     VkDevice device, VkDescriptorPool pool, const void *pAllocator) {
-    if (enabled()) destroy_pool(pool);
+    if (enabled()) {
+        pthread_mutex_lock(&g_pools_mutex);
+        PoolEntry *e = find_pool_locked(pool);
+        if (e) e->destroyed = 1;
+        pthread_mutex_unlock(&g_pools_mutex);
+    }
     next_DestroyDescriptorPool(device, pool, pAllocator);
 }
+
+/* ================================================================
+ *  v1 hooks
+ * ================================================================ */
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_AllocateCommandBuffers(
+    VkDevice device, const VkCommandBufferAllocateInfo *pInfo, VkCommandBuffer *pCmdBufs) {
+    VkResult r = next_AllocateCommandBuffers(device, pInfo, pCmdBufs);
+    if (enabled_v1() && r == 0 && pInfo && pCmdBufs) {
+        for (uint32_t i = 0; i < pInfo->commandBufferCount; i++) {
+            cmdbuf_register(pCmdBufs[i]);
+        }
+    }
+    return r;
+}
+
+__attribute__((visibility("default")))
+void PoolResetter_FreeCommandBuffers(
+    VkDevice device, VkCommandPool pool, uint32_t count, const VkCommandBuffer *pCmdBufs) {
+    if (enabled_v1() && pCmdBufs) {
+        for (uint32_t i = 0; i < count; i++) cmdbuf_destroy(pCmdBufs[i]);
+    }
+    next_FreeCommandBuffers(device, pool, count, pCmdBufs);
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_BeginCommandBuffer(VkCommandBuffer cb, const void *pInfo) {
+    if (enabled_v1()) cmdbuf_clear(cb);
+    return next_BeginCommandBuffer(cb, pInfo);
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_ResetCommandBuffer(VkCommandBuffer cb, uint32_t flags) {
+    if (enabled_v1()) cmdbuf_clear(cb);
+    return next_ResetCommandBuffer(cb, flags);
+}
+
+__attribute__((visibility("default")))
+void PoolResetter_CmdBindDescriptorSets(
+    VkCommandBuffer cb, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+    uint32_t firstSet, uint32_t setCount, const VkDescriptorSet *pSets,
+    uint32_t dynOffCount, const uint32_t *pDynOff) {
+    next_CmdBindDescriptorSets(cb, bindPoint, layout, firstSet, setCount, pSets, dynOffCount, pDynOff);
+    if (enabled_v1() && pSets && setCount > 0) {
+        pthread_mutex_lock(&g_cmdbufs_mutex);
+        CmdBufEntry *cbe = cmdbuf_get_or_create_locked(cb);
+        if (cbe) {
+            for (uint32_t i = 0; i < setCount; i++) {
+                PoolEntry *pe = set_table_lookup(pSets[i]);  /* takes g_set_mutex */
+                if (pe) cmdbuf_add_ref_locked(cbe, pe);
+            }
+        }
+        pthread_mutex_unlock(&g_cmdbufs_mutex);
+    }
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence) {
+    /* Snapshot pool refs from each cmd buffer in the submit, increment
+     * per-pool inflight_uses, and append to the fence's in-flight list.
+     * Done BEFORE forwarding so the count is a strict upper bound during
+     * the submit window. */
+    if (enabled_v1() && fence && pSubmits && submitCount > 0) {
+        for (uint32_t s = 0; s < submitCount; s++) {
+            const VkSubmitInfo *si = &pSubmits[s];
+            if (!si->pCommandBuffers) continue;
+            for (uint32_t c = 0; c < si->commandBufferCount; c++) {
+                VkCommandBuffer cb = si->pCommandBuffers[c];
+                pthread_mutex_lock(&g_cmdbufs_mutex);
+                CmdBufEntry *cbe = find_cmdbuf_locked(cb);
+                int n = cbe ? cbe->pool_refs_count : 0;
+                PoolEntry **snap = NULL;
+                if (n > 0) {
+                    snap = (PoolEntry**)malloc(n * sizeof(PoolEntry*));
+                    if (snap) memcpy(snap, cbe->pool_refs, n * sizeof(PoolEntry*));
+                }
+                pthread_mutex_unlock(&g_cmdbufs_mutex);
+                if (snap) {
+                    pthread_mutex_lock(&g_pools_mutex);
+                    for (int i = 0; i < n; i++) {
+                        snap[i]->inflight_uses++;
+                        if (snap[i]->inflight_uses > snap[i]->inflight_uses_peak)
+                            snap[i]->inflight_uses_peak = snap[i]->inflight_uses;
+                    }
+                    pthread_mutex_unlock(&g_pools_mutex);
+                    fence_add_refs(fence, snap, n);
+                    free(snap);
+                }
+            }
+        }
+    }
+    return next_QueueSubmit(queue, submitCount, pSubmits, fence);
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_WaitForFences(VkDevice device, uint32_t count, const VkFence *pFences, VkBool32 waitAll, uint64_t timeout) {
+    VkResult r = next_WaitForFences(device, count, pFences, waitAll, timeout);
+    if (enabled_v1() && r == 0 && pFences) {
+        /* SUCCESS means all waited fences are signaled. Heuristic: drain. */
+        for (uint32_t i = 0; i < count; i++) fence_drain(pFences[i]);
+    }
+    return r;
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_GetFenceStatus(VkDevice device, VkFence fence) {
+    VkResult r = next_GetFenceStatus(device, fence);
+    if (enabled_v1() && r == 0) fence_drain(fence);
+    return r;
+}
+
+__attribute__((visibility("default")))
+VkResult PoolResetter_ResetFences(VkDevice device, uint32_t count, const VkFence *pFences) {
+    if (enabled_v1() && pFences) {
+        for (uint32_t i = 0; i < count; i++) fence_drain(pFences[i]);
+    }
+    return next_ResetFences(device, count, pFences);
+}
+
+__attribute__((visibility("default")))
+void PoolResetter_DestroyFence(VkDevice device, VkFence fence, const void *pAllocator) {
+    if (enabled_v1()) fence_destroy(fence);
+    next_DestroyFence(device, fence, pAllocator);
+}
+
+/* ================================================================
+ *  procaddr / device-init scaffolding
+ * ================================================================ */
 
 __attribute__((visibility("default")))
 PFN_vkVoidFunction PoolResetter_GetDeviceProcAddr(VkDevice device, const char *pName) {
@@ -302,6 +810,26 @@ PFN_vkVoidFunction PoolResetter_GetDeviceProcAddr(VkDevice device, const char *p
             return (PFN_vkVoidFunction)PoolResetter_AllocateDescriptorSets;
         if (strcmp(pName, "vkFreeDescriptorSets") == 0)
             return (PFN_vkVoidFunction)PoolResetter_FreeDescriptorSets;
+        if (strcmp(pName, "vkAllocateCommandBuffers") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_AllocateCommandBuffers;
+        if (strcmp(pName, "vkFreeCommandBuffers") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_FreeCommandBuffers;
+        if (strcmp(pName, "vkBeginCommandBuffer") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_BeginCommandBuffer;
+        if (strcmp(pName, "vkResetCommandBuffer") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_ResetCommandBuffer;
+        if (strcmp(pName, "vkCmdBindDescriptorSets") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_CmdBindDescriptorSets;
+        if (strcmp(pName, "vkQueueSubmit") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_QueueSubmit;
+        if (strcmp(pName, "vkWaitForFences") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_WaitForFences;
+        if (strcmp(pName, "vkGetFenceStatus") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_GetFenceStatus;
+        if (strcmp(pName, "vkResetFences") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_ResetFences;
+        if (strcmp(pName, "vkDestroyFence") == 0)
+            return (PFN_vkVoidFunction)PoolResetter_DestroyFence;
     }
     if (next_GetDeviceProcAddr) return next_GetDeviceProcAddr(device, pName);
     return NULL;
@@ -333,9 +861,20 @@ VkResult PoolResetter_CreateDevice(
     next_CreateDescriptorPool   = (PFN_vkCreateDescriptorPool)  next_GetDeviceProcAddr(*pDevice, "vkCreateDescriptorPool");
     next_ResetDescriptorPool    = (PFN_vkResetDescriptorPool)   next_GetDeviceProcAddr(*pDevice, "vkResetDescriptorPool");
     next_DestroyDescriptorPool  = (PFN_vkDestroyDescriptorPool) next_GetDeviceProcAddr(*pDevice, "vkDestroyDescriptorPool");
+    next_AllocateCommandBuffers = (PFN_vkAllocateCommandBuffers)next_GetDeviceProcAddr(*pDevice, "vkAllocateCommandBuffers");
+    next_FreeCommandBuffers     = (PFN_vkFreeCommandBuffers)    next_GetDeviceProcAddr(*pDevice, "vkFreeCommandBuffers");
+    next_BeginCommandBuffer     = (PFN_vkBeginCommandBuffer)    next_GetDeviceProcAddr(*pDevice, "vkBeginCommandBuffer");
+    next_ResetCommandBuffer     = (PFN_vkResetCommandBuffer)    next_GetDeviceProcAddr(*pDevice, "vkResetCommandBuffer");
+    next_CmdBindDescriptorSets  = (PFN_vkCmdBindDescriptorSets) next_GetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorSets");
+    next_QueueSubmit            = (PFN_vkQueueSubmit)           next_GetDeviceProcAddr(*pDevice, "vkQueueSubmit");
+    next_WaitForFences          = (PFN_vkWaitForFences)         next_GetDeviceProcAddr(*pDevice, "vkWaitForFences");
+    next_GetFenceStatus         = (PFN_vkGetFenceStatus)        next_GetDeviceProcAddr(*pDevice, "vkGetFenceStatus");
+    next_ResetFences            = (PFN_vkResetFences)           next_GetDeviceProcAddr(*pDevice, "vkResetFences");
+    next_DestroyFence           = (PFN_vkDestroyFence)          next_GetDeviceProcAddr(*pDevice, "vkDestroyFence");
 
     if (enabled()) {
-        fprintf(stderr, "[wrapper_pool_resetter] device created, hooks armed\n");
+        fprintf(stderr, "[wrapper_pool_resetter] device created, hooks armed (v1=%s)\n",
+                enabled_v1() ? "on" : "off");
         fflush(stderr);
     }
     return r;
@@ -380,16 +919,10 @@ PFN_vkVoidFunction PoolResetter_GetInstanceProcAddr(VkInstance instance, const c
         return (PFN_vkVoidFunction)PoolResetter_CreateDevice;
     if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
         return (PFN_vkVoidFunction)PoolResetter_GetDeviceProcAddr;
-    if (strcmp(pName, "vkAllocateDescriptorSets") == 0)
-        return (PFN_vkVoidFunction)PoolResetter_AllocateDescriptorSets;
-    if (strcmp(pName, "vkFreeDescriptorSets") == 0)
-        return (PFN_vkVoidFunction)PoolResetter_FreeDescriptorSets;
-    if (strcmp(pName, "vkCreateDescriptorPool") == 0)
-        return (PFN_vkVoidFunction)PoolResetter_CreateDescriptorPool;
-    if (strcmp(pName, "vkResetDescriptorPool") == 0)
-        return (PFN_vkVoidFunction)PoolResetter_ResetDescriptorPool;
-    if (strcmp(pName, "vkDestroyDescriptorPool") == 0)
-        return (PFN_vkVoidFunction)PoolResetter_DestroyDescriptorPool;
+    /* device-level entrypoints can also be queried via instance procaddr;
+     * delegate so the name table lives in one place. */
+    PFN_vkVoidFunction p = PoolResetter_GetDeviceProcAddr(NULL, pName);
+    if (p) return p;
     if (next_GetInstanceProcAddr) return next_GetInstanceProcAddr(instance, pName);
     return NULL;
 }
