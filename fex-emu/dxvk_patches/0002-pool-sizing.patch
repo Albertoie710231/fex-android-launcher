@@ -1,0 +1,85 @@
+diff --git a/src/dxvk/dxvk_descriptor.cpp b/src/dxvk/dxvk_descriptor.cpp
+index cdd2ae67..00b6f3e1 100644
+--- a/src/dxvk/dxvk_descriptor.cpp
++++ b/src/dxvk/dxvk_descriptor.cpp
+@@ -2,22 +2,32 @@
+ #include "dxvk_device.h"
+ 
+ namespace dxvk {
+-  
++
+   DxvkDescriptorPool::DxvkDescriptorPool(const Rc<vk::DeviceFn>& vkd)
+   : m_vkd(vkd) {
+-    constexpr uint32_t MaxSets = 2048;
++    // mali_alloc_probe (2026-04-24) measured 36k vkCreateDescriptorPool calls
++    // during Sekiro init with the upstream sizing — each pool exhausted its
++    // STORAGE_IMAGE/STORAGE_BUFFER/STORAGE_TEXEL_BUFFER caps long before
++    // hitting MaxSets, forcing a new pool. On the leegao Mali wrapper each
++    // pool create costs ~1 /dev/mali0 mmap; result was mali0_vmas ≈ 39k,
++    // 60% of vm.max_map_count. Bumping MaxSets 4× and the storage caps
++    // from MaxSets/8 to MaxSets*1 should let each pool serve ~30× more
++    // sets before exhaustion, cutting startup pool creates from 36k to
++    // <2k. Memory overhead per pool is small (~kilobytes); 4× larger
++    // pools × 30× fewer pools = net win.
++    constexpr uint32_t MaxSets = 8192;
+ 
+     std::array<VkDescriptorPoolSize, 9> pools = {{
+       { VK_DESCRIPTOR_TYPE_SAMPLER,                MaxSets * 2 },
+       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          MaxSets * 3 },
+-      { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          MaxSets / 8 },
++      { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          MaxSets * 1 },
+       { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         MaxSets * 3 },
+-      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         MaxSets / 8 },
++      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         MaxSets * 1 },
+       { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,   MaxSets * 3 },
+-      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   MaxSets / 8 },
++      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   MaxSets * 1 },
+       { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MaxSets * 3 },
+       { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MaxSets * 2 } }};
+-    
++
+     VkDescriptorPoolCreateInfo info;
+     info.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+     info.pNext         = nullptr;
+@@ -25,18 +35,18 @@ namespace dxvk {
+     info.maxSets       = MaxSets;
+     info.poolSizeCount = pools.size();
+     info.pPoolSizes    = pools.data();
+-    
++
+     if (m_vkd->vkCreateDescriptorPool(m_vkd->device(), &info, nullptr, &m_pool) != VK_SUCCESS)
+       throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+   }
+-  
+-  
++
++
+   DxvkDescriptorPool::~DxvkDescriptorPool() {
+     m_vkd->vkDestroyDescriptorPool(
+       m_vkd->device(), m_pool, nullptr);
+   }
+-  
+-  
++
++
+   VkDescriptorSet DxvkDescriptorPool::alloc(VkDescriptorSetLayout layout) {
+     VkDescriptorSetAllocateInfo info;
+     info.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+@@ -44,14 +54,14 @@ namespace dxvk {
+     info.descriptorPool     = m_pool;
+     info.descriptorSetCount = 1;
+     info.pSetLayouts        = &layout;
+-    
++
+     VkDescriptorSet set = VK_NULL_HANDLE;
+     if (m_vkd->vkAllocateDescriptorSets(m_vkd->device(), &info, &set) != VK_SUCCESS)
+       return VK_NULL_HANDLE;
+     return set;
+   }
+-  
+-  
++
++
+   void DxvkDescriptorPool::reset() {
+     m_vkd->vkResetDescriptorPool(
+       m_vkd->device(), m_pool, 0);

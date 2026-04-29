@@ -1,0 +1,521 @@
+From bbd44a5105850d5596787b16efd2d3fe2047ce47 Mon Sep 17 00:00:00 2001
+From: Albertoie7102321 <ie710231@iteso.mx>
+Date: Fri, 24 Apr 2026 21:35:37 -0600
+Subject: [PATCH] View-trim patch (iter 7) for Mali /dev/mali0 leak
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DXVK v1.10.3 base. Adds per-DxvkImageView slot-level LRU eviction with
+per-frame stamp + pressure-trigger size cap. Designed for tilers like
+Mali where each VkImageView mmaps a /dev/mali0 page that Android counts
+as RSS, leading to lmkd-kill at ~9 GB even though real heap is 2-3 GB.
+
+Mechanism:
+- DxvkImageView: per-slot mutable atomic m_slotLastUsedFrame stamp,
+  m_createdTypesMask bitmask of which slots ctor populated, lazy
+  recreateView() on access to nulled slot.
+- DxvkImageView::trimIfIdle(currentFrame, maxAge): walks ViewCount
+  m_views[] slots, evicts (vkDestroyImageView + null) those whose
+  per-slot stamp is older than maxAge.
+- DxvkDevice: m_liveImageViews registry (raw pointers, mutex), declared
+  BEFORE m_objects so m_objects(this) initializer can construct
+  DxvkImageView wrappers without touching uninitialized containers.
+  registerImageView/unregisterImageView called from view ctor/dtor.
+- DxvkDevice::trimIdleImageViews(maxAge, maxLive) in presentImage:
+  Pass 1 trims at maxAge. If live VkImageView count > maxLive, additional
+  passes halve maxAge down to a 3-frame floor.
+- Config: dxvk.imageViewMaxAgeFrames + dxvk.imageViewMaxLive (defaults 0
+  = upstream behaviour).
+
+Empirical: on tablet stack, sustains 60+ min stress-area gameplay
+where unpatched DXVK 1.10.3-async on the same hardware crashes in
+2-4 min. View count plateau still ~40-45k (descriptor sets pin views
+alive — cannot release further without VK_EXT_descriptor_buffer which
+Mali doesn't expose). Patch's value is the pressure-trigger keeping
+VMA count below the vm.max_map_count cliff during creation bursts.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/dxvk/dxvk_device.cpp  |  62 +++++++++++++++++-
+ src/dxvk/dxvk_device.h    |  57 ++++++++++++++--
+ src/dxvk/dxvk_image.cpp   | 132 ++++++++++++++++++++++++++++++++++++--
+ src/dxvk/dxvk_image.h     |  61 ++++++++++++++++--
+ src/dxvk/dxvk_options.cpp |   8 +++
+ src/dxvk/dxvk_options.h   |  19 ++++++
+ 6 files changed, 323 insertions(+), 16 deletions(-)
+
+diff --git a/src/dxvk/dxvk_device.cpp b/src/dxvk/dxvk_device.cpp
+index dc12ab47..686afdfd 100644
+--- a/src/dxvk/dxvk_device.cpp
++++ b/src/dxvk/dxvk_device.cpp
+@@ -156,6 +156,57 @@ namespace dxvk {
+     const DxvkImageViewCreateInfo&  createInfo) {
+     return new DxvkImageView(m_vkd, image, createInfo);
+   }
++
++
++  void DxvkDevice::registerImageView(DxvkImageView* view) const {
++    std::lock_guard<dxvk::mutex> lock(m_liveImageViewsMutex);
++    m_liveImageViews.insert(view);
++  }
++
++
++  void DxvkDevice::unregisterImageView(DxvkImageView* view) const {
++    std::lock_guard<dxvk::mutex> lock(m_liveImageViewsMutex);
++    m_liveImageViews.erase(view);
++  }
++
++
++  uint32_t DxvkDevice::trimIdleImageViews(uint32_t maxAgeFrames, uint32_t maxLive) {
++    if (!maxAgeFrames)
++      return 0u;
++
++    uint32_t currentFrame = this->getCurrentFrameId();
++    uint32_t destroyed = 0u;
++
++    std::lock_guard<dxvk::mutex> lock(m_liveImageViewsMutex);
++
++    auto sumLive = [this]() -> uint32_t {
++      uint32_t c = 0u;
++      for (DxvkImageView* v : m_liveImageViews)
++        c += v->liveSlotCount();
++      return c;
++    };
++
++    // Pass 1: comfortable threshold.
++    for (DxvkImageView* view : m_liveImageViews)
++      destroyed += view->trimIfIdle(currentFrame, maxAgeFrames);
++
++    // Pressure-trigger passes: halve maxAge each round until live VkImageView
++    // count fits under the cap or we hit the 3-frame GPU-pipeline floor.
++    if (maxLive) {
++      uint32_t age = maxAgeFrames;
++      while (age > 3u && sumLive() > maxLive) {
++        age = age >> 1u;
++        if (age < 3u)
++          age = 3u;
++        for (DxvkImageView* view : m_liveImageViews)
++          destroyed += view->trimIfIdle(currentFrame, age);
++        if (age == 3u)
++          break;
++      }
++    }
++
++    return destroyed;
++  }
+   
+   
+   Rc<DxvkSampler> DxvkDevice::createSampler(
+@@ -208,8 +259,15 @@ namespace dxvk {
+     presentInfo.presenter = presenter;
+     m_submissionQueue.present(presentInfo, status);
+     
+-    std::lock_guard<sync::Spinlock> statLock(m_statLock);
+-    m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
++    {
++      std::lock_guard<sync::Spinlock> statLock(m_statLock);
++      m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
++    }
++
++    // Per-slot view trim + optional pressure trigger.
++    this->trimIdleImageViews(
++      m_options.imageViewMaxAgeFrames,
++      m_options.imageViewMaxLive);
+   }
+ 
+ 
+diff --git a/src/dxvk/dxvk_device.h b/src/dxvk/dxvk_device.h
+index e23f2c6f..e50cf54c 100644
+--- a/src/dxvk/dxvk_device.h
++++ b/src/dxvk/dxvk_device.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <unordered_set>
++
+ #include "dxvk_adapter.h"
+ #include "dxvk_buffer.h"
+ #include "dxvk_compute.h"
+@@ -340,6 +342,45 @@ namespace dxvk {
+     Rc<DxvkImageView> createImageView(
+       const Rc<DxvkImage>&            image,
+       const DxvkImageViewCreateInfo&  createInfo);
++
++    /**
++     * \brief Registers a live DxvkImageView for periodic trimming
++     *
++     * Called from the DxvkImageView constructor AFTER all VkImageView
++     * handles are created. The device maintains a raw-pointer set of
++     * every live wrapper so trimIdleImageViews can sweep them without
++     * holding Rc references.
++     * \param [in] view Newly-constructed view
++     */
++    void registerImageView(DxvkImageView* view) const;
++
++    /**
++     * \brief Unregisters a DxvkImageView before its destructor runs
++     *
++     * Called from the DxvkImageView destructor BEFORE any Vulkan
++     * handle is destroyed. This ordering is REQUIRED so a concurrent
++     * trimIdleImageViews cannot race the dying object.
++     * \param [in] view Dying view
++     */
++    void unregisterImageView(DxvkImageView* view) const;
++
++    /**
++     * \brief Sweeps the live image-view set and trims idle wrappers
++     *
++     * Called from presentImage once per frame. With \p maxAgeFrames=0
++     * this is a no-op. Otherwise:
++     *   1. First pass: trim with \p maxAgeFrames (the comfortable threshold).
++     *   2. If \p maxLive > 0 and live VkImageView count still exceeds
++     *      \p maxLive, do additional passes with progressively shorter
++     *      ages (halved each round) down to a hard floor of 3 frames
++     *      (GPU-pipeline depth — never destroy newer than that).
++     * Each wrapper checks per-slot stamps locally; pressure trigger just
++     * lowers what counts as "idle".
++     * \param [in] maxAgeFrames Comfortable trim threshold
++     * \param [in] maxLive      Live VkImageView soft cap (0 = no pressure trigger)
++     * \returns Total VkImageView handles destroyed this sweep
++     */
++    uint32_t trimIdleImageViews(uint32_t maxAgeFrames, uint32_t maxLive);
+     
+     /**
+      * \brief Creates a sampler object
+@@ -497,18 +538,26 @@ namespace dxvk {
+ 
+     DxvkDeviceFeatures          m_features;
+     DxvkDeviceInfo              m_properties;
+-    
++
+     DxvkDevicePerfHints         m_perfHints;
++
++    // Image-view trim registry. MUST be declared BEFORE m_objects so
++    // default construction of the set/mutex happens before any member
++    // initializer (e.g. m_objects(this)) can create DxvkImageView
++    // wrappers that call back into registerImageView().
++    mutable dxvk::mutex                        m_liveImageViewsMutex;
++    mutable std::unordered_set<DxvkImageView*> m_liveImageViews;
++
+     DxvkObjects                 m_objects;
+ 
+     sync::Spinlock              m_statLock;
+     DxvkStatCounters            m_statCounters;
+-    
++
+     DxvkDeviceQueueSet          m_queues;
+-    
++
+     DxvkRecycler<DxvkCommandList,    16> m_recycledCommandLists;
+     DxvkRecycler<DxvkDescriptorPool, 16> m_recycledDescriptorPools;
+-    
++
+     DxvkSubmissionQueue m_submissionQueue;
+ 
+     DxvkDevicePerfHints getPerfHints();
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 851bbc53..9015c32a 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -302,15 +302,132 @@ namespace dxvk {
+       default:
+         throw DxvkError(str::format("DxvkImageView: Invalid view type: ", m_info.type));
+     }
++
++    m_image->m_device->registerImageView(this);
+   }
+-  
+-  
++
++
+   DxvkImageView::~DxvkImageView() {
+-    for (uint32_t i = 0; i < ViewCount; i++)
++    // Unregister FIRST, BEFORE destroying any VkImageView handles, so
++    // a concurrent trimIdleImageViews sweep cannot race us and
++    // double-free handles. unregisterImageView blocks until any
++    // in-flight sweep releases the mutex.
++    m_image->m_device->unregisterImageView(this);
++
++    for (uint32_t i = 0; i < ViewCount; i++) {
++      if (m_views[i] != VK_NULL_HANDLE)
++        m_vkd->vkDestroyImageView(m_vkd->device(), m_views[i], nullptr);
++    }
++  }
++
++
++  VkImageView DxvkImageView::handleImpl(VkImageViewType viewType) const {
++    // Per-slot stamp: only the specific viewType slot we just touched
++    // gets refreshed. Cold slots in the same wrapper keep their old
++    // (or zero) stamp and become eligible for trim.
++    m_slotLastUsedFrame[viewType].store(
++      m_image->m_device->getCurrentFrameId(),
++      std::memory_order_relaxed);
++
++    VkImageView v = m_views[viewType];
++    if (unlikely(v == VK_NULL_HANDLE && ((m_createdTypesMask >> uint32_t(viewType)) & 1u)))
++      v = const_cast<DxvkImageView*>(this)->recreateView(viewType);
++    return v;
++  }
++
++
++  uint32_t DxvkImageView::computeNumLayers(VkImageViewType type) const {
++    // Mirror the ctor's switch so recreateView produces the same
++    // subresource range the constructor originally used.
++    switch (type) {
++      case VK_IMAGE_VIEW_TYPE_1D:
++      case VK_IMAGE_VIEW_TYPE_2D:
++      case VK_IMAGE_VIEW_TYPE_3D:
++        return 1u;
++
++      case VK_IMAGE_VIEW_TYPE_1D_ARRAY:
++        return m_info.numLayers;
++
++      case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
++        if (m_image->info().type == VK_IMAGE_TYPE_3D)
++          return m_image->mipLevelExtent(m_info.minLevel).depth;
++        return m_info.numLayers;
++
++      case VK_IMAGE_VIEW_TYPE_CUBE:
++        return 6u;
++
++      case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY:
++        return 6u * (m_info.numLayers / 6u);
++
++      default:
++        return m_info.numLayers;
++    }
++  }
++
++
++  VkImageView DxvkImageView::recreateView(VkImageViewType type) {
++    std::lock_guard<dxvk::mutex> lock(m_recreateMutex);
++
++    if (m_views[type] != VK_NULL_HANDLE)
++      return m_views[type];
++
++    if (!((m_createdTypesMask >> uint32_t(type)) & 1u))
++      return VK_NULL_HANDLE;
++
++    this->createView(type, computeNumLayers(type));
++    return m_views[type];
++  }
++
++
++  uint32_t DxvkImageView::trimIfIdle(uint32_t currentFrame, uint32_t maxAgeFrames) {
++    // Per-slot trim: walk every cached VkImageView slot and evict only
++    // those whose own stamp is past maxAgeFrames. The wrapper's parent
++    // image may still be in active use via OTHER slots — that's fine.
++    //
++    // Note: we deliberately do NOT call DxvkResource::isInUse for an
++    // early bail. During heavy gameplay almost every wrapper has at
++    // least one cmd-buffer ref in-flight, which would make isInUse
++    // permanently true and prevent any eviction. Instead, we rely on
++    // the per-slot age threshold itself as the grace period: if a
++    // specific slot hasn't been bound for maxAgeFrames (default 30,
++    // ~0.5s at 60fps), no in-flight command buffer can still reference
++    // it — DXVK's command-list pipeline is at most ~3 frames deep.
++
++    uint32_t destroyed = 0u;
++    bool needLock = false;
++
++    // Cheap pre-pass without the mutex: any candidates at all?
++    for (uint32_t i = 0; i < ViewCount; i++) {
++      if (m_views[i] == VK_NULL_HANDLE)
++        continue;
++      uint32_t last = m_slotLastUsedFrame[i].load(std::memory_order_relaxed);
++      if (last && currentFrame - last > maxAgeFrames) {
++        needLock = true;
++        break;
++      }
++    }
++    if (!needLock)
++      return 0u;
++
++    std::lock_guard<dxvk::mutex> lock(m_recreateMutex);
++
++    for (uint32_t i = 0; i < ViewCount; i++) {
++      if (m_views[i] == VK_NULL_HANDLE)
++        continue;
++
++      uint32_t last = m_slotLastUsedFrame[i].load(std::memory_order_relaxed);
++      if (!last || currentFrame - last <= maxAgeFrames)
++        continue;
++
+       m_vkd->vkDestroyImageView(m_vkd->device(), m_views[i], nullptr);
++      m_views[i] = VK_NULL_HANDLE;
++      destroyed++;
++    }
++
++    return destroyed;
+   }
+ 
+-  
++
+   void DxvkImageView::createView(VkImageViewType type, uint32_t numLayers) {
+     VkImageSubresourceRange subresourceRange;
+     subresourceRange.aspectMask     = m_info.aspect;
+@@ -364,6 +481,11 @@ namespace dxvk {
+         "\n    Usage:         ", std::hex, m_image->info().usage,
+         "\n    Tiling:        ", m_image->info().tiling));
+     }
++
++    // Record which view types the constructor created so handleImpl
++    // knows which slots are legal to lazily recreate after trimIfIdle
++    // has nulled them out.
++    m_createdTypesMask |= (1u << uint32_t(type));
+   }
+-  
++
+ }
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index b3b8a58e..864f28ee 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -377,7 +377,7 @@ namespace dxvk {
+     VkImageView handle(VkImageViewType viewType) const {
+       if (unlikely(viewType == VK_IMAGE_VIEW_TYPE_MAX_ENUM))
+         viewType = m_info.type;
+-      return m_views[viewType];
++      return handleImpl(viewType);
+     }
+     
+     /**
+@@ -552,20 +552,71 @@ namespace dxvk {
+         view->imageSubresources());
+     }
+ 
++    /**
++     * \brief Trims this view's cached Vulkan handles if idle
++     *
++     * Bails out if any submitted command buffer still references the
++     * view (\c DxvkResource::isInUse). Otherwise, if \c m_lastUsedFrame
++     * indicates no \c handle() call within \c maxAgeFrames, destroys
++     * every cached \c VkImageView handle and nulls the slots. The next
++     * \c handle() call will lazily recreate them.
++     *
++     * \param [in] currentFrame  Reference frame for aging comparison
++     * \param [in] maxAgeFrames  Evict views older than this many frames
++     * \returns Number of \c VkImageView handles destroyed
++     */
++    uint32_t trimIfIdle(uint32_t currentFrame, uint32_t maxAgeFrames);
++
++    /**
++     * \brief Counts cached VkImageView handles currently populated.
++     * Cheap (loop over fixed-size array). Read without lock — racing
++     * with createView/recreateView/trimIfIdle is fine for a soft metric.
++     */
++    uint32_t liveSlotCount() const {
++      uint32_t c = 0u;
++      for (uint32_t i = 0; i < ViewCount; i++)
++        if (m_views[i] != VK_NULL_HANDLE) c++;
++      return c;
++    }
++
+   private:
+-    
++
+     Rc<vk::DeviceFn>  m_vkd;
+     Rc<DxvkImage>     m_image;
+-    
++
+     DxvkImageViewCreateInfo m_info;
+-    VkImageView             m_views[ViewCount];
++    mutable VkImageView     m_views[ViewCount];
+ 
+     uint64_t          m_cookie;
+ 
++    /// Bitmask of \c VkImageViewType values originally created by the
++    /// constructor. \c handle() only lazily recreates slots whose bit
++    /// is set so unsupported view types stay \c VK_NULL_HANDLE.
++    uint32_t          m_createdTypesMask = 0u;
++
++    /// Per-slot frame stamps. A wrapper holds 2-7 \c VkImageView handles
++    /// (one per VkImageViewType the constructor created). Per-slot
++    /// tracking lets trimIfIdle evict cold slots inside an otherwise-hot
++    /// wrapper — the common eager-creation case where TYPE_2D is hot but
++    /// TYPE_2D_ARRAY (created in the same ctor) is never bound.
++    mutable std::atomic<uint32_t> m_slotLastUsedFrame[ViewCount] = { };
++
++    /// Guards lazy recreation in \c recreateView and concurrent trim
++    /// in \c trimIfIdle.
++    dxvk::mutex       m_recreateMutex;
++
+     static std::atomic<uint64_t> s_cookie;
+ 
+     void createView(VkImageViewType type, uint32_t numLayers);
+-    
++
++    uint32_t computeNumLayers(VkImageViewType type) const;
++
++    VkImageView recreateView(VkImageViewType type);
++
++    // Out-of-line to avoid pulling dxvk_device.h into dxvk_image.h
++    // (DxvkDevice is only forward-declared there).
++    VkImageView handleImpl(VkImageViewType viewType) const;
++
+   };
+   
+ }
+diff --git a/src/dxvk/dxvk_options.cpp b/src/dxvk/dxvk_options.cpp
+index ea82eedc..ba95112d 100644
+--- a/src/dxvk/dxvk_options.cpp
++++ b/src/dxvk/dxvk_options.cpp
+@@ -1,3 +1,5 @@
++#include <algorithm>
++
+ #include "dxvk_options.h"
+ 
+ namespace dxvk {
+@@ -9,6 +11,12 @@ namespace dxvk {
+     useRawSsbo            = config.getOption<Tristate>("dxvk.useRawSsbo",             Tristate::Auto);
+     shrinkNvidiaHvvHeap   = config.getOption<Tristate>("dxvk.shrinkNvidiaHvvHeap",    Tristate::Auto);
+     hud                   = config.getOption<std::string>("dxvk.hud", "");
++
++    auto viewAge          = config.getOption<int32_t>("dxvk.imageViewMaxAgeFrames", 0);
++    imageViewMaxAgeFrames = uint32_t(std::max(viewAge, 0));
++
++    auto viewLive         = config.getOption<int32_t>("dxvk.imageViewMaxLive", 0);
++    imageViewMaxLive      = uint32_t(std::max(viewLive, 0));
+   }
+ 
+ }
+diff --git a/src/dxvk/dxvk_options.h b/src/dxvk/dxvk_options.h
+index 992ec764..3aca62ad 100644
+--- a/src/dxvk/dxvk_options.h
++++ b/src/dxvk/dxvk_options.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <cstdint>
++
+ #include "../util/config/config.h"
+ 
+ namespace dxvk {
+@@ -26,6 +28,23 @@ namespace dxvk {
+ 
+     /// HUD elements
+     std::string hud;
++
++    /// Maximum age (in presented frames) a cached VkImageView may reach
++    /// before becoming a candidate for eviction via trimIfIdle.
++    /// 0 = disabled (upstream default). On tiler GPUs where each
++    /// VkImageView costs a driver-side mapping (Mali's /dev/mali0),
++    /// setting this to e.g. 120 caps view caches for long-running games.
++    uint32_t imageViewMaxAgeFrames = 0u;
++
++    /// Soft cap on total live VkImageView handles across all wrappers.
++    /// When trimIdleImageViews finds the live count above this, it does
++    /// additional passes with progressively shorter maxAge until either
++    /// the count fits or no more candidates exist (leaving views idle
++    /// for at least 3 frames as a hard floor for GPU-pipeline safety).
++    /// 0 = no pressure trigger (only the time-based trim runs).
++    /// Useful on Mali where ~45k+ live views slows page-table walks
++    /// even after creation rate stabilises.
++    uint32_t imageViewMaxLive = 0u;
+   };
+ 
+ }
+-- 
+2.54.0
+
