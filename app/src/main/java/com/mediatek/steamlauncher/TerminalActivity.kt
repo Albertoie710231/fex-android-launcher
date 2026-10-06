@@ -578,111 +578,8 @@ class TerminalActivity : AppCompatActivity() {
         // dropped the wiring; game files + Steamless products survived.
         // Per state_ds3.md: AppId 374320, USE_CPU_BCN=all required (else
         // white-screen on Mali), FORCE_OPTIMIZATION_BARRIERS + COMPOSITE.
-        findViewById<Button>(R.id.btnLaunchDS3).setOnClickListener {
-            appendOutput("=== wine DarkSoulsIII.exe (native Bionic) ===\n")
-            // DXVK pipeline-state cache fragility on this stack: any abnormal
-            // termination (wassert kill, force-stop, hang) leaves a partial
-            // last entry. Replay reads garbage, the 5 compiler threads NULL-
-            // deref, and subsequent runs hit a c0000005 storm at startup
-            // without ever reaching device-ready state. Wipe before each
-            // launch — cheap, costs ~30s of recompile on first frames.
-            val ds3DxvkCache = java.io.File(
-                filesDir,
-                "imagefs_bionic/home/xuser/.cache/DarkSoulsIII.dxvk-cache",
-            )
-            if (ds3DxvkCache.exists()) {
-                val sz = ds3DxvkCache.length()
-                ds3DxvkCache.delete()
-                appendOutput("[DS3 dxvk-cache wiped (${sz} bytes)]\n")
-            }
-            if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
-                xConnectorX11 = XConnectorX11Server(this).apply {
-                    val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
-                    if (start(socketRoot)) {
-                        handler.post { appendOutput("[XConnector X11 listening on ${socketPath()}]\n") }
-                        try {
-                            val container = vulkanSurface.parent as android.widget.FrameLayout
-                            val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
-                            xServer.setRenderer(xsv.renderer)
-                            runOnUiThread {
-                                vulkanSurface.visibility = android.view.View.GONE
-                                container.addView(xsv)
-                                xServerView = xsv
-                                wireXServerViewInput(xsv)
-                            }
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "XServerView attach failed", t)
-                        }
-                    } else {
-                        handler.post { appendOutput("[XConnector X11 start failed]\n") }
-                    }
-                }
-            }
-            reconfigureColdClient(
-                appId = "374320",
-                exePath = "steamapps\\common\\DARK SOULS III\\Game\\DarkSoulsIII.exe",
-                exeRunDir = "steamapps\\common\\DARK SOULS III\\Game",
-            )
-
-            val pipeline = NativeWinePipeline(this)
-            val gameWindowsPath =
-                "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
-            scope.launch {
-                val ds3HostExe = java.io.File(
-                    filesDir,
-                    "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe",
-                ).absolutePath
-                val ds3GuestExe =
-                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\DARK SOULS III\\Game\\DarkSoulsIII.exe"
-                val unpackedGuestExe = pipeline.unpackWithSteamless(
-                    guestExePath = ds3GuestExe,
-                    hostExeAbs = ds3HostExe,
-                    useProton9 = true,
-                )
-                if (unpackedGuestExe != ds3GuestExe) {
-                    val hostUnpacked = java.io.File("$ds3HostExe.unpacked.exe")
-                    val hostBackup = java.io.File("$ds3HostExe.steamstub")
-                    if (hostUnpacked.exists()) {
-                        if (!hostBackup.exists()) {
-                            java.io.File(ds3HostExe).copyTo(hostBackup, overwrite = false)
-                        }
-                        hostUnpacked.copyTo(java.io.File(ds3HostExe), overwrite = true)
-                        handler.post { appendOutput("[Steamless: swapped DarkSoulsIII.exe with unpacked]\n") }
-                    }
-                } else {
-                    handler.post { appendOutput("[Steamless: no unpacking happened, using original DarkSoulsIII.exe]\n") }
-                }
-
-                val r = pipeline.wineRun(
-                    args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
-                    timeoutMs = 600_000,
-                    extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
-                        "WINEDLLOVERRIDES" to
-                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
-                            "xaudio2_7=b;xapofx1_5=b;" +
-                            "steam_api64=n;" +
-                            "steamclient=n;steamclient64=n",
-                        "DISPLAY" to ":0",
-                        "USE_CPU_BCN" to "all",
-                        "FORCE_OPTIMIZATION_BARRIERS" to "1",
-                        "FORCE_SPEC_COMPOSITE_CONSTANTS" to "1",
-                    ),
-                    useProton9 = true,
-                )
-                try {
-                    java.io.File(filesDir, "ds3_stdout.log").writeText(r.stdout)
-                    java.io.File(filesDir, "ds3_stderr.log").writeText(r.stderr)
-                } catch (_: Throwable) {}
-                handler.post {
-                    appendOutput("ds3 exit=${r.exitCode}\n")
-                    appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
-                    appendOutput("full logs: files/ds3_stdout.log, files/ds3_stderr.log\n")
-                    if (r.exitCode == -99) appendOutput("[ds3 still running at timeout]\n")
-                    appendOutput("===========================================\n")
-                }
-            }
-        }
+        findViewById<Button>(R.id.btnLaunchDS3).setOnClickListener { launchDs3Native(usePanvk = false) }
+        findViewById<Button>(R.id.btnLaunchDS3Panvk).setOnClickListener { launchDs3Native(usePanvk = true) }
 
         // Quick test: run Wine notepad (needs X11 for windowing)
         findViewById<Button>(R.id.btnNotepad).setOnClickListener {
@@ -1556,6 +1453,118 @@ class TerminalActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_RIGHT_BRACKET -> K.KEY_BRACKET_RIGHT
             KeyEvent.KEYCODE_BACKSLASH -> K.KEY_BACKSLASH
             else -> null
+        }
+    }
+
+    private fun launchDs3Native(usePanvk: Boolean) {
+        appendOutput("=== wine DarkSoulsIII.exe (native Bionic${if (usePanvk) ", PanVK" else ""}) ===\n")
+        // DXVK pipeline-state cache fragility on this stack: any abnormal
+        // termination (wassert kill, force-stop, hang) leaves a partial
+        // last entry. Replay reads garbage, the 5 compiler threads NULL-
+        // deref, and subsequent runs hit a c0000005 storm at startup
+        // without ever reaching device-ready state. Wipe before each
+        // launch — cheap, costs ~30s of recompile on first frames.
+        val ds3DxvkCache = java.io.File(
+            filesDir,
+            "imagefs_bionic/home/xuser/.cache/DarkSoulsIII.dxvk-cache",
+        )
+        if (ds3DxvkCache.exists()) {
+            val sz = ds3DxvkCache.length()
+            ds3DxvkCache.delete()
+            appendOutput("[DS3 dxvk-cache wiped (${sz} bytes)]\n")
+        }
+        if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
+            xConnectorX11 = XConnectorX11Server(this).apply {
+                val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
+                if (start(socketRoot)) {
+                    handler.post { appendOutput("[XConnector X11 listening on ${socketPath()}]\n") }
+                    try {
+                        val container = vulkanSurface.parent as android.widget.FrameLayout
+                        val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
+                        xServer.setRenderer(xsv.renderer)
+                        runOnUiThread {
+                            vulkanSurface.visibility = android.view.View.GONE
+                            container.addView(xsv)
+                            xServerView = xsv
+                            wireXServerViewInput(xsv)
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "XServerView attach failed", t)
+                    }
+                } else {
+                    handler.post { appendOutput("[XConnector X11 start failed]\n") }
+                }
+            }
+        }
+        reconfigureColdClient(
+            appId = "374320",
+            exePath = "steamapps\\common\\DARK SOULS III\\Game\\DarkSoulsIII.exe",
+            exeRunDir = "steamapps\\common\\DARK SOULS III\\Game",
+        )
+
+        val pipeline = NativeWinePipeline(this)
+        val gameWindowsPath =
+            "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
+        scope.launch {
+            val ds3HostExe = java.io.File(
+                filesDir,
+                "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe",
+            ).absolutePath
+            val ds3GuestExe =
+                "C:\\Program Files (x86)\\Steam\\steamapps\\common\\DARK SOULS III\\Game\\DarkSoulsIII.exe"
+            val unpackedGuestExe = pipeline.unpackWithSteamless(
+                guestExePath = ds3GuestExe,
+                hostExeAbs = ds3HostExe,
+                useProton9 = true,
+            )
+            if (unpackedGuestExe != ds3GuestExe) {
+                val hostUnpacked = java.io.File("$ds3HostExe.unpacked.exe")
+                val hostBackup = java.io.File("$ds3HostExe.steamstub")
+                if (hostUnpacked.exists()) {
+                    if (!hostBackup.exists()) {
+                        java.io.File(ds3HostExe).copyTo(hostBackup, overwrite = false)
+                    }
+                    hostUnpacked.copyTo(java.io.File(ds3HostExe), overwrite = true)
+                    handler.post { appendOutput("[Steamless: swapped DarkSoulsIII.exe with unpacked]\n") }
+                }
+            } else {
+                handler.post { appendOutput("[Steamless: no unpacking happened, using original DarkSoulsIII.exe]\n") }
+            }
+
+            val r = pipeline.wineRun(
+                args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
+                timeoutMs = 600_000,
+                extraEnv = mapOf(
+                    "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
+                    "WINEDLLOVERRIDES" to
+                        "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
+                        "xaudio2_7=b;xapofx1_5=b;" +
+                        "steam_api64=n;" +
+                        "steamclient=n;steamclient64=n",
+                    "DISPLAY" to ":0",
+                    "DXVK_HUD" to "fps,frametimes,gpuload,memory",
+                ) + (
+                    // leegao wrapper only; PanVK decodes BCn natively.
+                    if (usePanvk) emptyMap() else mapOf(
+                        "USE_CPU_BCN" to "all",
+                        "FORCE_OPTIMIZATION_BARRIERS" to "1",
+                        "FORCE_SPEC_COMPOSITE_CONSTANTS" to "1",
+                    )
+                ),
+                useProton9 = true,
+                usePanvk = usePanvk,
+            )
+            try {
+                java.io.File(filesDir, "ds3_stdout.log").writeText(r.stdout)
+                java.io.File(filesDir, "ds3_stderr.log").writeText(r.stderr)
+            } catch (_: Throwable) {}
+            handler.post {
+                appendOutput("ds3 exit=${r.exitCode}\n")
+                appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
+                appendOutput("full logs: files/ds3_stdout.log, files/ds3_stderr.log\n")
+                if (r.exitCode == -99) appendOutput("[ds3 still running at timeout]\n")
+                appendOutput("===========================================\n")
+            }
         }
     }
 
