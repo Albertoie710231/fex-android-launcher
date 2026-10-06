@@ -52,6 +52,7 @@ class TerminalActivity : AppCompatActivity() {
     private var x11Server: X11Server? = null
     private var darksideX11: DarksideX11Server? = null
     private var xConnectorX11: XConnectorX11Server? = null
+    private val gamepadBridge by lazy { GamepadBridge(filesDir) }
     private var xServerView: com.winlator.widget.XServerView? = null
     private var framebufferBridge: FramebufferBridge? = null
     private var isDisplayMode = false
@@ -569,106 +570,8 @@ class TerminalActivity : AppCompatActivity() {
         // second game on this pipeline. DRM side: ColdClient Steam emulator
         // bypasses Steam entirely, which means EAC never initializes either
         // (EAC hooks through Steam's runtime; no Steam = no EAC).
-        findViewById<Button>(R.id.btnLaunchSekiroN).setOnClickListener {
-            appendOutput("=== wine sekiro.exe (native Bionic) ===\n")
-            if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
-                xConnectorX11 = XConnectorX11Server(this).apply {
-                    val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
-                    if (start(socketRoot)) {
-                        handler.post { appendOutput("[XConnector X11 listening on ${socketPath()}]\n") }
-                        try {
-                            val container = vulkanSurface.parent as android.widget.FrameLayout
-                            val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
-                            xServer.setRenderer(xsv.renderer)
-                            runOnUiThread {
-                                vulkanSurface.visibility = android.view.View.GONE
-                                container.addView(xsv)
-                                xServerView = xsv
-                                wireXServerViewInput(xsv)
-                            }
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "XServerView attach failed", t)
-                        }
-                    } else {
-                        handler.post { appendOutput("[XConnector X11 start failed]\n") }
-                    }
-                }
-            }
-            reconfigureColdClient(
-                appId = "814380",
-                exePath = "steamapps\\common\\Sekiro\\sekiro.exe",
-                exeRunDir = "steamapps\\common\\Sekiro",
-            )
-
-            val pipeline = NativeWinePipeline(this)
-            val gameWindowsPath =
-                "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
-            scope.launch {
-                // Strip SteamStub DRM from sekiro.exe before launch. Matches
-                // what GameNative does on game import. Without this,
-                // ColdClient + steam_api64 stubs don't satisfy the SteamStub
-                // wrapper's own auth check (seen: "Application load error
-                // 3:0000065432" dialog). Steamless produces
-                // `sekiro.exe.unpacked.exe` which is DRM-free.
-                val sekiroHostExe = java.io.File(
-                    filesDir,
-                    "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Sekiro/sekiro.exe",
-                ).absolutePath
-                val sekiroGuestExe =
-                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sekiro\\sekiro.exe"
-                val unpackedGuestExe = pipeline.unpackWithSteamless(
-                    guestExePath = sekiroGuestExe,
-                    hostExeAbs = sekiroHostExe,
-                    useProton9 = true,
-                )
-                if (unpackedGuestExe != sekiroGuestExe) {
-                    // Replace sekiro.exe with the unpacked version so the
-                    // ColdClient loader (which is configured to launch
-                    // sekiro.exe) runs the DRM-free build. Back up original.
-                    val hostUnpacked = java.io.File("$sekiroHostExe.unpacked.exe")
-                    val hostBackup = java.io.File("$sekiroHostExe.steamstub")
-                    if (hostUnpacked.exists()) {
-                        if (!hostBackup.exists()) {
-                            java.io.File(sekiroHostExe).copyTo(hostBackup, overwrite = false)
-                        }
-                        hostUnpacked.copyTo(java.io.File(sekiroHostExe), overwrite = true)
-                        handler.post { appendOutput("[Steamless: swapped sekiro.exe with unpacked]\n") }
-                    }
-                } else {
-                    handler.post { appendOutput("[Steamless: no unpacking happened, using original sekiro.exe]\n") }
-                }
-
-                val r = pipeline.wineRun(
-                    args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
-                    timeoutMs = 300_000,
-                    extraEnv = mapOf(
-                        "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
-                        // Sekiro-specific overrides: drop Galaxy64 (Sekiro is
-                        // Steam-only, no GOG). Keep DXVK on n, steam_api64 stub.
-                        // GFSDK_SSAO isn't an NVIDIA-only SSAO in Sekiro's case;
-                        // start conservative and iterate if it fails.
-                        "WINEDLLOVERRIDES" to
-                            "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
-                            "xaudio2_7=b;xapofx1_5=b;" +
-                            "steam_api64=n;" +
-                            "steamclient=n;steamclient64=n",
-                        "DISPLAY" to ":0",
-                    ),
-                    useProton9 = true,
-                )
-                try {
-                    java.io.File(filesDir, "sekiro_stdout.log").writeText(r.stdout)
-                    java.io.File(filesDir, "sekiro_stderr.log").writeText(r.stderr)
-                } catch (_: Throwable) {}
-                handler.post {
-                    appendOutput("sekiro exit=${r.exitCode}\n")
-                    appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
-                    appendOutput("full logs: files/sekiro_stdout.log, files/sekiro_stderr.log\n")
-                    if (r.exitCode == -99) appendOutput("[sekiro still running at timeout]\n")
-                    appendOutput("===========================================\n")
-                }
-            }
-        }
+        findViewById<Button>(R.id.btnLaunchSekiroN).setOnClickListener { launchSekiroNative(usePanvk = false) }
+        findViewById<Button>(R.id.btnLaunchSekiroPanvk).setOnClickListener { launchSekiroNative(usePanvk = true) }
 
         // Launch DS3 through the same native-Bionic ColdClient pipeline
         // as Sekiro N. Restored after a tree-restoration during RE4 work
@@ -1528,10 +1431,15 @@ class TerminalActivity : AppCompatActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // Forward mapped keys to the X11 server while a game is running.
         // Skip when the command EditText has focus (so the diagnostic
-        // prompt still works). Back/volume/menu keep their Android meaning.
+        // prompt still works). Volume/menu keep their Android meaning. Back
+        // goes to the game as Escape: a gamepad's B button sends Back, and
+        // letting it through finishes this activity and kills the game.
         val srv = xConnectorX11
         if (srv != null && srv.isRunning() && !etCommand.isFocused) {
-            val xkc = androidKeyToXKeycode(event.keyCode) ?: return super.dispatchKeyEvent(event)
+            if (gamepadBridge.handleKey(event)) return true
+            val xkc = (if (event.keyCode == KeyEvent.KEYCODE_BACK) K.KEY_ESC
+                       else androidKeyToXKeycode(event.keyCode))
+                ?: return super.dispatchKeyEvent(event)
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> {
                     Log.i(TAG, "key DOWN kc=${event.keyCode} -> X11 ${xkc.name}")
@@ -1543,6 +1451,12 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val srv = xConnectorX11
+        if (srv != null && srv.isRunning() && gamepadBridge.handleMotion(event)) return true
+        return super.dispatchGenericMotionEvent(event)
     }
 
     /** Wire touchscreen-as-mouse input on the XServerView (the GL surface
@@ -1642,6 +1556,112 @@ class TerminalActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_RIGHT_BRACKET -> K.KEY_BRACKET_RIGHT
             KeyEvent.KEYCODE_BACKSLASH -> K.KEY_BACKSLASH
             else -> null
+        }
+    }
+
+    private fun launchSekiroNative(usePanvk: Boolean) {
+        appendOutput("=== wine sekiro.exe (native Bionic${if (usePanvk) ", PanVK" else ""}) ===\n")
+        if (xConnectorX11 == null || !xConnectorX11!!.isRunning()) {
+            xConnectorX11 = XConnectorX11Server(this).apply {
+                val socketRoot = "${filesDir.absolutePath}/imagefs_bionic"
+                if (start(socketRoot)) {
+                    handler.post { appendOutput("[XConnector X11 listening on ${socketPath()}]\n") }
+                    try {
+                        val container = vulkanSurface.parent as android.widget.FrameLayout
+                        val xsv = com.winlator.widget.XServerView(this@TerminalActivity, xServer)
+                        xServer.setRenderer(xsv.renderer)
+                        runOnUiThread {
+                            vulkanSurface.visibility = android.view.View.GONE
+                            container.addView(xsv)
+                            xServerView = xsv
+                            wireXServerViewInput(xsv)
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "XServerView attach failed", t)
+                    }
+                } else {
+                    handler.post { appendOutput("[XConnector X11 start failed]\n") }
+                }
+            }
+        }
+        reconfigureColdClient(
+            appId = "814380",
+            exePath = "steamapps\\common\\Sekiro\\sekiro.exe",
+            exeRunDir = "steamapps\\common\\Sekiro",
+        )
+
+        val pipeline = NativeWinePipeline(this)
+        val gameWindowsPath =
+            "C:\\Program Files (x86)\\Steam\\steamclient_loader_x64.exe"
+        scope.launch {
+            // Strip SteamStub DRM from sekiro.exe before launch. Matches
+            // what GameNative does on game import. Without this,
+            // ColdClient + steam_api64 stubs don't satisfy the SteamStub
+            // wrapper's own auth check (seen: "Application load error
+            // 3:0000065432" dialog). Steamless produces
+            // `sekiro.exe.unpacked.exe` which is DRM-free.
+            val sekiroHostExe = java.io.File(
+                filesDir,
+                "proton10/prefix/.wine/drive_c/Program Files (x86)/Steam/steamapps/common/Sekiro/sekiro.exe",
+            ).absolutePath
+            val sekiroGuestExe =
+                "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sekiro\\sekiro.exe"
+            val unpackedGuestExe = pipeline.unpackWithSteamless(
+                guestExePath = sekiroGuestExe,
+                hostExeAbs = sekiroHostExe,
+                useProton9 = true,
+            )
+            if (unpackedGuestExe != sekiroGuestExe) {
+                // Replace sekiro.exe with the unpacked version so the
+                // ColdClient loader (which is configured to launch
+                // sekiro.exe) runs the DRM-free build. Back up original.
+                val hostUnpacked = java.io.File("$sekiroHostExe.unpacked.exe")
+                val hostBackup = java.io.File("$sekiroHostExe.steamstub")
+                if (hostUnpacked.exists()) {
+                    if (!hostBackup.exists()) {
+                        java.io.File(sekiroHostExe).copyTo(hostBackup, overwrite = false)
+                    }
+                    hostUnpacked.copyTo(java.io.File(sekiroHostExe), overwrite = true)
+                    handler.post { appendOutput("[Steamless: swapped sekiro.exe with unpacked]\n") }
+                }
+            } else {
+                handler.post { appendOutput("[Steamless: no unpacking happened, using original sekiro.exe]\n") }
+            }
+
+            val r = pipeline.wineRun(
+                args = listOf("explorer", "/desktop=shell,1920x1080", gameWindowsPath),
+                // wineRun closes the live log at timeout while the game keeps
+                // running, so a short timeout loses the crash. Cover a session.
+                timeoutMs = 4 * 60 * 60 * 1000L,
+                extraEnv = mapOf(
+                    "WINEDEBUG" to "err+all,fixme-all,+seh,+loaddll,+x11drv",
+                    // Sekiro-specific overrides: drop Galaxy64 (Sekiro is
+                    // Steam-only, no GOG). Keep DXVK on n, steam_api64 stub.
+                    // GFSDK_SSAO isn't an NVIDIA-only SSAO in Sekiro's case;
+                    // start conservative and iterate if it fails.
+                    "WINEDLLOVERRIDES" to
+                        "d3d11,d3d10core,d3d9,d3d8,dxgi=n;mscoree,mshtml=;" +
+                        "xaudio2_7=b;xapofx1_5=b;" +
+                        "steam_api64=n;" +
+                        "steamclient=n;steamclient64=n",
+                    "DISPLAY" to ":0",
+                    // On-screen fps / GPU load / DXVK memory for the wrapper vs PanVK A/B.
+                    "DXVK_HUD" to "fps,frametimes,gpuload,memory",
+                ),
+                useProton9 = true,
+                usePanvk = usePanvk,
+            )
+            try {
+                java.io.File(filesDir, "sekiro_stdout.log").writeText(r.stdout)
+                java.io.File(filesDir, "sekiro_stderr.log").writeText(r.stderr)
+            } catch (_: Throwable) {}
+            handler.post {
+                appendOutput("sekiro exit=${r.exitCode}\n")
+                appendOutput("stdout bytes=${r.stdout.length}, stderr bytes=${r.stderr.length}\n")
+                appendOutput("full logs: files/sekiro_stdout.log, files/sekiro_stderr.log\n")
+                if (r.exitCode == -99) appendOutput("[sekiro still running at timeout]\n")
+                appendOutput("===========================================\n")
+            }
         }
     }
 

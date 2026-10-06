@@ -103,10 +103,10 @@ dependencies {
     implementation("com.github.luben:zstd-jni:1.5.5-11")  // Zstd compression support
 
     // JavaSteam — native Steam protocol client for depot downloading
-    implementation("io.github.joshuatam:javasteam:1.8.0-11-SNAPSHOT") {
+    implementation("io.github.joshuatam:javasteam:1.8.0.1-26-SNAPSHOT") {
         isChanging = true
     }
-    implementation("io.github.joshuatam:javasteam-depotdownloader:1.8.0-11-SNAPSHOT") {
+    implementation("io.github.joshuatam:javasteam-depotdownloader:1.8.0.1-26-SNAPSHOT") {
         isChanging = true
     }
     implementation("com.google.protobuf:protobuf-java:4.31.1")

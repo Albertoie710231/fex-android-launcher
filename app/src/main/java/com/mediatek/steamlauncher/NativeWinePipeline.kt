@@ -267,6 +267,23 @@ class NativeWinePipeline(private val context: Context) {
                         src.copyTo(dest, overwrite = true)
                         Log.i(TAG, "Mirrored libvulkan_wrapper.so (${src.length()} bytes) into imagefs_bionic/usr/lib")
                     }
+                    // GN's stock ICD json points at /data/data/com.winlator.cmod/...;
+                    // the bionic linker's dlopen bypasses our path-redirect shims,
+                    // so the loader finds no driver unless the path is ours.
+                    File("$dataDir/imagefs_bionic/usr/share/vulkan/icd.d/wrapper_icd.aarch64.json").apply {
+                        parentFile?.mkdirs()
+                        writeText(
+                            """
+                            {
+                                "ICD": {
+                                    "api_version": "1.3.289",
+                                    "library_path": "${dest.absolutePath}"
+                                },
+                                "file_format_version": "1.0.0"
+                            }
+                            """.trimIndent()
+                        )
+                    }
                 }
             }
             // Pre-create the drive_c skeleton. Wine's wineboot expects
@@ -615,7 +632,9 @@ class NativeWinePipeline(private val context: Context) {
             if (!destDir.exists()) return true  // imagefs_bionic not extracted yet
             val dest = File(destDir, "libevshim.so")
             val bytes = context.assets.open("productize/libevshim.so").use { it.readBytes() }
-            if (dest.exists() && dest.length() == bytes.size.toLong()) return true
+            // Compare content, not size: GN's stock libevshim in a fresh
+            // imagefs has the same size as our patched one.
+            if (dest.exists() && dest.readBytes().contentEquals(bytes)) return true
             dest.writeBytes(bytes)
             Log.i(TAG, "Deployed patched libevshim.so (${bytes.size} bytes)")
             return true
@@ -1221,11 +1240,53 @@ class NativeWinePipeline(private val context: Context) {
      *  libwine_native.so. Needed for ARM64EC x86-64 Windows games whose
      *  DirectX feature level negotiation behaves differently between
      *  wine 9 and wine 10. */
+    /**
+     * Swap the Vulkan driver from the leegao wrapper to Mesa PanVK
+     * (zenithblue panvk-kbase-android beta.16, bundled as
+     * libvulkan_panfrost.so), which talks to /dev/mali0 directly and
+     * bypasses libGLES_mali.so entirely.
+     *
+     * Every wrapper-specific knob is dropped, and implicit layers are
+     * isolated in an empty XDG dir: on DXVK 1.10.3 even env-disabled
+     * manifest-declared layers broke rendering (failed_attempts.md), and
+     * the spoof/maintenance5/GPL shims would mask what PanVK exposes
+     * natively. BCn is native on PanVK (textureCompressionBC=1).
+     */
+    private fun applyPanvkEnv(env: MutableMap<String, String>) {
+        val share = File("$dataDir/panvk_share/vulkan")
+        File(share, "icd.d").mkdirs()
+        File(share, "implicit_layer.d").mkdirs()
+        val icd = File(share, "icd.d/panvk_icd.aarch64.json")
+        icd.writeText(
+            """
+            {
+                "file_format_version": "1.0.1",
+                "ICD": {
+                    "library_path": "$nativeLibDir/libvulkan_panfrost.so",
+                    "api_version": "1.4.363"
+                }
+            }
+            """.trimIndent()
+        )
+        env.keys.removeAll { key ->
+            key.startsWith("WRAPPER_") || key.startsWith("VK_GC_") || key in setOf(
+                "SPOOF_FEATURES", "MALI_ALLOC_PROBE",
+                "ENABLE_BCN_COMPUTE", "BCN_COMPUTE_AUTO", "USE_CPU_BCN",
+                "ENABLE_UTIL_LAYER",
+            )
+        }
+        env["VK_ICD_FILENAMES"] = icd.absolutePath
+        env["VK_LAYER_PATH"] = "$dataDir/imagefs_bionic/usr/share/vulkan/explicit_layer.d"
+        env["XDG_DATA_DIRS"] = "$dataDir/panvk_share"
+        env["DISABLE_UTIL_LAYER"] = "1"
+    }
+
     fun wineRun(
         args: List<String>,
         timeoutMs: Long = 30000,
         extraEnv: Map<String, String> = emptyMap(),
         useProton9: Boolean = false,
+        usePanvk: Boolean = false,
     ): Result {
         val wineBinary = if (useProton9) "$dataDir/proton9/bin/wine" else winePath
         val wineTreeDir = if (useProton9) "$dataDir/proton9" else "$dataDir/proton10"
@@ -1618,6 +1679,8 @@ class NativeWinePipeline(private val context: Context) {
             // way to redirect libevshim's dlsym-resolved open(), leave
             // those env vars off and use only the single-lib LD_PRELOAD
             // redirect shim we control.
+
+            if (usePanvk) applyPanvkEnv(this)
 
             putAll(extraEnv)
         }
