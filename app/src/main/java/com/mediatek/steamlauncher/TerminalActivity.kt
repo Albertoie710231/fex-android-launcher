@@ -864,7 +864,6 @@ class TerminalActivity : AppCompatActivity() {
             }
             val userInput = EditText(this).apply {
                 hint = "Username"
-                setText("sakatepongolas")
             }
             val passInput = EditText(this).apply {
                 hint = "Password"
